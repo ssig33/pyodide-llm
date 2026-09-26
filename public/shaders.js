@@ -646,10 +646,9 @@ export const promptForms = ({ half, subgroups, packed, memory, threads }) => {
       code: regTile(half), constants: { WORKGROUP_SIZE_M: tile.m, WORKGROUP_SIZE_N: tile.n }, none: past(shape, regTileBytes(tile, half)) };
   });
   forms.push({ name: "TF.js tiles 32×32, vec4", tile: TFJS_SHAPE, packed: false, half: false, code: tfjsTile, none: past(TFJS_SHAPE, 2 * 32 * 32 * 4) });
-  if (packed) {
-    forms.push({ name: "ORT DP4A 64×64", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(false), none: past(DP4A_SHAPE, 4608) });
-    if (subgroups) forms.push({ name: "ORT DP4A 64×64, subgroups", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(true), none: past(DP4A_SHAPE, 4608) });
-  }
+  const dp4aNone = packed ? past(DP4A_SHAPE, 4608) : "no packed int8 dot here";
+  forms.push({ name: "ORT DP4A 64×64", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(false), none: dp4aNone });
+  if (subgroups) forms.push({ name: "ORT DP4A 64×64, subgroups", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(true), none: dp4aNone });
   return forms;
 };
 
@@ -678,7 +677,10 @@ export function quantizedLikeCpu(x) {
 // most; a wrong index, scale or group by about 1 / sqrt(544) = 4e-2). f16 forms: WGSL leaves the direction of the
 // rounding to f16 to the device, so each weight × scale and activation is within 1 ulp (2^-10, or 2^-24 where it is
 // subnormal): no more than |products| × (2^-9 + 2^-20 + (n + 1) × 2^-24) + 2^-24 × Σ(|weight| + |activation|).
-// Returns { worst, wrong }: the worst difference over the sum of |products|, and why it is wrong, or null.
+// Returns { worst, wrong, far, apart, values }: the worst difference over the sum of |products|, why it is wrong or
+// null, and of a packed form whether a quantized value is far from quantize_x's and how many of values differ by 1.
+// the f32 forms' line of tiledOff, a share of the sum of |products| (the matrix × vector checks of the benchmark hold theirs to it too)
+export const TILED_LINE = 1e-4;
 export function tiledOff({ w, s, x, got, xq, xs, rows, n, tokens, xStride, yStride, half }) {
   const perRow = n / GROUP;
   let worst = 0, over = false, far = false, apart = 0, values = 0;
@@ -707,12 +709,12 @@ export function tiledOff({ w, s, x, got, xq, xs, rows, n, tokens, xStride, yStri
       }
       const off = Math.abs(got[t * yStride + r] / 2 - want);
       worst = Math.max(worst, off / size);
-      over ||= half ? off > size * (2 ** -9 + 2 ** -20 + (n + 1) * 2 ** -24) + small * 2 ** -24 : off >= 1e-4 * size;
+      over ||= half ? off > size * (2 ** -9 + 2 ** -20 + (n + 1) * 2 ** -24) + small * 2 ** -24 : off >= TILED_LINE * size;
     }
   }
   const wrong = far ? "the quantized activations are far from quantize_x's" : apart > 0.01 * values
     ? `${apart} of ${values} quantized activations are not quantize_x's` : over ? `products ${worst.toExponential(2)} from JavaScript's` : null;
-  return { worst, wrong };
+  return { worst, wrong, far, apart, values };
 }
 
 // the most likely token: the first index of the largest logit, in one workgroup, so that only 4 bytes come back

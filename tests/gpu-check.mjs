@@ -10,14 +10,14 @@
 // which SwiftShader lacks (AGENTS.md). The harness and the GPU's worker are then worker threads.
 //
 // Node reads each model with Pyodide as the page does and records two things: the plan that forward.js gets from
-// Python (where every tensor is), and NumPy's answer for a prompt of 40 tokens: the keys and values of every layer at
+// Python (where every tensor is), and NumPy's answer for a prompt of 150 tokens: the keys and values of every layer at
 // every position the prompt's blocks fill, and the logits of its last token. NumPy multiplies the int8 weights
 // widened to float32 by float32 activations, which is what the GPU does; forward.js on the CPU quantizes the
 // activations as well (7 bits with relaxed SIMD), so it is farther from both by design. The browser then runs
 // forward.js in a worker (it waits in Atomics.wait, which a page may not) on the same memory: the prompt through
 // forwardMany() and its last token through forward(), once on the CPU and with the GPU's worker once for the shaders
 // it chooses and once for every tiled shader of the matrices (T147), the prompt in blocks of 16 and then all at once.
-// The cache starts at 8 positions, so that both grow within the prompt (8, 16, 32, 64). Checked:
+// The cache starts at 8 positions, so that both grow within the prompt (8 to 256). Checked:
 //   - the GPU took every token of the prompt (gpuTokens), the same again from position 0, and a block that begins
 //     past the keys and values it holds went to the CPU;
 //   - the keys and values it wrote back into the cache, against NumPy's: the worst row (a layer's keys or values of
@@ -42,19 +42,22 @@ const engine = option("--engine", "chromium");
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
 const ids = args.length ? args : ["synthetic", "stories15M", "tiny-lm", "llm-jp-3-150m"];
-const COUNT = 40, KV_START = 8;
+// T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
+const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
-// this machine's SwiftShader and on Dawn's lavapipe, the four models below). The CPU's forward.js: 4.0e-2 to 1.4e-1
-// (its 7-bit activations). A GPU that is wrong lands far past the CPU's (broken on purpose: RoPE at the next position
-// 1.13 to 1.16, no causal mask 1.86 to 6.97, the keys written back in the order [token][layer] 2.50 to 4.62, T135).
-//   float32 (TF.js's tiles, llama.cpp's f32): 8.1e-4 to 1.56e-3, the float16 of the cache (2^-11 = 4.9e-4 of a value)
-//     and the attention on float16 keys and values from the first layer on, as the CPU's (T135's GPU read its own
-//     float32 ones: 4.5e-4 to 4.7e-4). The line: 4e-3.
-//   f16 (llama.cpp's f16: every weight × scale and activation rounded to 11 bits): 8.8e-4 to 5.2e-3 (the made-up model's
-//     random weights the worst). The line: 1e-2.
+// Dawn's lavapipe and this machine's SwiftShader, 149 tokens: two blocks of 64 and a part). The CPU's forward.js: 4.1e-2
+// to 3.2e-1 (its 7-bit activations; the made-up model's random weights the most). A GPU that is wrong lands far past
+// the lines (broken on purpose: RoPE at the next position 1.13 to 1.16, no causal mask 1.86 to 6.97, the keys written
+// back in the order [token][layer] 2.50 to 4.62, T135; T147's six in TODO.md).
+//   float32 (TF.js's tiles, llama.cpp's f32): 8.1e-4 to 2.4e-3 for the models here, 3.90e-3 for the made-up one: the
+//     float16 of the cache (2^-11 = 4.9e-4 of a value) and the attention on float16 keys and values from the first
+//     layer on, as the CPU's (T135's GPU read its own float32 ones: 4.5e-4 to 4.7e-4 at 39 tokens), growing with the
+//     positions (the made-up model 1.56e-3 at 39 tokens). The line: 8e-3.
+//   f16 (llama.cpp's f16: every weight × scale and activation rounded to 11 bits): 9.5e-4 to 6.1e-3. The line: 1.5e-2.
 //   8 bits (ORT's DP4A: the activations quantized as the CPU's matmul_q8 takes them, 8 bits where the CPU's relaxed
-//     SIMD takes 7): 0.35 to 0.52 of the CPU's. The line: 0.75 of the CPU's.
-const GPU_LINE = 4e-3, HALF_LINE = 1e-2, PACKED_LINE = 0.75;
+//     SIMD takes 7): 0.30 to 0.56 of the CPU's. The line: 0.75 of the CPU's (a ratio to the CPU's error: measure it
+//     again where the CPU's arithmetic changes, T159, T165).
+const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2, PACKED_LINE = 0.75;
 // The logits of the prompt's last token, the largest difference from NumPy's over the largest of NumPy's: the CPU's
 // own run 1.6e-2 to 5.6e-2, the one on the GPU's keys and values 0.75 to 1.04 times that (closer: its keys and values
 // are NumPy's but for the float16); broken on purpose 0.27 to 1.13, 4.8 times the CPU's and more. The line: no more
@@ -67,7 +70,7 @@ py.runPython(`
 import base64, struct, numpy as np, llama2_numpy, llama2_convert
 from llama2_numpy import Llama
 
-def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=64, seed=0):
+def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0):
     """A made-up int8 checkpoint and its tokenizer.bin, as quantize.py writes one: grouped-query attention"""
     rng = np.random.default_rng(seed)
     header = (dim, hidden, layers, heads, kv_heads, vocab, seq_len)
@@ -104,6 +107,7 @@ def answer(data, vocabulary, text, count, options):
             "header": list(struct.unpack_from("<7i", data, 0))}
 `);
 
+// each text three times over: long enough for COUNT tokens of every model here
 const TEXTS = {
   english: "Once upon a time, there was a little girl named Lily. She loved to play outside in the park with her friends. " +
     "One day, she saw a big red ball under a tree. She ran to the ball and kicked it high into the sky, and everyone laughed.",
@@ -125,7 +129,7 @@ for (const id of ids) {
     py.FS.writeFile("tokenizer.bin", fs.readFileSync(root + entry.tokenizer));
     py.runPython(`data, vocabulary = open("model.bin", "rb").read(), open("tokenizer.bin", "rb").read()`);
     options = entry.options;
-    text = /日本語/.test(entry.note) ? TEXTS.japanese : TEXTS.english;
+    text = (/日本語/.test(entry.note) ? TEXTS.japanese : TEXTS.english).repeat(3);
   }
   if (options.dtype !== "int8") throw new Error(`${id} is ${options.dtype}: the GPU takes int8 weights`);
   py.globals.set("OPTIONS", py.toPy(options));
@@ -292,7 +296,7 @@ async function inBrowser() {
   page.on("console", (message) => lines.push(`[${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => lines.push(`[pageerror] ${error.message}`));
   await page.goto(`http://localhost:${server.address().port}/`);
-  // SwiftShader compiles a tiled shader in 10 to 90 s (T147): every shader of four models takes most of an hour
+  // SwiftShader compiles a tiled shader in 10 to 90 s (T147): every shader of the made-up model takes some minutes
   await page.waitForFunction(() => window.__gpuCheck, null, { timeout: 5400000 });
   const result = await page.evaluate(() => window.__gpuCheck);
   await Promise.race([browser.close(), new Promise((resolve) => setTimeout(resolve, 15000))]);
@@ -402,7 +406,10 @@ for (const { id, cpu, gpu: runs, late } of outcome.results) {
     if (!(gpuLogits <= LOGITS_LINE * cpuLogits) || !(againLogits <= LOGITS_LINE * cpuLogits)) {
       failures.push(`the logits on the GPU's keys and values are ${gpuLogits.toExponential(2)} and ${againLogits.toExponential(2)} from NumPy's, the CPU's ${cpuLogits.toExponential(2)}`);
     }
-    if (argmax(floats(gpu.logits)) !== best || argmax(floats(gpu.again.logits)) !== best) failures.push("another most likely token than on the CPU");
+    // the most likely token: the CPU's, or one whose logit NumPy puts no farther below its largest than the CPU's run
+    // is from NumPy's (a near tie, T147: stories15M at 149 tokens, where the GPU's logits were nearer NumPy's)
+    const near = (b64) => { const i = argmax(floats(b64)); return i === best || want[argmax(want)] - want[i] <= LOGITS_LINE * cpuLogits * largest; };
+    if (!near(gpu.logits) || !near(gpu.again.logits)) failures.push("another most likely token than on the CPU, and not a near tie");
     console.log(`  ${gpu.form ?? "no form"}, ${gpu.attention ?? "no attention"}: keys and values ${gpuKv.toExponential(2)} (all at once ${againKv.toExponential(2)}), ` +
       `logits ${gpuLogits.toExponential(2)} (${againLogits.toExponential(2)}), the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));

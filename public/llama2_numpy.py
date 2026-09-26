@@ -1120,9 +1120,10 @@ class Llama:
                 # prompt_block() at a time (T147: as many as the engine takes now); the text comes out as it would
                 # one by one, only a block at once
                 fed = [self.bos] + prompt_tokens[:-1]
-                step = self.prompt_block()
-                for at in range(0, len(fed), step):
-                    block = fed[at:at + step]
+                at = 0
+                while at < len(fed):
+                    # asked again every block: where the GPU gives up, the CPU's blocks are short again (T108)
+                    block = fed[at:at + self.prompt_block()]
                     self.forward_many(block, at)
                     for pos in range(at, at + len(block)):
                         next_token = prompt_tokens[pos]
@@ -1133,6 +1134,7 @@ class Llama:
                         forced += 1
                         if text and echo:
                             yield text
+                    at += len(block)
                 first = len(fed)
                 sampling_start = time.perf_counter()
             for pos in range(first, steps):

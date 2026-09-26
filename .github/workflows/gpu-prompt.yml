@@ -2,6 +2,9 @@
 # software adapter (SwiftShader: the runners have no GPU): tests/gpu-check.mjs on the models this workflow builds (the
 # site's int8 models and a made-up one with grouped-query attention). It shows that the numbers are right; the speeds
 # that count are the owner's devices'. The page itself with ?gpu=on: models.yml with query "gpu=on". By hand only.
+# T147: SwiftShader compiles a tiled shader in 10 to 90 s and has no shader-f16, so the browsers take the made-up model
+# only (every shader, 150 tokens), and Dawn in Node on Mesa's lavapipe (shader-f16 and subgroups) takes every model
+# (about 5 minutes on the development machine).
 #
 #   gh workflow run gpu-prompt.yml [-f models="synthetic tiny-lm"] [--ref <branch>]
 name: The prompt on the GPU
@@ -10,15 +13,15 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'model ids of this directory, or synthetic, separated by spaces (default: the check''s own)'
+        description: 'model ids of this directory, or synthetic, separated by spaces (default: synthetic in the browsers, every model on Dawn)'
         required: false
 
 jobs:
   gpu:
     name: ${{ matrix.os }} ${{ matrix.engine }}
     runs-on: ${{ matrix.os }}
-    # T147: every tiled shader on SwiftShader, which compiles one in 10 to 90 s: about an hour on the development machine
-    timeout-minutes: 150
+    # T147: the made-up model's every tiled shader on SwiftShader; gpu-check waits for the page 90 minutes at most
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -52,5 +55,44 @@ jobs:
         shell: bash
         run: |
           echo "## ${{ matrix.os }} ${{ matrix.engine }}" >> "$GITHUB_STEP_SUMMARY"
-          node tests/gpu-check.mjs ${{ inputs.models }} --engine ${{ matrix.engine }} 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
+          node tests/gpu-check.mjs ${{ inputs.models || 'synthetic' }} --engine ${{ matrix.engine }} 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"
+
+  dawn:
+    # T147: shader-f16 and subgroups, which SwiftShader lacks: the npm package webgpu (Dawn, not a dependency of this
+    # project: installed under .tmp/) on Mesa's lavapipe (the package mesa-vulkan-drivers; its manifest is named
+    # lvp_icd.<arch>.json on Ubuntu 24.04, lvp_icd.json on 26.04)
+    name: ubuntu-latest dawn (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Download and convert the models, compile the kernels, install Dawn and lavapipe
+        shell: bash
+        run: |
+          pip install numpy tokenizers regex
+          npm ci
+          make models kernels
+          sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+          mkdir -p .tmp/dawn && (cd .tmp/dawn && npm init -y > /dev/null && npm install webgpu@0.6.1)
+
+      - name: The prompt on the GPU against the CPU and NumPy, on Dawn
+        shell: bash
+        run: |
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          echo "## ubuntu-latest dawn ($VK_ICD_FILENAMES)" >> "$GITHUB_STEP_SUMMARY"
+          node tests/gpu-check.mjs ${{ inputs.models }} --engine dawn --webgpu .tmp/dawn/node_modules/webgpu 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${PIPESTATUS[0]}"

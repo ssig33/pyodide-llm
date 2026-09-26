@@ -19,8 +19,10 @@ const PAGE = 65536;
 // T120: no phase comes near this without progress (the longest token measured, Qwen2.5 7B's on CI, took 286 ms in
 // all): a count that has not moved for so long means a software thread the browser stopped in the middle of its chunk
 const STALLED_MS = 10000;
-// T135: the GPU's worker says something at least this often while it puts a model on the GPU (T147: every 5 s)
-const GPU_QUIET_MS = 30000;
+// T135: the GPU's worker says something at least this often while it puts a model on the GPU: after every step, each
+// of which it gives up itself after 180 s (gpu.js's STEP_MS, T147: SwiftShader compiles a shader in up to 90 s). A
+// worker quiet for longer than that is one the browser ended
+const GPU_QUIET_MS = 200000;
 // T147: the most tokens of a prompt the GPU takes at once: the tokens of the largest tile (T146's 64 × 64), whose
 // sixteen blocks left three quarters of it idle. Python hands a prompt over this many at a time where the GPU is on
 // (promptBlock), BATCH where it is not: the worker answers nothing while one call runs (T108)
@@ -733,7 +735,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         console.info(`gpu: ${data.adapter}: ${Math.round(data.bytes / 1e6)} MB of layers on it in ${data.seconds.toFixed(1)} s`);
         // T147: the matrices' shader this device runs fastest of those that are right here, and what the others came to
         const forms = data.forms.map((f) => `${f.name} ${f.none ?? (f.ms ? `${f.ms.toFixed(1)} ms` : "untimed")}`).join("; ");
-        console.info(`gpu: the matrices by ${data.form}, the attention by ${data.attention} (${GPU_BLOCK} tokens of the first gate: ${forms})`);
+        console.info(`gpu: the matrices by ${data.form}, the attention by ${data.attention} (a pass of the first layer by ${GPU_BLOCK} tokens: ${forms})`);
         settleGpu?.("prompts on WebGPU");
       } else if (data.type === "unusable") {
         stopGpu(data.reason);

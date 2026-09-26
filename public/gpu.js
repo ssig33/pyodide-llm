@@ -5,8 +5,8 @@
 //
 //   { type: "start", memory, plan }  the layers of the model onto the GPU, read from the shared memory of forward.js
 //                                    (plan: what forward.js says of them, addresses in that memory). Says
-//                                    { type: "progress" } every few seconds meanwhile (a shader may take a minute to
-//                                    compile where the CPU stands in for the GPU: T147), then { type: "ready",
+//                                    { type: "progress" } after every step (a layer's weights, a shader compiled,
+//                                    checked, timed: STEP_MS each at most, T147), then { type: "ready",
 //                                    adapter, bytes, seconds, form, attention, forms } or { type: "unusable", reason }
 //   { type: "prompt", serial, count, pos }
 //                                    the rows of count tokens at positions pos, pos + 1, ... (embedded by forward.js,
@@ -36,9 +36,14 @@ const STORAGE = 0x80, COPY_DST = 0x8, COPY_SRC = 0x4, MAP_READ = 0x1, UNIFORM = 
 // the bytes that go to the GPU through a copy of their own at a time (writeBuffer takes no view of a shared memory
 // everywhere, and copies what it is given at once)
 const CHUNK = 8 << 20;
-// a tiled shader is timed on the model's first gate matrix by a whole block, once to warm up and then TIMES times (the
-// median); on a fallback adapter (the CPU in the GPU's place: its times are no GPU's) once
-const TIMES = 3;
+// The right tiled shaders are timed together, in turn, on the model's first layer (its seven matrices by a whole block,
+// with the quantizations of a packed one): a submission of n passes of the layer and one of 2n, their difference the
+// time of n passes (what a submission costs besides its work is in both and drops out: 2.6 to 8.4 ms waited for on
+// the owner's Android, T134, where llm-jp-3 150M's gate by 64 tokens is 0.6 ms of work), n doubled until a submission
+// of n takes TIMED_MS (at most MOST_PASSES), PAIRS pairs a shader, the shaders in turn within each round (a device that
+// warms up or is loaded meanwhile falls on all of them alike: T168's review), the median of each shader's pairs. On a
+// fallback adapter (the CPU in the GPU's place: its times are no GPU's) one pair of one pass
+const TIMED_MS = 20, MOST_PASSES = 256, PAIRS = 5;
 
 let model = null;  // what is on the GPU for the model: the device, the plan, the buffers, the pipelines, the cache
 let starting = false, stopping = false, lost = null;
@@ -49,14 +54,26 @@ onmessage = ({ data }) => {
   else if (data.type === "stop") stop();
 };
 
-// how often a worker that puts a model on the GPU says it is still at it (forward.js gives one up that says nothing
-// for 30 s: a worker the browser ended. A device that hangs is lost, by the browser's watchdog, and its promises fail)
-const ALIVE_MS = 5000;
+// The most a step of putting the model on the GPU may take: a shader's compilation, a check, the timing, a layer's
+// weights. SwiftShader took up to 90 s to compile llama.cpp's 64×64 tiles on the development machine (T147), a GPU
+// compiles in far less; twice that is a GPU that hangs. The worker then gives the GPU up (the prompt stays on the
+// CPU), and says { type: "progress" } after every step meanwhile (forward.js gives up a worker that says nothing for
+// longer than this: one the browser ended)
+const STEP_MS = 180000;
+function within(promise, what) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(`${what} took more than ${STEP_MS / 1000} s`), { late: true })), STEP_MS);
+  });
+  return Promise.race([promise, late]).finally(() => {
+    clearTimeout(timer);
+    postMessage({ type: "progress" });
+  });
+}
 
 async function start(memory, plan) {
   const began = performance.now();
   starting = true;
-  const alive = setInterval(() => postMessage({ type: "progress" }), ALIVE_MS);
   try {
     const wgsl = await shaders;
     if (!self.navigator?.gpu) return unusable("no WebGPU in a worker here");
@@ -69,10 +86,12 @@ async function start(memory, plan) {
     if (largest > limit) return unusable(`a matrix of ${megabytes(largest)} is more than a buffer of this GPU (${megabytes(limit)})`);
     // shader-f16 and subgroups where the adapter has them (a device refuses a feature it lacks), and the adapter's
     // workgroup memory and threads (the tiles and the attention size themselves by them)
-    const { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup } = adapter.limits;
+    const { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX } = adapter.limits;
     const device = await adapter.requestDevice({
       requiredFeatures: ["shader-f16", "subgroups"].filter((name) => adapter.features.has(name)),
-      requiredLimits: { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup } });
+      requiredLimits: { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX } });
     device.lost.then((info) => { lost = `the GPU was lost (${info.reason}${info.message ? `: ${info.message}` : ""})`; });
     const info = adapter.info ?? {};
     model = { device, memory, plan, wgsl, owned: [], limit, info, fallback: Boolean(info.isFallbackAdapter ?? adapter.isFallbackAdapter) };
@@ -89,7 +108,7 @@ async function start(memory, plan) {
     if (stopping) return end();
     bindLayers(model);
     grow(model, Math.min(plan.kvStart, plan.seqLen));
-    await device.queue.onSubmittedWorkDone();
+    await within(device.queue.onSubmittedWorkDone(), "the GPU's work");
     const invalid = await device.popErrorScope(), full = await device.popErrorScope();
     if (stopping) return end();
     if (invalid || full) return unusable(`the GPU did not take the layers (${(invalid ?? full).message})`);
@@ -99,7 +118,6 @@ async function start(memory, plan) {
   } catch (error) {
     unusable(String(error?.message ?? error));
   } finally {
-    clearInterval(alive);
     starting = false;
   }
 }
@@ -202,7 +220,7 @@ async function upload(m) {
       bytes += valueBytes + scaleBytes;
     }
     // what was written waits in memory until the GPU takes it: let it, before more comes
-    await m.device.queue.onSubmittedWorkDone();
+    await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
     if (stopping) return bytes;
   }
   const normBytes = plan.layers * plan.dim * 4;
@@ -219,7 +237,8 @@ async function upload(m) {
 async function prepare(m) {
   const { plan, wgsl } = m, B = plan.batch;
   const qDim = plan.heads * plan.headSize, kvDim = plan.kvHeads * plan.headSize, widest = Math.max(plan.dim, qDim, plan.hidden);
-  [m.norm, m.rope, m.swiglu, m.quantize] = await Promise.all([wgsl.RMSNORM, wgsl.ROPE, wgsl.SWIGLU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code)));
+  [m.norm, m.rope, m.swiglu, m.quantize] = await within(Promise.all([wgsl.RMSNORM, wgsl.ROPE, wgsl.SWIGLU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code))),
+    "the small steps' shaders");
   // a block's tokens, each array dense: token t's row at t times its width
   m.x = buffer(m, B * plan.dim * 4, STORAGE | COPY_DST);
   m.xb = buffer(m, B * Math.max(plan.dim, qDim) * 4, STORAGE | COPY_DST);
@@ -253,7 +272,7 @@ async function chooseAttention(m) {
   const { device, plan, wgsl } = m;
   const half = device.features.has("shader-f16");
   const subgroups = device.features.has("subgroups") && Boolean(navigator.gpu.wgslLanguageFeatures?.has("subgroup_id"));
-  const limits = { memory: device.limits.maxComputeWorkgroupStorageSize, threads: device.limits.maxComputeInvocationsPerWorkgroup,
+  const limits = { memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device),
     subgroupMin: m.info.subgroupMinSize, subgroupMax: m.info.subgroupMaxSize };
   const tried = [];
   const options = [{ half, subgroups }, { half: false, subgroups: false }].filter((o, i) => i === 0 || o.half !== half || o.subgroups !== subgroups);
@@ -266,14 +285,15 @@ async function chooseAttention(m) {
       continue;
     }
     try {
-      const pipeline = await validated(m, () => pipelineOf(m, wgsl.flashTile(shape)));
-      const wrong = await checkAttention(m, pipeline);
+      const pipeline = await within(validated(m, () => pipelineOf(m, wgsl.flashTile(shape))), `compiling ${name}`);
+      const wrong = await within(checkAttention(m, pipeline), `checking ${name}`);
       if (!wrong) {
         m.attention = { name, pipeline, shape };
         return;
       }
       tried.push(`${name}: ${wrong}`);
     } catch (error) {
+      if (error?.late) throw error;
       tried.push(`${name}: ${error?.message ?? error}`);
     }
   }
@@ -352,34 +372,34 @@ async function chooseMatrices(m) {
   const { device, plan, wgsl } = m;
   const packed = Boolean(navigator.gpu.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product"));
   let forms = wgsl.promptForms({ half: device.features.has("shader-f16"), subgroups: device.features.has("subgroups"), packed,
-    memory: device.limits.maxComputeWorkgroupStorageSize, threads: device.limits.maxComputeInvocationsPerWorkgroup });
+    memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device) });
   if (plan.force.matrices) forms = forms.filter((form) => form.name === plan.force.matrices);
   m.forms = [];
-  let best = null;
+  const right = [];
   for (const form of forms) {
     if (form.none) {
       m.forms.push({ name: form.name, none: form.none });
       continue;
     }
     try {
-      const pipeline = await validated(m, () => pipelineOf(m, form.code, form.constants));
+      const pipeline = await within(validated(m, () => pipelineOf(m, form.code, form.constants)), `compiling ${form.name}`);
       const tiled = { ...form, pipeline };
-      const wrong = await checkForm(m, tiled);
-      if (wrong) {
-        m.forms.push({ name: form.name, none: `wrong: ${wrong}` });
-        continue;
-      }
-      const ms = plan.force.matrices ? 0 : await timeForm(m, tiled);
-      m.forms.push({ name: form.name, ms });
-      if (!best || ms < best.ms) best = { ...tiled, ms };
+      const wrong = await within(checkForm(m, tiled), `checking ${form.name}`);
+      if (wrong) m.forms.push({ name: form.name, none: `wrong: ${wrong}` });
+      else right.push(tiled);
     } catch (error) {
+      if (error?.late) throw error;
       m.forms.push({ name: form.name, none: String(error?.message ?? error) });
     }
     if (stopping) return;
   }
-  if (!best) throw new Error(`no tiled shader is right on this GPU (${m.forms.map((f) => `${f.name}: ${f.none}`).join("; ") || `none named ${plan.force.matrices}`})`);
-  m.form = best;
+  if (!right.length) throw new Error(`no tiled shader is right on this GPU (${m.forms.map((f) => `${f.name}: ${f.none}`).join("; ") || `none named ${plan.force.matrices}`})`);
+  const ms = right.length > 1 ? await within(timeForms(m, right), "timing the tiled shaders") : [0];
+  right.forEach((form, i) => m.forms.push({ name: form.name, ms: ms[i] }));
+  m.form = right[ms.indexOf(Math.min(...ms))];
 }
+// the threads of a workgroup of one dimension this device takes
+const threadsOf = (device) => Math.min(device.limits.maxComputeInvocationsPerWorkgroup, device.limits.maxComputeWorkgroupSizeX);
 
 // a matrix of rows × n (w and s, buffers) by the tokens of from into to (added where add): the bind group of form
 const productGroup = (m, form, w, s, rows, n, from, to, add, owned = m.owned, io = m) => bind(m, form.pipeline,
@@ -434,26 +454,48 @@ async function checkForm(m, form) {
   return null;
 }
 
-// ms of the model's first gate matrix (w1 of layer 0: hidden × dim, the widest kind of a layer's matrices) by a block
-// of plan.batch tokens with form, its quantization included for a packed one
-async function timeForm(m, form) {
-  const { device, plan } = m, { rows, n, layers } = m.matrices.w1, owned = [];
+// ms of a pass of the model's first layer with each of forms (see TIMED_MS): the seven matrices by plan.batch tokens,
+// each packed one's inputs quantized first
+async function timeForms(m, forms) {
+  const { device, plan } = m, owned = [], layer = [];
   try {
     device.queue.writeBuffer(m.step, 0, new Uint32Array([plan.batch, 0, 0, 0]));
-    const group = await validated(m, () => productGroup(m, form, ...layers[0], rows, n, m.xb, m.gate, false, owned));
-    const once = async () => {
-      const began = performance.now(), encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-      if (form.packed) dispatch(pass, m.quantize, m.quantizeXb.group, m.quantizeXb.x, plan.batch);
-      multiply(m, pass, form, group, rows, plan.batch);
+    const products = [["wq", m.xb, m.q, false, m.quantizeXb], ["wk", m.xb, m.k], ["wv", m.xb, m.v], ["wo", m.xb, m.x, true, m.quantizeXb],
+      ["w1", m.xb, m.gate, false, m.quantizeXb], ["w3", m.xb, m.up], ["w2", m.gate, m.x, true, m.quantizeGate]];
+    for (const form of forms) {
+      layer.push(await validated(m, () => products.map(([name, from, to, add, quantize]) => {
+        const { rows, n, layers } = m.matrices[name];
+        return { group: productGroup(m, form, ...layers[0], rows, n, from, to, add, owned), rows, quantize };
+      })));
+    }
+    const submission = async (i, passes) => {
+      const form = forms[i], encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+      for (let p = 0; p < passes; p++) {
+        for (const { group, rows, quantize } of layer[i]) {
+          if (form.packed && quantize) dispatch(pass, m.quantize, quantize.group, quantize.x, plan.batch);
+          multiply(m, pass, form, group, rows, plan.batch);
+        }
+      }
       pass.end();
+      const began = performance.now();
       device.queue.submit([encoder.finish()]);
       await device.queue.onSubmittedWorkDone();
       return performance.now() - began;
     };
-    await once();
-    const times = [];
-    for (let i = 0; i < (m.fallback ? 1 : TIMES); i++) times.push(await once());
-    return times.sort((a, b) => a - b)[times.length >> 1];
+    const passes = [], differences = forms.map(() => []);
+    for (let i = 0; i < forms.length; i++) {
+      await submission(i, 1);  // warm
+      let n = 1;
+      while (!m.fallback && n < MOST_PASSES && (await submission(i, n)) < TIMED_MS) n *= 2;
+      passes.push(n);
+    }
+    for (let round = 0; round < (m.fallback ? 1 : PAIRS); round++) {
+      for (let i = 0; i < forms.length; i++) {
+        const once = await submission(i, passes[i]), twice = await submission(i, 2 * passes[i]);
+        differences[i].push((twice - once) / passes[i]);
+      }
+    }
+    return differences.map((d) => d.sort((a, b) => a - b)[d.length >> 1]);
   } finally {
     owned.forEach((b) => b.destroy());
   }

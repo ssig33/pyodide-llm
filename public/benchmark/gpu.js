@@ -136,24 +136,10 @@ function pipelinesFor() {
 // and in an error scope: one this device refuses rejects there, and only its own rows say so
 const tiledPipelines = new Map();
 function promptShaders() {
-  const half = device.features.has("shader-f16"), subgroups = device.features.has("subgroups");
-  const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup: threads } = device.limits;
-  const past = ({ threads: wanted }, bytes) => (wanted > threads ? `${wanted} threads, the device ${threads}`
-    : bytes > memory ? `${bytes} bytes of workgroup memory, the device ${memory}` : undefined);
-  const shaders = [{ name: "batched (T135)", kind: "batched" }];
-  for (const tile of WGSL.REG_TILES) {
-    const shape = WGSL.regTileShape(tile);
-    shaders.push({ name: `llama.cpp tiles ${shape.rows}×${shape.tokens}, ${half ? "f16" : "f32"}`, tile: shape, packed: false, half,
-      code: WGSL.regTile(half), constants: { WORKGROUP_SIZE_M: tile.m, WORKGROUP_SIZE_N: tile.n },
-      none: past(shape, WGSL.regTileBytes(tile, half)) });
-  }
-  // TensorFlow.js's: a step's 32 rows and 32 tokens of 32 as vec4<f32>
-  shaders.push({ name: "TF.js tiles 32×32, vec4", tile: WGSL.TFJS_SHAPE, packed: false, code: WGSL.tfjsTile,
-    none: past(WGSL.TFJS_SHAPE, 2 * 32 * 32 * 4) });
-  const dp4aNone = packed ? past(WGSL.DP4A_SHAPE, 4608) : "no packed int8 dot here";
-  shaders.push({ name: "ORT DP4A 64×64", tile: WGSL.DP4A_SHAPE, packed: true, code: WGSL.dp4a(false), none: dp4aNone });
-  if (subgroups) shaders.push({ name: "ORT DP4A 64×64, subgroups", tile: WGSL.DP4A_SHAPE, packed: true, code: WGSL.dp4a(true), none: dp4aNone });
-  return shaders;
+  const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX } = device.limits;
+  // T147: the tiled ones are the model's GPU worker's candidates (shaders.js's promptForms), the same list
+  return [{ name: "batched (T135)", kind: "batched" }, ...WGSL.promptForms({ half: device.features.has("shader-f16"),
+    subgroups: device.features.has("subgroups"), packed, memory, threads: Math.min(maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX) })];
 }
 // T149: the shaders of a matrix times one vector (a generated token's): T134's two, then llama.cpp's mul_mat_vec (its
 // float form and its MMVQ one, each with the workgroup's reduction and, where subgroups are, with subgroupAdd) and
@@ -276,20 +262,6 @@ function vectors(longest, most, tokens = 1) {
   return io;
 }
 const destroyVectors = (io) => [io.x, io.xq, io.xs, io.y, io.step].forEach((b) => b.destroy());
-// x (groups of GROUP values) quantized as the CPU's quantize_x does it: the largest |value| / 127, round half to even
-function quantized(x) {
-  const xq = new Int8Array(x.length), xs = new Float32Array(x.length / GROUP);
-  for (let g = 0; g < xs.length; g++) {
-    let largest = 0;
-    for (let i = 0; i < GROUP; i++) largest = Math.max(largest, Math.abs(x[g * GROUP + i]));
-    xs[g] = Math.fround(largest / 127);
-    for (let i = 0; i < GROUP; i++) {
-      const v = x[g * GROUP + i] / xs[g], r = Math.round(v);
-      xq[g * GROUP + i] = Math.abs(v - Math.trunc(v)) === 0.5 && r % 2 ? r - 1 : r;
-    }
-  }
-  return { xq, xs };
-}
 function run(pass, [pipeline, group, x, y, z = 1]) {
   pass.setPipeline(pipeline);
   if (group) pass.setBindGroup(0, group);  // none for the empty dispatch
@@ -338,7 +310,7 @@ async function check() {
   const w = new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s = floats(rows * n / GROUP, 0.01);
   const io = vectors(n, rows), x = floats(n, 2);
   device.queue.writeBuffer(io.x, 0, x);
-  const { xq, xs } = quantized(x);
+  const { xq, xs } = WGSL.quantizedLikeCpu(x);
   device.queue.writeBuffer(io.xq, 0, new Uint8Array(xq.buffer));
   device.queue.writeBuffer(io.xs, 0, xs);
   const signed = new Int8Array(w.buffer);
@@ -379,7 +351,7 @@ async function check() {
 // workgroup's 4 or 8 rows and a part of them in each, and shape.first past 0), of widths 544 and 2080: 17 and 65 groups
 // of 32, a part of what llama.cpp's 64 groups a pass, ORT's 512 values a step and its DP4A's 32 groups a step take, and
 // 2080 more than one of them. x is 64 values longer than the width (a shader that takes the width from the buffer
-// reads them), and y holds a sentinel past the rows that must stay. The sums as checkTiled holds them: WORST_TILED of
+// reads them), and y holds a sentinel past the rows that must stay. The sums as checkTiled holds them: WGSL.TILED_LINE of
 // the sum of the |products| of the row (a wrong index or scale is off by about 1/sqrt(n) of it); the packed ones on the
 // vector quantized in JavaScript (as PACKED is checked), whose products are exact integers times the two scales
 const SENTINEL = 7.25;
@@ -393,7 +365,7 @@ async function checkMatVec() {
         const perRow = n / GROUP, longest = n + 64;
         const w = new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s = floats(rows * perRow, 0.01);
         const signed = new Int8Array(w.buffer);
-        const io = vectors(longest, rows + past), x = floats(longest, 2), { xq, xs } = quantized(x);
+        const io = vectors(longest, rows + past), x = floats(longest, 2), { xq, xs } = WGSL.quantizedLikeCpu(x);
         device.queue.writeBuffer(io.x, 0, x);
         device.queue.writeBuffer(io.xq, 0, new Uint8Array(xq.buffer));
         device.queue.writeBuffer(io.xs, 0, xs);
@@ -420,7 +392,7 @@ async function checkMatVec() {
           }
           const off = Math.abs(got[r] - want);
           worst = Math.max(worst, off / size);
-          over ||= !(off < WORST_TILED * size);
+          over ||= !(off < WGSL.TILED_LINE * size);
         }
         for (let r = rows; r < rows + past; r++) touched ||= got[r] !== SENTINEL;
       }
@@ -437,7 +409,7 @@ async function checkMatVec() {
 // the width, yStride 320 for 300 rows: the prompt's model reads 2048 of 8192), twice into the same y (the second added
 // to the first: shape.add) against JavaScript's product: half of y. The packed ones on what the GPU quantized, and that
 // against JavaScript's quantize_x: a scale may differ in its last bits (WGSL's division is not rounded exactly) and a
-// value then by 1, a wrong index by far more. The products are held to WORST_TILED of the sum of the |products| of the
+// value then by 1, a wrong index by far more. The products are held (shaders.js's tiledOff) to 1e-4 of the sum of the |products| of the
 // row and token: what a float32 sum in another order may differ by is 544 × 2^-24 = 3.2e-5 of it at most, and a wrong
 // index, scale or group is off by about |value| / |sum of |products|| = 1 / sqrt(544) = 4e-2. The f16 tiles hold a
 // weight times its scale and an activation as halves, and WGSL leaves the direction of that rounding to the device
@@ -445,7 +417,6 @@ async function checkMatVec() {
 // subnormal, whatever the direction, so a product is within 2^-9 + 2^-20 of it and 2^-24 × (|weight| + |activation|),
 // and the float32 sum adds (n + 1) × 2^-24 of the sum of |products|: the f16 tiles are held to that bound, row by row
 // (about 2e-3 of the sum; still 1/20 of a wrong index's)
-const WORST_TILED = 1e-4;
 const CASES = [{ tokens: 11, wider: 0 }, { tokens: 70, wider: 0 }, { tokens: 11, wider: 64 }];
 async function checkTiled() {
   const rows = 300, n = 544, perRow = n / GROUP;
@@ -477,34 +448,13 @@ async function checkTiled() {
           owned.forEach((b) => b.destroy());
           destroyVectors(io);
         });
-        for (let t = 0; t < tokens; t++) {
-          const at = t * xStride, groups = t * (xStride / GROUP);
-          const mine = xq ? quantized(x.subarray(at, at + n)) : null;
-          if (mine) {
-            for (let g = 0; g < perRow; g++) far ||= Math.abs(xs[groups + g] - mine.xs[g]) > 1e-6 * mine.xs[g];
-            for (let i = 0; i < n; i++) {
-              far ||= Math.abs(xq[at + i] - mine.xq[i]) > 1;
-              apart += xq[at + i] !== mine.xq[i];
-            }
-            values += n;
-          }
-          for (let r = 0; r < rows; r++) {
-            let want = 0, size = 0, small = 0;
-            for (let g = 0; g < perRow; g++) {
-              const scale = s[r * perRow + g] * (mine ? xs[groups + g] : 1);
-              for (let i = g * GROUP; i < (g + 1) * GROUP; i++) {
-                const weight = Math.fround(signed[r * n + i] * s[r * perRow + g]), value = x[at + i];
-                const product = mine ? signed[r * n + i] * xq[at + i] * scale : shader.half ? weight * value : signed[r * n + i] * value * s[r * perRow + g];
-                want += product;
-                size += Math.abs(product);
-                small += Math.abs(weight) + Math.abs(value);
-              }
-            }
-            const off = Math.abs(got[t * yStride + r] / 2 - want);
-            worst = Math.max(worst, off / size);
-            over ||= shader.half ? off > size * (2 ** -9 + 2 ** -20 + (n + 1) * 2 ** -24) + small * 2 ** -24 : off >= WORST_TILED * size;
-          }
-        }
+        // T147: the comparison is shaders.js's tiledOff, the model's GPU worker's too
+        const off = WGSL.tiledOff({ w: signed, s, x, got, xq, xs, rows, n, tokens, xStride, yStride, half: shader.half });
+        worst = Math.max(worst, off.worst);
+        over ||= Boolean(off.wrong);
+        far ||= off.far;
+        apart += off.apart;
+        values += off.values;
       }
       // the quantized values no more than 1 apart, and apart in no more than 1 of 100
       const quantizing = values ? { apart: apart / values, far } : {};
