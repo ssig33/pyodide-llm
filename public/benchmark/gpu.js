@@ -770,7 +770,7 @@ function layerParts(shape, pos, copies, owned, data) {
   const v = { h: make(dim * 4), xb: make(dim * 4), q: make(dim * 4), k: make(kvDim * 4), v: make(kvDim * 4), att: make(dim * 4),
     t: make(dim * 4), g: make(hidden * 4), u: make(hidden * 4), norms: make(2 * dim * 4), angles: make(headSize * 4),
     keys: make(cacheBytes), values: make(cacheBytes) };
-  const angles = data?.angles ?? layerAngles(headSize, pos);
+  const angles = data?.angles ?? layerAngles(headSize, pos), eps = data?.eps ?? EPS;
   device.queue.writeBuffer(v.angles, 0, angles);
   // the state a layer starts from: the residual stream, the norms' weights, the cache of the positions before
   const reset = (state) => {
@@ -784,7 +784,7 @@ function layerParts(shape, pos, copies, owned, data) {
   const normParams = (at) => {
     const bytes = new ArrayBuffer(16);
     new Uint32Array(bytes, 0, 2).set([dim, at]);
-    new Float32Array(bytes, 8, 1)[0] = EPS;
+    new Float32Array(bytes, 8, 1)[0] = eps;
     return uniform(new Uint8Array(bytes));
   };
   const flashParams = new ArrayBuffer(16);
@@ -794,7 +794,7 @@ function layerParts(shape, pos, copies, owned, data) {
   const fusedParams = (rows, n, second = 0, normAt = 0) => {
     const bytes = new ArrayBuffer(48);
     new Uint32Array(bytes).set([rows, n / 4, n / GROUP, second, 0, normAt, pos, dim, kvDim, headSize, headSize, 0]);
-    new Float32Array(bytes, 16, 1)[0] = EPS;
+    new Float32Array(bytes, 16, 1)[0] = eps;
     return uniform(new Uint8Array(bytes));
   };
   const u = { step, attentionNorm: normParams(0), ffnNorm: normParams(dim), rope: uniform(new Uint32Array([heads, kvHeads, headSize, headSize])),
@@ -872,7 +872,7 @@ function fromHalf(h) {
   return sign * (exponent ? 2 ** (exponent - 15) * (1 + mantissa / 1024) : 2 ** -14 * (mantissa / 1024));
 }
 // The layer in JavaScript (float64 sums), as the CPU's forward pass runs it: what both forms are held to. d: the
-// check's weights ({w, s} of each matrix), h, norms, keys, values (float16 bits) and angles. Returns the residual stream
+// check's weights ({w, s} of each matrix), h, norms, keys, values (float16 bits), angles and eps. Returns the residual stream
 // after the layer and the float16 bits of the keys and values of the position
 function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d) {
   const product = ({ w, s }, n, first, rows, x) => {
@@ -887,7 +887,7 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
   const normed = (x, at) => {
     let squares = 0;
     for (const value of x) squares += value * value;
-    const scale = 1 / Math.sqrt(squares / dim + EPS);
+    const scale = 1 / Math.sqrt(squares / dim + d.eps);
     return x.map((value, i) => d.norms[at + i] * (scale * value));
   };
   const turned = (vector) => {
@@ -924,11 +924,22 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
 // attention), against layerReference. The residual stream after it is held to LAYER_LINE of what the layer added to
 // it (float32 sums in another order are off by about 1e-6 of it; a wrong index, a norm read from the wrong place, a
 // residual left out or gate taken for up by a tenth or more), the key and value of the position to 2e-3 of the largest
-// (a float16 rounded the other way is 2^-11 of itself), and the cache's other positions must stay as they were
+// (a float16 rounded the other way is 2^-11 of itself), and the cache's other positions must stay as they were.
+// The norm folded into the matrices' read (fusedMatVec) is held by the stream and the eps the check starts from: the
+// stream is about ±2 with three channels at ±30 (a real stream has such channels: T92's GPT-2 at 1000× the median),
+// so the norm's scale is far from 1 (about 0.28: a scale left out shows, and the sum of x² has a few large terms among
+// many small), and the check's eps is about a twelfth of the mean of x² (a model's 1e-5 would hide a wrong or missing
+// eps under LAYER_LINE; the timing keeps EPS). Larger channels (±60) make the attention's softmax steep enough that a
+// key or value of the position rounded the other way in float16 moves the stream by up to 2e-4 (lavapipe, 2026-09-27);
+// at ±30 both forms stay within 1e-6 over 45 draws
 const LAYER_CHECK = { dim: 256, hidden: 544, heads: 4, kvHeads: 2 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
+const LAYER_CHECK_OUTLIERS = 3, LAYER_CHECK_OUTLIER = 30, LAYER_CHECK_EPS = 1;
 async function checkLayer() {
   const shape = layerShape(LAYER_CHECK), pos = LAYER_CHECK_POS, verdicts = {};
-  const data = { ...layerState(shape, pos), angles: layerAngles(shape.headSize, pos) };
+  const data = { ...layerState(shape, pos), angles: layerAngles(shape.headSize, pos), eps: LAYER_CHECK_EPS };
+  for (let i = 0; i < LAYER_CHECK_OUTLIERS; i++) {
+    data.h[Math.floor((i + 0.5) * shape.dim / LAYER_CHECK_OUTLIERS)] = LAYER_CHECK_OUTLIER * (i % 2 ? -1 : 1);
+  }
   for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
     data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01) };
   }

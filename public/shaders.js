@@ -1701,7 +1701,15 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(num_workgroups) num_wg
 //     the sum: W·(g ⊙ x·s) = s × W·(g ⊙ x). Every workgroup reads all of x once anyway, and adds up x² beside the rows'
 //     sums in the same reduction (FlashNorm, Graef et al. 2024, arXiv 2407.09577: the scale deferred past the matrix).
 //     No public WGSL does this (llama.cpp's WebGPU fuses the norm with its weight only, rms_norm_mul.wgsl): the lines
-//     are this project's, written as llama.cpp's rms_norm_mul computes it.
+//     are this project's, written as llama.cpp's rms_norm_mul computes it (eps inside the sqrt with the mean, as the
+//     engine's rmsnorm and RMSNORM above). Checked (T150, Fable): the deferred scale rounds once at the end where the
+//     separate form rounds every x·s, so both are within a few float32 ulp of float64 (4e-7 of the largest row at
+//     worst, with channels at 1000× the rest too: the sum of x² adds the small terms among themselves before the tree
+//     meets a large one). What it costs a workgroup: reading g (4·dim bytes from the cache, beside x) and 2·dim more
+//     ALU next to the rows' 4·dim·1.125 bytes from DRAM; what it saves a layer: two dispatches and a vector written and
+//     read. Which is cheaper is the device's (the layer table's fused row against the separate one).
+//     A norm of a head (Qwen3's q and k, T153) cannot go on the write: a head's rows span headSize / 4 workgroups and
+//     WGSL has no sum across them; the read side stays as it is, the write side gets a small dispatch after the matrix.
 // Changed from mul_mat_vec besides: the sums are SUMS (the rows', gate's rows' too, and x²'s), reduced as llama.cpp
 // reduces its rows' (the workgroup's tree, or subgroupAdd), into totals that the write (the epilogue) reads; where a
 // row is written differs by the output. The weights' layout, the scales and Params' first four are T149's.
