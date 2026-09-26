@@ -117,7 +117,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
 </style>
 
 <script>
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, environmentOf, reportTooLong, reportUrl } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, reportTooLong, reportUrl, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -424,22 +424,12 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     const best = Math.max(0, ...bandwidths.flatMap((s) => [s.result?.widen?.GBps ?? 0, s.result?.packed?.GBps ?? 0]));
     if (best && ceilings?.global?.GBps && !ceilings.fallback && !ceilings.global.unsteady) lines.push("", `The fastest of these reads ${percent(best, ceilings.global.GBps)} of what a loop that only reads a buffer reads (${fixed(ceilings.global.GBps)} GB/s, below).`);
     lines.push("");
-    // the CPU's side of a token: the weights read once at what one thread measured, and at twice that, which the
-    // software threads reach at most (T93: the memory's bandwidth)
-    const cpuGBps = bandwidths.find((s) => s.name.includes("1B w1"))?.result?.cpu?.GBps ?? bandwidths[0]?.result?.cpu?.GBps;
-    lines.push("| a token (weights, dispatches, logits back) | GB | dispatches | GPU ms | GPU tok/s | CPU tok/s, 1 thread (estimate) | GPU ÷ CPU with threads (≤ 2×) |", "|---|---:|---:|---:|---:|---:|---:|");
-    for (const s of steps.filter((x) => x.name.startsWith("a token"))) {
-      const t = s.result ?? {};
-      if (s.error || t.error) {
-        lines.push(`| ${s.name.slice(11)} | | | ${s.error ?? t.error} | | | |`);
-        continue;
-      }
-      const one = cpuGBps ? cpuGBps / t.GB : undefined;
-      lines.push(`| ${s.name.slice(11)} | ${fixed(t.GB, 2)} | ${t.dispatches} | ${fixed(t.msPerToken)} | ${fixed(t.tokPerSecond)} | ${fixed(one)} | ${one ? `${fixed(t.tokPerSecond / (2 * one), 2)}×` : ""} |`);
-    }
+    // T157: the CPU beside the GPU is the CPU section's forward pass, rewritten when the CPU section runs after this one
+    const baseline = cpuBaseline(results.cpu);
+    lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline));
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
       "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),
-      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings));
+      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline));
     lines.push("", `**Bridge** (Atomics.wait ↔ Atomics.waitAsync, ${BRIDGE_ROUNDS} round trips): ${bridge.error ?? `${fixed(bridge.microseconds)} µs each`}`);
     return lines.join("\n");
   }
@@ -488,10 +478,11 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
   }
   // a prompt's tokens at once on the GPU against the CPU section's blocks of 16 (the same made-up model: two layers of
   // Llama 3.2 1B's width, no classifier), by every shader of it (T146: the tiled ones beside T135's batched one), with
-  // the GFLOPS of each (a multiply and an add for each weight and token) and the CPU's GOPS from the same count
-  function promptMarkdown(s: any, check?: any, ceilings?: any) {
+  // the GFLOPS of each (a multiply and an add for each weight and token) and the CPU's GOPS from the same count; and
+  // how many times faster each is than the CPU's fastest count of threads (T157)
+  function promptMarkdown(s: any, check?: any, ceilings?: any, baseline?: any) {
     if (!s || s.error) return [`**A prompt all at once**: ${s?.error ?? "not measured"}`];
-    const r = s.result;
+    const r = s.result, cpuPrompt = baseline?.prompt;
     const cpuRows = (results.cpu?.data?.rows ?? []).filter((row: any) => row.promptMsPerToken);
     const cpu = cpuRows.length ? cpuRows.map((row: any) => `${fixed(row.promptMsPerToken, 2)} ms with ${row.threads} (${fixed((2 * r.weights) / (row.promptMsPerToken / 1000) / 1e9, 0)} GOPS)`).join(", ")
       : "run the CPU section for it";
@@ -506,10 +497,12 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     return [`**A prompt** (the CPU section's model: two layers of Llama 3.2 1B's width, ${fixed(r.GB, 2)} GB, ${fixed(r.weights / 1e6, 0)} million weights, no classifier); ` +
       `the CPU, 16 tokens at once: ${cpu}. A tiled shader's name says whose form it takes (llama.cpp's, TensorFlow.js's, ONNX Runtime's) and the rows × tokens of a workgroup's tile. ` +
       "The batched shader is measured again at the end: a device that slows down as it warms up shows it there. " +
-      "Of the ceiling: its GFLOPS against the lower of the device's ceiling above for what the shader multiplies with (f32, or the int8 dots) and the buffer's reads at that many tokens", "",
-      "| shader | tokens at once on the GPU | GPU ms | GPU ms a token | GFLOPS | of the ceiling |", "|---|---:|---:|---:|---:|---:|",
-      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${row.none ?? `failed: ${row.error}`} | | | | |`
-        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} | ${ceilingOf(row, ceilings)} |`)),
+      "Of the ceiling: its GFLOPS against the lower of the device's ceiling above for what the shader multiplies with (f32, or the int8 dots) and the buffer's reads at that many tokens. " +
+      (cpuPrompt ? `GPU ÷ CPU: against the CPU's ${fixed(cpuPrompt.msPerToken, 2)} ms a token with ${cpuPrompt.threads} (its fastest); above 1× the GPU is faster`
+        : `GPU ÷ CPU: not measured (${baseline?.why ?? "the CPU section measured no prompt"})`), "",
+      "| shader | tokens at once on the GPU | GPU ms | GPU ms a token | GFLOPS | of the ceiling | GPU ÷ CPU |", "|---|---:|---:|---:|---:|---:|---:|",
+      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${row.none ?? `failed: ${row.error}`} | | | | | |`
+        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} | ${ceilingOf(row, ceilings)} | ${timesFaster(cpuPrompt?.msPerToken, row.msPerToken)} |`)),
       "", `**Fastest on the GPU** (of the shaders the check found right): ${[fastest(16), fastest(64)].filter(Boolean).join("; ") || "nothing measured"}`];
   }
 
@@ -615,6 +608,13 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       state.className = `state ${result.status}`;
       state.textContent = STATE[result.status];
       out.innerHTML = rendered(result.markdown);
+      // T157: the GPU section's tables hold the GPU against the CPU section; a CPU section run after it (on its own
+      // button) writes them again, and the report with them
+      const g = results.gpu;
+      if (name === "cpu" && g?.data?.steps) {
+        g.markdown = gpuMarkdown(g.data.steps, g.data.bridge, g.data.lost);
+        parts.gpu.out.innerHTML = rendered(g.markdown);
+      }
       report();
     }
     buttons.forEach((b) => (b.disabled = false));

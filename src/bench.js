@@ -132,3 +132,58 @@ export function reportsTable(issues) {
   }
   return out.join("\n");
 }
+
+// T157: the GPU section of /benchmark/ against the CPU section's forward pass (forward.js itself, relaxed SIMD and the
+// software threads, as the model page runs it). Before T157 the CPU of the GPU's token table was one thread of
+// matmul_q8 doubled, which read low: 1.44× on the owner's Android where the CPU section's numbers make about 1.0×.
+const STATES = { none: "found nothing to run on here", wrong: "computed something wrong", error: "failed" };
+
+/**
+ * The CPU the GPU is held against: of the CPU section's rows, the fastest count of software threads for a token and,
+ * each on its own, for a prompt's tokens 16 at once. section: the page's result of the CPU section ({status, data}),
+ * or undefined where it has not run. Where it gives nothing to hold against, { why } says so, and no estimate stands
+ * in for it.
+ */
+export function cpuBaseline(section) {
+  if (!section) return { why: "run the CPU section for it" };
+  if (section.status !== "ok") return { why: `the CPU section ${STATES[section.status] ?? section.status}` };
+  const rows = (section.data?.rows ?? []).filter((row) => Number.isFinite(row.msPerToken) && row.msPerToken > 0);
+  const fastest = (key) => rows.filter((row) => Number.isFinite(row[key]) && row[key] > 0).sort((a, b) => a[key] - b[key])[0];
+  const token = fastest("msPerToken"), prompt = fastest("promptMsPerToken");
+  if (!token) return { why: "the CPU section measured no token" };
+  return { token: { threads: token.threads, msPerToken: token.msPerToken, GBps: token.GBps },
+           ...(prompt ? { prompt: { threads: prompt.threads, msPerToken: prompt.promptMsPerToken } } : {}) };
+}
+
+/** How many times faster the GPU is than the CPU on the same work ("0.52×": the CPU is faster); "" where either is
+ * missing. */
+export const timesFaster = (cpuMs, gpuMs) => (Number.isFinite(cpuMs) && Number.isFinite(gpuMs) && cpuMs > 0 && gpuMs > 0
+  ? `${(cpuMs / gpuMs).toFixed(2)}×` : "");
+
+/**
+ * The GPU section's table of a token, with the CPU beside it. steps: the GPU section's steps whose name begins with
+ * "a token of " ({name, result: {GB, dispatches, msPerToken, tokPerSecond}} or {name, error}); baseline: cpuBaseline().
+ * The CPU section's model (two layers of Llama 3.2 1B's width) is not the GPU's, so the CPU's time of a token is its
+ * weights read at the GB/s the CPU section measured: a token of the model page is its weights read once (T93).
+ */
+export function tokenTable(steps, baseline) {
+  const cpu = baseline.token;
+  const lines = [cpu ? `The CPU: the CPU section's forward pass with ${cpu.threads} software thread${cpu.threads === 1 ? "" : "s"}, its fastest ` +
+      `(${number(cpu.GBps)} GB/s), each model's weights read at that. Above 1× the GPU is faster.`
+    : `The CPU: not measured (${baseline.why}).`, "",
+    "| a token (weights, dispatches, logits back) | GB | dispatches | GPU ms | GPU tok/s | CPU ms | GPU ÷ CPU |",
+    "|---|---:|---:|---:|---:|---:|---:|"];
+  for (const s of steps) {
+    const t = s.result ?? {};
+    const name = s.name.replace(/^a token of /, "");
+    if (s.error || t.error) {
+      // an error's words in one cell: a | or a line break of it would break the table
+      lines.push(`| ${name} | | | ${String(s.error ?? t.error).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ")} | | | |`);
+      continue;
+    }
+    const cpuMs = cpu && Number.isFinite(t.GB) ? (t.GB / cpu.GBps) * 1000 : undefined;
+    lines.push(`| ${name} | ${number(t.GB, 2)} | ${t.dispatches} | ${number(t.msPerToken)} | ${number(t.tokPerSecond)} | ` +
+               `${cpuMs === undefined ? "" : number(cpuMs)} | ${timesFaster(cpuMs, t.msPerToken)} |`);
+  }
+  return lines;
+}

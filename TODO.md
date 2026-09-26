@@ -237,8 +237,15 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 - 根拠: 今は重みを WebAssembly のメモリと GPU の両方に持つ（1B で約 1.1GB 増える）。スマホは同じ物理メモリなので、入るモデルが小さくなる。T94 の第 3 段の宿題。
 - 作るもの: GPU で動かす端末では、変換の `sink` から GPU のバッファへ直接書く。CPU に戻るときの扱い（読み直すか、両方持つか）を決める。
 
-### T157 [計測] ベンチの「GPU ÷ CPU」の列を、実際の CPU の forward で出す — 状態: 未着手（規模 小）
+### T157 [計測] ベンチの「GPU ÷ CPU」の列を、実際の CPU の forward で出す — 状態: **レビュー待ち**（2026-09-27、Opus medium、ブランチ `t157-ratio`。文面は仮の英語で入れた: 下の案を持ち主に。規模 小）
 - 根拠: 表の右端の「GPU ÷ CPU with threads」は、CPU を `matmul_q8` の 1 本の行列 × ベクトルで見積もっていて、relaxed SIMD と 4 本の実際の forward より小さく出る（持ち主の Android で「1.44×」が、CPU の節の数字から見積もると約 1.0 倍）。CPU の節の実測の帯域から出す。表の見た目が変わるので、文面は持ち主に。
+- **実装（2026-09-27）**: CPU は CPU の節の実測（`forward.js` の forward そのもの）の、いちばん速い本数（`src/bench.js` の `cpuBaseline()`。1 トークンとプロンプトで別々に選ぶ）。**1 トークンの表**（`tokenTable()`）: 列は「GPU ms・GPU tok/s・CPU ms・GPU ÷ CPU」。CPU ms は GPU の各モデルの重みの GB ÷ CPU の節のその本数の GB/s（CPU の節のモデルは 2 層の作り物で、ms をそのまま比べられない）。それまでの「CPU tok/s, 1 thread (estimate)」と「(≤ 2×)」の列は外した。**プロンプトの表**: 列「GPU ÷ CPU」を足した（CPU の節の 16 トークンずつのいちばん速い本数の ms / トークン ÷ そのシェーダの ms / トークン。同じ作り物のモデル）。**CPU の節が無い・failed・WRONG・機能が無いときは空にする**（古い見積もりには戻さない。表の上の 1 行が理由を言う: 「run the CPU section for it」など）。**CPU の節を GPU の節の後に走らせたら**（節のボタンで。Run all は CPU が先）、GPU の節の表と報告の Markdown を書き直す。確かめ: `tests/bench.mjs`（持ち主の Android の 1 回目の数字で、packed の 1B が 1.00× になること、本数の選び方、CPU の無いときの理由と空の列、各行の列の数が見出しと同じこと、報告が今までどおり読めること。わざと壊して: CPU の GB/s を 2 倍にすると落ち、誤りの文の `|` を逃がさないと列の数で落ちる）。
+- **持ち主に見せる文面の案**（いまは仮の英語で入っている）:
+  - 1 トークンの表の上: 「The CPU: the CPU section's forward pass with 4 software threads, its fastest (28.7 GB/s), each model's weights read at that. Above 1× the GPU is faster.」
+  - CPU の節が無いとき: 「The CPU: not measured (run the CPU section for it).」（failed のときは「the CPU section failed」、WRONG のときは「the CPU section computed something wrong」）
+  - 1 トークンの表の見出し: 「a token (weights, dispatches, logits back) | GB | dispatches | GPU ms | GPU tok/s | CPU ms | GPU ÷ CPU」
+  - プロンプトの表の説明の終わり: 「GPU ÷ CPU: against the CPU's 2.77 ms a token with 4 (its fastest); above 1× the GPU is faster」、見出しの最後の列「GPU ÷ CPU」
+- **持ち主に見てもらうこと**: 本線に入った後、`/benchmark/` で「Run all」を押し（または CPU の節と GPU の節のボタン）、GPU の節の 2 つの表の右端が出ること。GPU の節のボタンを先に押してから CPU の節のボタンを押すと、GPU の節の右端が埋まること。見た目は `preview.yml` で撮れる。
 
 ### T169 [文書] README を書き直し、しくみと計測の記録を docs/ に分ける — 状態: 未着手（2026-09-27、持ち主「採番せよ」。外からの設計の意見を持ち主が持ち込み、そのうち採るものを 3 つに分けた。規模 小〜中）
 - 根拠: README の冒頭が古い（「Python が層を順に呼び、ctypes でカーネルを呼ぶ」は T93 の前の形。いまの forward は JS と WASM で、GPU もある）。初めての人の「これは何か・どう使うか・どのブラウザで・何 MB か・自分のモデルは」が探しにくい。

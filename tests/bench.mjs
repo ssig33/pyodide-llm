@@ -2,8 +2,8 @@
 //
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
-import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, environmentOf, loginUrl, parseReport, reportBody, reportTooLong,
-         reportUrl, reportsTable } from "../src/bench.js";
+import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, environmentOf, loginUrl, parseReport, reportBody,
+         reportTooLong, reportUrl, reportsTable, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -94,4 +94,50 @@ for (let rows = 1; rows < 120; rows++) {
 }
 assert.ok(new URL(longUrl).searchParams.get("body").endsWith(TOO_LONG));
 assert.ok(new URL(longUrl).searchParams.get("body").includes("**Device**: ("), "the three questions stay");
+
+// T157: the GPU's token table against the CPU section's forward pass. The owner's Android (T134's first report): the
+// CPU section 11.2, 10.3 and 7.3 ms a token with 1, 2 and 4 threads (18.9, 20.5, 28.7 GB/s), its prompt 5.80, 4.50
+// and 2.77; the GPU's packed token of Llama 3.2 1B 48.4 ms, which the old column called 1.44×
+const cpuSection = { status: "ok", data: { rows: [
+  { asked: 1, threads: 1, msPerToken: 11.2, GBps: 18.9, promptMsPerToken: 5.80 },
+  { asked: 2, threads: 2, msPerToken: 10.3, GBps: 20.5, promptMsPerToken: 4.50 },
+  { asked: 4, threads: 4, msPerToken: 7.3, GBps: 28.7, promptMsPerToken: 2.77 },
+  { asked: 8, threads: 3, none: "the browser did not start that many software threads" }] } };
+const baseline = cpuBaseline(cpuSection);
+assert.deepEqual(baseline, { token: { threads: 4, msPerToken: 7.3, GBps: 28.7 }, prompt: { threads: 4, msPerToken: 2.77 } });
+// the fastest of each on its own: a device whose prompt is fastest at another count than its token
+assert.equal(cpuBaseline({ status: "ok", data: { rows: [{ threads: 1, msPerToken: 5, GBps: 40, promptMsPerToken: 3 },
+  { threads: 2, msPerToken: 6, GBps: 35, promptMsPerToken: 2 }] } }).prompt.threads, 2);
+// nothing to hold against: why, and no estimate in its place
+assert.equal(cpuBaseline(undefined).why, "run the CPU section for it");
+assert.equal(cpuBaseline({ status: "error", markdown: "stopped" }).why, "the CPU section failed");
+assert.equal(cpuBaseline({ status: "wrong", data: cpuSection.data }).why, "the CPU section computed something wrong");
+assert.equal(cpuBaseline({ status: "none", markdown: "no WebAssembly SIMD" }).why, "the CPU section found nothing to run on here");
+assert.ok(cpuBaseline({ status: "ok", data: { rows: [{ asked: 1, none: "x" }] } }).why);
+assert.equal(timesFaster(2.77, 5.51), "0.50×");
+assert.equal(timesFaster(undefined, 5.51), "");
+assert.equal(timesFaster(2.77, NaN), "");
+const tokenSteps = [
+  { name: "a token of Llama 3.2 1B", result: { GB: 1.39, dispatches: 241, msPerToken: 81.6, tokPerSecond: 12.25 } },
+  { name: "a token of Llama 3.2 1B, packed int8", result: { GB: 1.39, dispatches: 241, msPerToken: 48.4, tokPerSecond: 20.66 } },
+  { name: "a token of Llama 3.2 3B", error: "could not hold | the weights\nat all" },
+  { name: "a token of llm-jp-3 150M", result: { model: "llm-jp-3 150M", error: "the GPU did not take 0.2 GB of weights" } }];
+for (const [label, table] of [["with the CPU", tokenTable(tokenSteps, baseline)], ["without it", tokenTable(tokenSteps, cpuBaseline(undefined))]]) {
+  // every row of the table as many cells as its header: a report that renders
+  const rowsOf = table.filter((line) => line.startsWith("|"));
+  assert.equal(rowsOf.length, 2 + tokenSteps.length, label);
+  const count = (line) => line.replace(/\\\|/g, "").split("|").length;
+  for (const line of rowsOf) assert.equal(count(line), count(rowsOf[0]), `${label}: ${line}`);
+  assert.ok(!table.join("\n").includes("undefined") && !table.join("\n").includes("NaN"), label);
+}
+const withCpu = tokenTable(tokenSteps, baseline);
+// 1.39 GB at 28.7 GB/s is 48.4 ms: the packed token the old column called 1.44× is 1.00×
+assert.ok(withCpu.includes("| Llama 3.2 1B, packed int8 | 1.39 | 241 | 48.4 | 20.7 | 48.4 | 1.00× |"), withCpu.join("\n"));
+assert.ok(withCpu[0].includes("4 software threads") && withCpu[0].includes("28.7 GB/s"), withCpu[0]);
+const withoutCpu = tokenTable(tokenSteps, cpuBaseline(undefined));
+assert.ok(withoutCpu[0].includes("run the CPU section for it"), withoutCpu[0]);
+assert.ok(withoutCpu.includes("| Llama 3.2 1B | 1.39 | 241 | 81.6 | 12.3 |  |  |"), withoutCpu.join("\n"));
+// and the report with it still reads as the model's table alone
+const withGpu = parseReport(reportBody([markdown, "#### GPU", ...withCpu].join("\n\n")));
+assert.deepEqual(withGpu.rows.map((row) => row.name), ["everything", "without the kernels"]);
 console.log("ok");
