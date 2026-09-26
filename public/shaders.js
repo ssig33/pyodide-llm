@@ -1675,3 +1675,265 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(num_workgroups) num_wg
       }
     }
 }`;
+
+// ---- T150: a layer of a generated token in five dispatches where the separate steps take fourteen (RMSNorm; q, k and
+// v; RoPE and the cache; the attention; o; the residual add; RMSNorm; gate and up; SwiGLU; down; the residual add):
+//   1. q, k and v as one matrix (their rows one after the other in one buffer), the norm on its read of the input, and
+//      RoPE and the cache on its write: q turned into q, k turned and v as they are into the cache at step.pos
+//   2. the attention (flashTile, as the prompt's)
+//   3. o, its product added to the residual stream on its write
+//   4. gate and up in one workgroup (gate's rows, then up's in the same buffer), the norm on the read, SwiGLU on the
+//      write
+//   5. down, added to the residual stream on its write
+// For /benchmark/'s GPU section first (T150), and for the model's GPU worker when it generates on the GPU (T152).
+// The matrix × vector is llama.cpp's mul_mat_vec in its widened form (T149's mulMatVec), and each fold takes its form
+// from a public implementation:
+//   - gate and up in one kernel with the GLU on the write: llama.cpp's CUDA mul_mat_vec_q with its fusion (mmvq.cu:
+//     vgate beside vx, tmp_gate beside tmp, reduced alike, and result *= silu(gate) where a row is written; commit
+//     2145525a). Here the two matrices are one buffer, up's rows `second` rows after gate's.
+//   - the residual added on the write: the same kernel's x_bias (result += x_biases[j], an ADD after the MUL_MAT fused
+//     into it), and MLC LLM's fused matmul and add (FuseDequantizeMatmulEwise, Apache-2.0)
+//   - q, k and v (and gate and up) as one matrix: MLC LLM's Llama (qkv_proj and gate_up_proj, Apache-2.0)
+//   - RoPE and the cache on the write: llama.cpp's CUDA fuses rope and set_rows (ggml-cuda.cu, rope_set_rows_ops) into
+//     one kernel after the matrix; here into the matrix's own write, since a workgroup's 4 rows hold whole pairs (the
+//     neighbours RoPE turns together, and the pairs of float16 the cache holds a u32). The turning is ROPE's above.
+//   - RMSNorm on the read: the norm's scale 1 / sqrt(mean(x²) + eps) is one number for the whole row, so it comes out of
+//     the sum: W·(g ⊙ x·s) = s × W·(g ⊙ x). Every workgroup reads all of x once anyway, and adds up x² beside the rows'
+//     sums in the same reduction (FlashNorm, Graef et al. 2024, arXiv 2407.09577: the scale deferred past the matrix).
+//     No public WGSL does this (llama.cpp's WebGPU fuses the norm with its weight only, rms_norm_mul.wgsl): the lines
+//     are this project's, written as llama.cpp's rms_norm_mul computes it.
+// Changed from mul_mat_vec besides: the sums are SUMS (the rows', gate's rows' too, and x²'s), reduced as llama.cpp
+// reduces its rows' (the workgroup's tree, or subgroupAdd), into totals that the write (the epilogue) reads; where a
+// row is written differs by the output. The weights' layout, the scales and Params' first four are T149's.
+//
+// Adapted from llama.cpp, ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_vec.wgsl and mul_mat_vec_acc.tmpl (MUL_ACC_Q8_0),
+// and ggml/src/ggml-cuda/mmvq.cu (the fusion of gate, bias and GLU) (https://github.com/ggml-org/llama.cpp, commit
+// 2145525a, 2026-09-26), under the MIT License:
+//
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+// input: "norm" (x is the residual stream, normed on the read with norm_weight from params.normAt) or "plain".
+// output: "rope" (rows of q, then kvRows of k, then of v: q into q, k and v into the cache at params.pos), "add" (added
+// to dst: the residual stream) or "swiglu" (silu(gate) × up into dst, up's rows params.second after gate's).
+// Bindings: 0 the weights, 1 their scales, 2 x, 3 params; 4 norm_weight (norm); 5 dst (add, swiglu), or 5 q, 6 the
+// keys, 7 the values, 8 the angles (rope: the cos of the position's headSize / 2 angles, then their sin).
+export const fusedMatVec = ({ input, output, subgroups }) => {
+  const norm = input === "norm", glu = output === "swiglu", rope = output === "rope";
+  const matrices = glu ? 2 : 1, sums = MUL_MAT_VEC_ROWS * matrices + (norm ? 1 : 0);
+  return /* wgsl */ `${subgroups ? "enable subgroups;\nrequires subgroup_id;\n" : ""}
+struct Params { rows: u32, words: u32, perRow: u32, second: u32, eps: f32, normAt: u32, pos: u32, qRows: u32,
+                kvRows: u32, headSize: u32, turned: u32, unused: u32 }
+@group(0) @binding(0) var<storage, read> src0: array<u32>;
+@group(0) @binding(1) var<storage, read> scales: array<f32>;
+@group(0) @binding(2) var<storage, read> src1: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+${norm ? "@group(0) @binding(4) var<storage, read> norm_weight: array<f32>;" : ""}
+${rope ? `@group(0) @binding(5) var<storage, read_write> q: array<f32>;
+@group(0) @binding(6) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(7) var<storage, read_write> values: array<u32>;
+@group(0) @binding(8) var<storage, read> angles: array<f32>;` : "@group(0) @binding(5) var<storage, read_write> dst: array<f32>;"}
+
+const WG_SIZE = 256u;
+const OUTPUTS_PER_WG = ${MUL_MAT_VEC_ROWS}u;
+const BLOCK_SIZE = 32u;
+const THREADS_PER_BLOCK = 4u;
+const ELEMS_PER_THREAD = BLOCK_SIZE / THREADS_PER_BLOCK;
+const MATRICES = ${matrices}u;
+const SUMS = ${sums}u;
+const SQUARES = OUTPUTS_PER_WG * MATRICES;  // where the sum of x² is, when the norm is on the read
+
+fn get_byte_i32(value: u32, index: u32) -> i32 {
+    return bitcast<i32>(((value >> (index * 8)) & 0xFF) << 24) >> 24;
+}
+
+// a row's sum at the thread's part of a block: llama.cpp's inner loop, for one row of either matrix
+fn block_dot(weight_row: u32, block: u32, thread_within_block: u32, x_block: array<f32, ELEMS_PER_THREAD>) -> f32 {
+    let d = scales[weight_row * params.perRow + block];
+    let block_word_base = weight_row * params.words + block * (BLOCK_SIZE / 4u);
+    var q_packed: array<u32, ELEMS_PER_THREAD / 4u>;
+    for (var packed_idx = 0u; packed_idx < ELEMS_PER_THREAD / 4u; packed_idx++) {
+        q_packed[packed_idx] = src0[block_word_base + thread_within_block * 2u + packed_idx];
+    }
+    var row_sum = 0.0;
+    for (var packed_idx = 0u; packed_idx < ELEMS_PER_THREAD / 4u; packed_idx++) {
+        for (var byte_idx = 0u; byte_idx < 4u; byte_idx++) {
+            let q_val = f32(get_byte_i32(q_packed[packed_idx], byte_idx)) * d;
+            row_sum += q_val * x_block[packed_idx * 4u + byte_idx];
+        }
+    }
+    return row_sum;
+}
+
+// the sums as the reduction takes them: the rows' (acc), then up's rows' (acc_up, beside acc as mmvq.cu's tmp_gate beside tmp), then x²
+fn accumulate_vec_dot(thread_id: u32, row_base: u32) -> array<f32, SUMS> {
+    var acc: array<f32, OUTPUTS_PER_WG>;${glu ? `
+    var acc_up: array<f32, OUTPUTS_PER_WG>;` : ""}${norm ? `
+    var squares = 0.0;` : ""}
+
+    let num_blocks = params.perRow;
+    let thread_within_block = thread_id % THREADS_PER_BLOCK;
+    for (var block = thread_id / THREADS_PER_BLOCK; block < num_blocks; block += WG_SIZE / THREADS_PER_BLOCK) {
+        let x_base = block * BLOCK_SIZE + thread_within_block * ELEMS_PER_THREAD;
+        var x_block: array<f32, ELEMS_PER_THREAD>;
+        for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
+            x_block[i] = src1[x_base + i];${norm ? `
+            // the workgroup reads each value of x once: x² for the norm's scale, and the norm's weight now
+            squares += x_block[i] * x_block[i];
+            x_block[i] *= norm_weight[params.normAt + x_base + i];` : ""}
+        }
+        for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
+            let output_row = row_base + row;
+            if (output_row < params.rows) {
+                acc[row] += block_dot(output_row, block, thread_within_block, x_block);${glu ? `
+                // up's row, params.second rows after gate's (mmvq.cu's vgate beside vx)
+                acc_up[row] += block_dot(output_row + params.second, block, thread_within_block, x_block);` : ""}
+            }
+        }
+    }
+
+    var sums: array<f32, SUMS>;
+    for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
+        sums[row] = acc[row];${glu ? `
+        sums[OUTPUTS_PER_WG + row] = acc_up[row];` : ""}
+    }${norm ? `
+    sums[SQUARES] = squares;` : ""}
+    return sums;
+}
+
+// Flattened as [sum][thread] to keep each sum's reduction contiguous in memory.
+var<workgroup> partial_sums: array<f32, SUMS * WG_SIZE>;
+// what the reduction leaves: each sum of the workgroup, for the write
+var<workgroup> totals: array<f32, SUMS>;
+
+fn partial_index(sum: u32, thread: u32) -> u32 {
+    return sum * WG_SIZE + thread;
+}
+
+@compute @workgroup_size(WG_SIZE)
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>${subgroups ? `,
+    @builtin(subgroup_id) subgroup_id: u32,
+    @builtin(subgroup_invocation_id) subgroup_invocation_id: u32,
+    @builtin(num_subgroups) num_subgroups: u32,
+    @builtin(subgroup_size) subgroup_size: u32` : ""}
+) {
+    let thread_id = local_id.x;
+
+    let wg_linear = wg_id.y * num_wg.x + wg_id.x;
+    let output_groups = (params.rows + OUTPUTS_PER_WG - 1u) / OUTPUTS_PER_WG;
+    if (wg_linear >= output_groups) {
+        return;
+    }
+
+    let row_base = wg_linear * OUTPUTS_PER_WG;
+
+    let acc = accumulate_vec_dot(thread_id, row_base);
+${subgroups ? `
+    for (var sum = 0u; sum < SUMS; sum++) {
+        let subgroup_total = subgroupAdd(acc[sum]);
+        if (subgroup_invocation_id == 0u) {
+            partial_sums[partial_index(sum, subgroup_id)] = subgroup_total;
+        }
+    }
+
+    workgroupBarrier();
+
+    for (var sum = subgroup_id; sum < SUMS; sum += num_subgroups) {
+        var sum_acc = 0.0f;
+        for (var k = subgroup_invocation_id; k < num_subgroups; k += subgroup_size) {
+            sum_acc += partial_sums[partial_index(sum, k)];
+        }
+        let sum_total = subgroupAdd(sum_acc);
+        if (subgroup_invocation_id == 0) {
+            totals[sum] = sum_total;
+        }
+    }` : `
+    for (var sum = 0u; sum < SUMS; sum++) {
+        partial_sums[partial_index(sum, thread_id)] = acc[sum];
+    }
+
+    workgroupBarrier();
+
+    var stride = WG_SIZE / 2u;
+
+    while (stride > 0) {
+        if (thread_id < stride) {
+            for (var sum = 0u; sum < SUMS; sum++) {
+                partial_sums[partial_index(sum, thread_id)] += partial_sums[partial_index(sum, thread_id + stride)];
+            }
+        }
+
+        workgroupBarrier();
+        stride = stride / 2;
+    }
+
+    if (thread_id < SUMS) {
+        totals[thread_id] = partial_sums[partial_index(thread_id, 0)];
+    }`}
+
+    workgroupBarrier();
+
+    // the write: the norm's scale on every sum (s × W·(g ⊙ x)), then what the output does with a row
+    let scale = ${norm ? "1.0 / sqrt(totals[SQUARES] / f32(params.perRow * BLOCK_SIZE) + params.eps)" : "1.0"};
+${rope ? `    // a pair of neighbouring rows a thread: q's turned into q; k's turned and v's as they are into the cache at pos
+    if (thread_id < OUTPUTS_PER_WG / 2u) {
+        let row = row_base + 2u * thread_id;
+        if (row < params.rows) {
+            let v0 = totals[2u * thread_id] * scale;
+            let v1 = totals[2u * thread_id + 1u] * scale;
+            let size = params.headSize;
+            let half = size / 2u;
+            if (row < params.qRows) {
+                let in_head = row % size;
+                if (in_head < params.turned) {
+                    let c = angles[in_head / 2u];
+                    let s = angles[half + in_head / 2u];
+                    q[row] = v0 * c - v1 * s;
+                    q[row + 1u] = v0 * s + v1 * c;
+                } else {
+                    q[row] = v0;
+                    q[row + 1u] = v1;
+                }
+            } else if (row < params.qRows + params.kvRows) {
+                let j = row - params.qRows;
+                var key = vec2<f32>(v0, v1);
+                let in_head = j % size;
+                if (in_head < params.turned) {
+                    let c = angles[in_head / 2u];
+                    let s = angles[half + in_head / 2u];
+                    key = vec2<f32>(key.x * c - key.y * s, key.x * s + key.y * c);
+                }
+                keys[params.pos * params.kvRows / 2u + j / 2u] = pack2x16float(key);
+            } else {
+                let j = row - params.qRows - params.kvRows;
+                values[params.pos * params.kvRows / 2u + j / 2u] = pack2x16float(vec2<f32>(v0, v1));
+            }
+        }
+    }` : `    if (thread_id < OUTPUTS_PER_WG) {
+        let row = row_base + thread_id;
+        if (row < params.rows) {
+            let value = totals[thread_id] * scale;${glu ? `
+            // llama.cpp's result *= silu(gate_value), as the GLU writes it (glu.wgsl's OP_SWIGLU)
+            let gate = value;
+            let up = totals[OUTPUTS_PER_WG + thread_id] * scale;
+            dst[row] = gate / (1.0 + exp(-gate)) * up;` : `
+            dst[row] = dst[row] + value;`}
+        }
+    }`}
+}`;
+};

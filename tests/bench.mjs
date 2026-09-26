@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, environmentOf, loginUrl, parseReport, reportBody,
-         matVecTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         layerTable, matVecTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -180,4 +180,38 @@ assert.equal(matVecRow(matVecTable(matVecSteps, {}, matVecCeilings, { lost: "los
 assert.ok(matVecTable(matVecSteps, {}, matVecCeilings, { lost: "lost" }).some((line) => line.includes("the device was lost")));
 assert.equal(matVecRow(matVecTable(matVecSteps, {}, { ...matVecCeilings, fallback: true })), "| widened (T134) | 20.0 GB/s |");
 assert.ok(matVecTable(matVecSteps, {}, matVecCeilings).includes("| llama.cpp MMVQ, 4 rows | failed: a \\| b |"));
+// T150: the layer's table: "faster than the separate steps" beside a fused row, against the separate steps of the
+// same reduction, but none after a lost device, on a fallback adapter, for a row the check found WRONG or an unsteady
+// one; every row as many cells as the header, a failure's | in its cell
+const layerStep = { name: "a layer of a token", result: { model: "Llama 3.2 1B", pos: 127, layers: 16, GB: 0.0684, rows: [
+  { form: "separate steps", check: "a layer, separate steps", fused: false, subgroups: false, dispatches: 14, msPerLayer: 4.2 },
+  { form: "fused (T150)", check: "a layer, fused (T150)", fused: true, subgroups: false, dispatches: 5, msPerLayer: 2.1 },
+  { form: "separate steps, subgroups", check: "a layer, separate steps, subgroups", fused: false, subgroups: true, error: "a | b\nc" },
+  { form: "fused (T150), subgroups", check: "a layer, fused (T150), subgroups", fused: true, subgroups: true, dispatches: 5, msPerLayer: 1.9 }] } };
+const layerRight = { "a layer, separate steps": { ok: true }, "a layer, fused (T150)": { ok: true } };
+const fasterOf = (lines, form) => cellsOf(lines.find((line) => line.startsWith(`| ${form} |`) || line.startsWith(`| ${form} (WRONG`))).at(-1).trim();
+const layerLines = layerTable(layerStep, layerRight);
+assert.ok(layerLines.includes("| fused (T150) | 5 | 2.10 | 33.6 | 2.0× |"), layerLines.join("\n"));
+assert.equal(fasterOf(layerLines, "separate steps"), "");
+// no separate steps measured with subgroups: nothing to hold the fused one against
+assert.equal(fasterOf(layerLines, "fused (T150), subgroups"), "");
+assert.ok(layerLines.includes("| separate steps, subgroups | failed: a \\| b c | | | |"), layerLines.join("\n"));
+for (const [label, lines] of [["right", layerLines], ["lost", layerTable(layerStep, layerRight, { lost: "lost" })],
+  ["fallback", layerTable(layerStep, layerRight, { fallback: true })], ["no check", layerTable(layerStep)]]) {
+  const rowsOf = lines.filter((line) => line.startsWith("|"));
+  assert.equal(rowsOf.length, 2 + layerStep.result.rows.length, label);
+  for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
+  assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), label);
+}
+assert.equal(fasterOf(layerTable(layerStep, layerRight, { lost: "lost" }), "fused (T150)"), "");
+assert.ok(layerTable(layerStep, layerRight, { lost: "lost" }).some((line) => line.includes("the device was lost")));
+assert.equal(fasterOf(layerTable(layerStep, layerRight, { fallback: true }), "fused (T150)"), "");
+const layerWrong = { ...layerRight, "a layer, fused (T150)": { ok: false } };
+assert.equal(fasterOf(layerTable(layerStep, layerWrong), "fused (T150)"), "");
+assert.ok(layerTable(layerStep, layerWrong).some((line) => line.startsWith("| fused (T150) (WRONG in the check) |")));
+// the separate steps WRONG: nothing right to hold the fused one against
+assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, separate steps": { ok: false } }), "fused (T150)"), "");
+const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.fused && !row.subgroups ? { ...row, unsteady: true } : row)) } };
+assert.ok(layerTable(unsteadyStep, layerRight).includes("| fused (T150) | 5 | unsteady: 2.10 | 33.6 |  |"));
+assert.equal(layerTable({ name: "a layer of a token", error: "x | y" })[0], "**A layer of a token**: x \\| y");
 console.log("ok");

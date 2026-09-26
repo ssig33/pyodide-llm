@@ -277,3 +277,33 @@ export function tokenTable(steps, baseline, gpu = {}) {
   }
   return lines;
 }
+
+/**
+ * T150: the GPU section's table of one layer of a token, its fourteen steps each a dispatch of their own against the
+ * same fused into five (public/shaders.js's fusedMatVec). step: {name, result: {model, pos, layers, GB, rows: [{form,
+ * check, fused, subgroups, dispatches, msPerLayer, unsteady}, or {form, check, error}]}} or {name, error}; check: the
+ * shaders against JavaScript (a form's verdict under row.check); gpu: { fallback, lost }. "Faster than the separate
+ * steps" beside a fused row, against the separate steps of the same reduction: not where noRatios() says none, nor
+ * for a row the check found WRONG or that was unsteady.
+ */
+export function layerTable(step, check, gpu = {}) {
+  if (!step) return [];
+  if (step.error || !step.result) return [`**A layer of a token**: ${tableCell(step.error ?? "not measured")}`];
+  const r = step.result, none = noRatios(gpu);
+  const wrong = (row) => Boolean(check && check[row.check] && !check[row.check].ok);
+  const usable = (row) => Number.isFinite(row?.msPerLayer) && row.msPerLayer > 0 && !row.unsteady && !wrong(row);
+  const faster = (row) => {
+    if (none || !row.fused || !usable(row)) return "";
+    const separate = r.rows.find((one) => !one.fused && one.subgroups === row.subgroups);
+    return usable(separate) ? times(separate.msPerLayer / row.msPerLayer) : "";
+  };
+  return [`**A layer of a token** (${r.model}'s width, at position ${r.pos}, ${number(r.GB * 1000, 0)} MB of weights): its fourteen steps each a dispatch of its own ` +
+    "(the norm, q, k, v, RoPE and the cache, the attention, o, the residual's add, the norm, gate, up, SwiGLU, down, the add), and the same fused into five " +
+    "(q, k and v with the norm, RoPE and the cache; the attention; o with the add; gate and up with the norm and SwiGLU; down with the add). " +
+    "Each is timed as a submission of 2n layers less one of n, the weights read from copies of them in turn, as the matrix × vector is.",
+    ...(none ? [`Faster than the separate steps: ${none}.`] : []), "",
+    `| a layer | dispatches | GPU ms | its ${r.layers} layers, ms | faster than the separate steps |`, "|---|---:|---:|---:|---:|",
+    ...r.rows.map((row) => (row.error ? `| ${tableCell(row.form)} | ${tableCell(`failed: ${row.error}`)} | | | |`
+      : `| ${tableCell(row.form)}${wrong(row) ? " (WRONG in the check)" : ""} | ${row.dispatches} | ${row.unsteady ? "unsteady: " : ""}${number(row.msPerLayer, 2)} | ` +
+        `${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
+}

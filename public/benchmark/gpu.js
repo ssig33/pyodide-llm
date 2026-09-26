@@ -7,12 +7,13 @@
 //                                         too, with their edges)
 //   { step: "bandwidth", shape }          GB/s of one int8 matrix times a vector, by every shader of matVecShaders()
 //                                         (T134's two and T149's from llama.cpp and ONNX Runtime), and the CPU's
-//   { step: "token", model, kind, fused, sample }
+//   { step: "token", model, kind, sample }
 //                                         a whole token's work of a model's shapes (every layer's matrices, a few small
-//                                         dispatches, the classifier, the logits read back), ms per token. fused: the
-//                                         matrices that read the same input as one (q, k and v; gate and up) and fewer
-//                                         small dispatches; sample: the most likely token found on the GPU, and only its
-//                                         id read back instead of every logit
+//                                         dispatches, the classifier, the logits read back), ms per token. sample: the
+//                                         most likely token found on the GPU, and only its id read back instead of every
+//                                         logit
+//   { step: "layer" }                     T150: one layer of a token of Llama 3.2 1B's width, as its fourteen separate
+//                                         steps and fused into five dispatches (shaders.js's fusedMatVec), ms a layer
 //   { step: "overhead" }                  what a token costs besides the weights: 240 empty dispatches, a submission
 //                                         with and without waiting for it, reading back 4 bytes and all the logits
 //   { step: "prompt", counts }            the tokens of a prompt through the matrices all at once (matrix × matrix,
@@ -44,14 +45,9 @@ const layerMatrices = ({ dim, hidden, heads, kvHeads }) => {
   const kvDim = (dim / heads) * kvHeads;
   return [[dim, dim], [kvDim, dim], [kvDim, dim], [dim, dim], [hidden, dim], [hidden, dim], [dim, hidden]];
 };
-// the same weights with the matrices that read the same input as one: q, k and v, then o, gate and up, then down
-const fusedMatrices = ({ dim, hidden, heads, kvHeads }) => {
-  const kvDim = (dim / heads) * kvHeads;
-  return [[dim + 2 * kvDim, dim], [dim, dim], [2 * hidden, dim], [dim, hidden]];
-};
-// the small steps a layer dispatches on its own: seven as the CPU's forward pass has them, three where each is folded
-// into its neighbour (the norms into the next matrix's reading of its input, the residual adds into the matrix before)
-const SMALL_PER_LAYER = 7, SMALL_FUSED = 3;
+// the small steps a layer dispatches on its own, as the CPU's forward pass has them (a stand-in each, SMALL; T150's
+// layer step runs the real ones)
+const SMALL_PER_LAYER = 7;
 // the CPU section's made-up model (public/benchmark/sections.js): Llama 3.2 1B's width, two layers
 const PROMPT_MODEL = { dim: 2048, hidden: 8192, layers: 2, heads: 32, kvHeads: 8 };
 const matrixBytes = ([rows, n]) => rows * n + (rows * n / GROUP) * 4;
@@ -345,6 +341,7 @@ async function check() {
   Object.assign(verdicts, await checkMatVec());
   Object.assign(verdicts, await checkTiled());
   verdicts.argmax = await checkArgmax();
+  Object.assign(verdicts, await checkLayer());
   return verdicts;
 }
 // T149: every matrix × vector shader of its own (llama.cpp's and ONNX Runtime's) on 300 rows cut into chunks of 101 (a
@@ -628,12 +625,11 @@ async function cpuBandwidth([rows, n]) {
 }
 
 // ---- a token's work: every layer's seven matrices and seven small dispatches, the classifier, the logits back.
-// fused: four matrices a layer (the ones that read the same input as one) and three small dispatches; sample: the
-// argmax on the GPU and 4 bytes back instead of the logits
-async function token(name, kind = "widen", { fused = false, sample = false } = {}) {
+// sample: the argmax on the GPU and 4 bytes back instead of the logits
+async function token(name, kind = "widen", { sample = false } = {}) {
   await gpu();
   const model = MODELS[name];
-  const perLayer = fused ? fusedMatrices(model) : layerMatrices(model), small = fused ? SMALL_FUSED : SMALL_PER_LAYER;
+  const perLayer = layerMatrices(model), small = SMALL_PER_LAYER;
   const shapes = [...Array(model.layers)].flatMap(() => perLayer);
   const classifier = [model.vocab, model.dim];
   const longest = Math.max(model.dim, model.hidden), most = Math.max(2 * model.hidden, model.vocab);
@@ -687,9 +683,335 @@ async function token(name, kind = "widen", { fused = false, sample = false } = {
   picked?.owned.forEach((x) => x.destroy());
   [a, b, back].forEach((x) => x.destroy());
   destroyVectors(io);
-  return { model: name, kind, fused, sample, GB: bytes / 1e9, msPerToken: ms, tokPerSecond: 1000 / ms,
+  return { model: name, kind, sample, GB: bytes / 1e9, msPerToken: ms, tokPerSecond: 1000 / ms,
     GBps: bytes / (ms / 1000) / 1e9,
     dispatches: made.reduce((n, m) => n + m.dispatches.length, 0) + model.layers * small + (picked ? 1 : 0) };
+}
+
+// ---- T150: one layer of a generated token (Llama 3.2 1B's width, at position LAYER_POS), as its fourteen separate
+// steps (RMSNorm, q, k, v, RoPE and the cache, the attention, o, the residual add, RMSNorm, gate, up, SwiGLU, down, the
+// residual add: the prompt's shaders and T149's matrix × vector) and fused into five (shaders.js's fusedMatVec: q, k
+// and v with the norm and RoPE, the attention, o with the add, gate and up with the norm and SwiGLU, down with the
+// add), each with the workgroup's reduction and, where subgroups are, with subgroupAdd. Both forms read the same
+// weights: a layer's four matrices (q, k and v one after the other; o; gate and up; down), the separate steps a range
+// of rows of them each. Timed as the matrix × vector is (T149): n layers a submission, each on the next copy of the
+// weights (copies that make MATVEC_BYTES, so that a layer is not read from the GPU's caches), a submission of 2n less
+// one of n (paired). The attention is the prompt's (flashTile, f32 in the workgroup's memory and no subgroups, the
+// same in both forms: its cost is in both rows alike).
+const LAYER_POS = 127, LAYER_MOST = 4096, EPS = 1e-5, THETA = 500000;
+const layerShape = ({ dim, hidden, heads, kvHeads }) => {
+  const headSize = dim / heads, kvDim = headSize * kvHeads;
+  return { dim, hidden, heads, kvHeads, headSize, kvDim,
+    matrices: { qkv: [dim + 2 * kvDim, dim], o: [dim, dim], gateUp: [2 * hidden, dim], down: [dim, hidden] } };
+};
+const layerForms = () => {
+  const subgroups = device.features.has("subgroups") && (navigator.gpu.wgslLanguageFeatures?.has("subgroup_id") ?? false);
+  return (subgroups ? [false, true] : [false]).flatMap((withSubgroups) => [false, true].map((fused) =>
+    ({ name: `${fused ? "fused (T150)" : "separate steps"}${withSubgroups ? ", subgroups" : ""}`, fused, subgroups: withSubgroups })));
+};
+// the check's verdict of a form, by name
+const layerCheck = (form) => `a layer, ${form.name}`;
+// a pipeline of its WGSL, made once (in a validation scope: a shader this device refuses rejects there)
+const layerPipelines = new Map();
+async function compiled(code) {
+  if (!layerPipelines.has(code)) {
+    layerPipelines.set(code, validated(() => device.createComputePipelineAsync({ layout: "auto",
+      compute: { module: device.createShaderModule({ code }), entryPoint: "main" } })));
+  }
+  return layerPipelines.get(code);
+}
+async function layerPipes(shape, subgroups) {
+  const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX } = device.limits;
+  const flash = WGSL.flashShape({ headSize: shape.headSize, half: false, subgroups: false, memory,
+    threads: Math.min(maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX) });
+  if (flash.none) throw new Error(flash.none);
+  // one at a time: each in an error scope of its own
+  const pipes = { small: pipelinesFor().small };
+  for (const [key, code] of [["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["flash", WGSL.flashTile(flash)],
+    ["product", WGSL.mulMatVec({ packed: false, subgroups })], ["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups })],
+    ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })], ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })]]) {
+    pipes[key] = await compiled(code);
+  }
+  return pipes;
+}
+// A layer's buffers: copies of its four matrices (data: the check's weights, else random), the vectors, the norms'
+// weights, the angles of the position, the cache (positions up to pos), and the uniforms. owned: where they go to be
+// destroyed. dispatches(form, pipes, copy): one layer's, [pipeline, bind group, x, y] each.
+function layerParts(shape, pos, copies, owned, data) {
+  const { dim, hidden, heads, kvHeads, headSize, kvDim } = shape;
+  const make = (bytes, usage = STORAGE | COPY_DST | COPY_SRC) => {
+    const b = buffer(bytes, usage);
+    owned.push(b);
+    return b;
+  };
+  const uniform = (bytes) => {
+    const b = make(bytes.byteLength, UNIFORM | COPY_DST);
+    device.queue.writeBuffer(b, 0, bytes);
+    return b;
+  };
+  const copiesOf = [];
+  for (let c = 0; c < copies; c++) {
+    const one = {};
+    for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
+      if (rows * n > device.limits.maxStorageBufferBindingSize) throw new Error(`${key} is past a binding of this device`);
+      const w = make(rows * n), s = make((rows * n / GROUP) * 4);
+      if (data) {
+        device.queue.writeBuffer(w, 0, data[key].w);
+        device.queue.writeBuffer(s, 0, data[key].s);
+      } else {
+        fill(w, rows * n);
+        device.queue.writeBuffer(s, 0, floats(rows * n / GROUP, 0.002));
+      }
+      one[key] = { w, s, rows, n };
+    }
+    copiesOf.push(one);
+  }
+  const cacheBytes = (pos + 1) * kvDim * 2;
+  const v = { h: make(dim * 4), xb: make(dim * 4), q: make(dim * 4), k: make(kvDim * 4), v: make(kvDim * 4), att: make(dim * 4),
+    t: make(dim * 4), g: make(hidden * 4), u: make(hidden * 4), norms: make(2 * dim * 4), angles: make(headSize * 4),
+    keys: make(cacheBytes), values: make(cacheBytes) };
+  const angles = data?.angles ?? layerAngles(headSize, pos);
+  device.queue.writeBuffer(v.angles, 0, angles);
+  // the state a layer starts from: the residual stream, the norms' weights, the cache of the positions before
+  const reset = (state) => {
+    device.queue.writeBuffer(v.h, 0, state.h);
+    device.queue.writeBuffer(v.norms, 0, state.norms);
+    device.queue.writeBuffer(v.keys, 0, state.keys);
+    device.queue.writeBuffer(v.values, 0, state.values);
+  };
+  reset(data ?? layerState(shape, pos));
+  const step = uniform(new Uint32Array([1, pos, 0, 0]));
+  const normParams = (at) => {
+    const bytes = new ArrayBuffer(16);
+    new Uint32Array(bytes, 0, 2).set([dim, at]);
+    new Float32Array(bytes, 8, 1)[0] = EPS;
+    return uniform(new Uint8Array(bytes));
+  };
+  const flashParams = new ArrayBuffer(16);
+  new Uint32Array(flashParams, 0, 2).set([heads, kvHeads]);
+  new Float32Array(flashParams, 8, 1)[0] = 1 / Math.sqrt(headSize);
+  // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, pos, qRows, kvRows, headSize, turned
+  const fusedParams = (rows, n, second = 0, normAt = 0) => {
+    const bytes = new ArrayBuffer(48);
+    new Uint32Array(bytes).set([rows, n / 4, n / GROUP, second, 0, normAt, pos, dim, kvDim, headSize, headSize, 0]);
+    new Float32Array(bytes, 16, 1)[0] = EPS;
+    return uniform(new Uint8Array(bytes));
+  };
+  const u = { step, attentionNorm: normParams(0), ffnNorm: normParams(dim), rope: uniform(new Uint32Array([heads, kvHeads, headSize, headSize])),
+    flash: uniform(new Uint8Array(flashParams)), swiglu: uniform(new Uint32Array([hidden, 0, 0, 0])),
+    qkv: fusedParams(dim + 2 * kvDim, dim), o: fusedParams(dim, dim), gateUp: fusedParams(hidden, dim, hidden, dim), down: fusedParams(dim, hidden) };
+  // the matrix × vector's Shape (rows, words, perRow, first) of each range the separate steps read, made once
+  const shapes = new Map();
+  const shapeOf = (rows, n) => {
+    const key = `${rows},${n}`;
+    if (!shapes.has(key)) shapes.set(key, uniform(new Uint32Array([rows, n / 4, n / GROUP, 0])));
+    return shapes.get(key);
+  };
+  const group = (pipeline, entries) => device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+    entries: entries.map(([binding, resource]) => ({ binding, resource: "offset" in resource ? resource : { buffer: resource } })) });
+  const dispatches = (form, pipes, copy) => {
+    const m = copiesOf[copy];
+    const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, v.keys], [2, v.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
+    const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
+    if (form.fused) {
+      return [
+        [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles]]), groups(m.qkv.rows), 1],
+        attention,
+        [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
+        [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
+        [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
+    }
+    // rows first to first + rows of a matrix, x into y
+    const product = ({ w, s, n }, first, rows, x, y) => [pipes.product, group(pipes.product, [
+      [0, { buffer: w, offset: first * n, size: rows * n }], [1, { buffer: s, offset: first * n / 8, size: rows * n / 8 }],
+      [2, x], [3, y], [4, shapeOf(rows, n)]]), groups(rows), 1];
+    const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
+    const add = [pipes.small, group(pipes.small, [[0, v.t], [1, v.h]]), 1, 1];
+    return [norm(u.attentionNorm), product(m.qkv, 0, dim, v.xb, v.q), product(m.qkv, dim, kvDim, v.xb, v.k), product(m.qkv, dim + kvDim, kvDim, v.xb, v.v),
+      [pipes.rope, group(pipes.rope, [[0, v.q], [1, v.k], [2, v.v], [3, v.keys], [4, v.values], [5, v.angles], [6, u.rope], [7, u.step]]), 1, 1],
+      attention, product(m.o, 0, dim, v.att, v.t), add, norm(u.ffnNorm), product(m.gateUp, 0, hidden, v.xb, v.g),
+      product(m.gateUp, hidden, hidden, v.xb, v.u), [pipes.swiglu, group(pipes.swiglu, [[0, v.g], [1, v.u], [2, u.swiglu], [3, u.step]]), Math.ceil(hidden / 64), 1],
+      product(m.down, 0, dim, v.g, v.t), add];
+  };
+  return { vectors: v, reset, dispatches };
+}
+// the cos of a position's headSize / 2 angles, then their sin (Llama 3's theta, unscaled: any angles would do)
+function layerAngles(headSize, pos) {
+  const angles = new Float32Array(headSize), half = headSize / 2;
+  for (let i = 0; i < half; i++) {
+    const angle = pos * THETA ** (-2 * i / headSize);
+    angles[i] = Math.cos(angle);
+    angles[half + i] = Math.sin(angle);
+  }
+  return angles;
+}
+// a made-up state: the residual stream, the norms' weights about 1, and the cache before pos of float16 pairs
+function layerState({ dim, kvDim }, pos) {
+  const h = floats(dim, 4), norms = new Float32Array(2 * dim).map(() => 0.5 + Math.random());
+  const cache = () => new Uint16Array((pos + 1) * kvDim).map(() => toHalf((Math.random() - 0.5) * 4));
+  return { h, norms, keys: cache(), values: cache() };
+}
+// float32 to float16's bits, rounded to the nearest (ties to even), as a cache holds its keys and values
+const f32 = new Float32Array(1), bits32 = new Uint32Array(f32.buffer);
+function toHalf(value) {
+  f32[0] = value;
+  const b = bits32[0], sign = (b >>> 16) & 0x8000, exponent = ((b >>> 23) & 0xff) - 112;
+  let mantissa = b & 0x7fffff;
+  if (exponent >= 31) return sign | 0x7c00;
+  if (exponent <= 0) {
+    if (exponent < -10) return sign;
+    mantissa |= 0x800000;
+    const shift = 14 - exponent, kept = mantissa >> shift, rest = mantissa & ((1 << shift) - 1), middle = 1 << (shift - 1);
+    return sign | (kept + (rest > middle || (rest === middle && kept & 1) ? 1 : 0));
+  }
+  const kept = (exponent << 10) | (mantissa >> 13), rest = mantissa & 0x1fff;
+  return sign | (kept + (rest > 0x1000 || (rest === 0x1000 && kept & 1) ? 1 : 0));
+}
+function fromHalf(h) {
+  const exponent = (h >> 10) & 31, mantissa = h & 1023, sign = h & 0x8000 ? -1 : 1;
+  return sign * (exponent ? 2 ** (exponent - 15) * (1 + mantissa / 1024) : 2 ** -14 * (mantissa / 1024));
+}
+// The layer in JavaScript (float64 sums), as the CPU's forward pass runs it: what both forms are held to. d: the
+// check's weights ({w, s} of each matrix), h, norms, keys, values (float16 bits) and angles. Returns the residual stream
+// after the layer and the float16 bits of the keys and values of the position
+function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d) {
+  const product = ({ w, s }, n, first, rows, x) => {
+    const signed = new Int8Array(w.buffer, w.byteOffset, w.length), out = new Float64Array(rows);
+    for (let r = 0; r < rows; r++) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += signed[(first + r) * n + i] * s[((first + r) * n + i) / GROUP | 0] * x[i];
+      out[r] = sum;
+    }
+    return out;
+  };
+  const normed = (x, at) => {
+    let squares = 0;
+    for (const value of x) squares += value * value;
+    const scale = 1 / Math.sqrt(squares / dim + EPS);
+    return x.map((value, i) => d.norms[at + i] * (scale * value));
+  };
+  const turned = (vector) => {
+    for (let j = 0; j < vector.length; j += 2) {
+      const i = (j % headSize) / 2, c = d.angles[i], s = d.angles[headSize / 2 + i], [a, b] = [vector[j], vector[j + 1]];
+      vector[j] = a * c - b * s;
+      vector[j + 1] = a * s + b * c;
+    }
+    return vector;
+  };
+  const h = Float64Array.from(d.h), xb = normed(h, 0);
+  const q = turned(product(d.qkv, dim, 0, dim, xb)), k = turned(product(d.qkv, dim, dim, kvDim, xb));
+  const v = product(d.qkv, dim, dim + kvDim, kvDim, xb);
+  const keys = Uint16Array.from(k, toHalf), values = Uint16Array.from(v, toHalf);
+  const cached = (all, row) => (p, i) => fromHalf(p === pos ? row[i] : all[p * kvDim + i]);
+  const K = cached(d.keys, keys), V = cached(d.values, values), att = new Float64Array(dim);
+  for (let head = 0; head < heads; head++) {
+    const kv = Math.floor(head / (heads / kvHeads)) * headSize, scores = [];
+    for (let p = 0; p <= pos; p++) {
+      let score = 0;
+      for (let i = 0; i < headSize; i++) score += q[head * headSize + i] * K(p, kv + i);
+      scores.push(score / Math.sqrt(headSize));
+    }
+    const most = Math.max(...scores), weights = scores.map((score) => Math.exp(score - most)), sum = weights.reduce((a, b) => a + b);
+    for (let p = 0; p <= pos; p++) for (let i = 0; i < headSize; i++) att[head * headSize + i] += (weights[p] / sum) * V(p, kv + i);
+  }
+  const o = product(d.o, dim, 0, dim, att), h1 = h.map((value, i) => value + o[i]), xb2 = normed(h1, dim);
+  const gate = product(d.gateUp, dim, 0, hidden, xb2), up = product(d.gateUp, dim, hidden, hidden, xb2);
+  const down = product(d.down, hidden, 0, dim, gate.map((g, i) => (g / (1 + Math.exp(-g))) * up[i]));
+  return { h: h1.map((value, i) => value + down[i]), keys, values };
+}
+// The check (T150): every form of the layer on a small one (Llama's shape: GQA, 4 heads of 64 and 2 of K and V; a
+// hidden width of 544 = 17 groups, a part of mul_mat_vec's 64 a pass), at position 70 (71 positions, two tiles of the
+// attention), against layerReference. The residual stream after it is held to LAYER_LINE of what the layer added to
+// it (float32 sums in another order are off by about 1e-6 of it; a wrong index, a norm read from the wrong place, a
+// residual left out or gate taken for up by a tenth or more), the key and value of the position to 2e-3 of the largest
+// (a float16 rounded the other way is 2^-11 of itself), and the cache's other positions must stay as they were
+const LAYER_CHECK = { dim: 256, hidden: 544, heads: 4, kvHeads: 2 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
+async function checkLayer() {
+  const shape = layerShape(LAYER_CHECK), pos = LAYER_CHECK_POS, verdicts = {};
+  const data = { ...layerState(shape, pos), angles: layerAngles(shape.headSize, pos) };
+  for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
+    data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01) };
+  }
+  const want = layerReference(shape, pos, data);
+  let added = 0, largestKey = 0, largestValue = 0;
+  want.h.forEach((value, i) => (added = Math.max(added, Math.abs(value - data.h[i]))));
+  want.keys.forEach((bits) => (largestKey = Math.max(largestKey, Math.abs(fromHalf(bits)))));
+  want.values.forEach((bits) => (largestValue = Math.max(largestValue, Math.abs(fromHalf(bits)))));
+  for (const form of layerForms()) {
+    try {
+      const got = await scoped(async (owned) => {
+        const pipes = await layerPipes(shape, form.subgroups);
+        const parts = layerParts(shape, pos, 1, owned, data);
+        const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+        parts.dispatches(form, pipes, 0).forEach((d) => run(pass, d));
+        pass.end();
+        const h = new Float32Array(await readBack(encoder, parts.vectors.h, shape.dim * 4));
+        const cacheBytes = (pos + 1) * shape.kvDim * 2;
+        return { h, keys: new Uint16Array(await readBack(device.createCommandEncoder(), parts.vectors.keys, cacheBytes)),
+          values: new Uint16Array(await readBack(device.createCommandEncoder(), parts.vectors.values, cacheBytes)) };
+      });
+      let off = 0, keyOff = 0, valueOff = 0, touched = false;
+      got.h.forEach((value, i) => (off = Math.max(off, Math.abs(value - want.h[i]) / added)));
+      for (let p = 0; p <= pos; p++) {
+        for (let i = 0; i < shape.kvDim; i++) {
+          const at = p * shape.kvDim + i;
+          if (p === pos) {
+            keyOff = Math.max(keyOff, Math.abs(fromHalf(got.keys[at]) - fromHalf(want.keys[i])) / largestKey);
+            valueOff = Math.max(valueOff, Math.abs(fromHalf(got.values[at]) - fromHalf(want.values[i])) / largestValue);
+          } else touched ||= got.keys[at] !== data.keys[at] || got.values[at] !== data.values[at];
+        }
+      }
+      const cache = Math.max(keyOff, valueOff);
+      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched,
+        stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}) };
+    } catch (error) {
+      verdicts[layerCheck(form)] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+    } finally {
+      // the page stops a section that says nothing for 5 minutes: SwiftShader compiles each form's shaders for tens of s
+      postMessage({ alive: true });
+    }
+  }
+  return verdicts;
+}
+async function layer() {
+  await gpu();
+  const shape = layerShape(MODELS["Llama 3.2 1B"]);
+  const bytes = Object.values(shape.matrices).reduce((sum, matrix) => sum + matrixBytes(matrix), 0);
+  const copies = fallback ? 1 : Math.ceil(MATVEC_BYTES / bytes), rows = [];
+  await scoped(async (owned) => {
+    const parts = layerParts(shape, LAYER_POS, copies, owned);
+    await device.queue.onSubmittedWorkDone();
+    for (const form of layerForms()) {
+      const row = { form: form.name, check: layerCheck(form), fused: form.fused, subgroups: form.subgroups };
+      try {
+        const pipes = await layerPipes(shape, form.subgroups);
+        const each = [...Array(copies)].map((_, copy) => parts.dispatches(form, pipes, copy));
+        // n layers a submission, each on the next copy
+        let next = 0;
+        const submission = async (n) => {
+          const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+          for (let i = 0; i < n; i++) each[next++ % copies].forEach((d) => run(pass, d));
+          pass.end();
+          const began = performance.now();
+          device.queue.submit([encoder.finish()]);
+          await device.queue.onSubmittedWorkDone();
+          return performance.now() - began;
+        };
+        const r = await validated(async () => {
+          if (fallback) return { ms: await submission(1), dispatches: 1 };
+          await submission(2);
+          return paired(submission, LAYER_MOST);
+        });
+        rows.push({ ...row, dispatches: each[0].length, msPerLayer: r.ms / r.dispatches, layers: r.dispatches,
+          ...(r.ratio ? { ratio: r.ratio } : {}), ...(r.unsteady ? { unsteady: true } : {}) });
+      } catch (error) {
+        rows.push({ ...row, error: String(error?.message ?? error) });
+      } finally {
+        postMessage({ alive: true });
+      }
+    }
+  });
+  return { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, rows };
 }
 
 // ---- what a token costs besides its weights: the dispatches of Llama 3.2 1B's token (seven matrices and seven small
@@ -955,6 +1277,7 @@ onmessage = async ({ data }) => {
     else if (data.step === "check") result = await check();
     else if (data.step === "bandwidth") result = await bandwidth(data.shape);
     else if (data.step === "token") result = await token(data.model, data.kind, data);
+    else if (data.step === "layer") result = await layer();
     else if (data.step === "overhead") result = await overhead();
     else if (data.step === "prompt") result = await prompt(data.counts);
     else if (data.step === "ceilings") result = await ceilings();

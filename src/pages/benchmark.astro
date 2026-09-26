@@ -55,10 +55,10 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       <section data-section="gpu">
         <h2>GPU</h2>
         <p class="about">WebGPU: the adapter, its shaders checked against JavaScript, how fast it reads int8 weights, and
-          a token's work of three model sizes against the CPU. Then the same token in fewer dispatches and with the next
-          token chosen on the GPU, what a token costs besides its weights, the device's ceilings (loops of multiply-adds,
-          int8 dots or reads alone), and a prompt's tokens all at once, with the share of its ceiling each shader
-          reaches. The weights are random bytes.</p>
+          a token's work of three model sizes against the CPU. Then the same token with the next token chosen on the GPU,
+          one layer of a token as separate steps and fused into fewer dispatches, what a token costs besides its
+          weights, the device's ceilings (loops of multiply-adds, int8 dots or reads alone), and a prompt's tokens all
+          at once, with the share of its ceiling each shader reaches. The weights are random bytes.</p>
       </section>
       <section data-section="storage">
         <h2>Storage</h2>
@@ -117,7 +117,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
 </style>
 
 <script>
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -340,9 +340,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
   // the GPU section of T94's stage 0, step by step as /gpu-test/ ran it
   const SHAPES: Record<string, number[]> = { "llm-jp-3 150M w1": [2048, 512], "Llama 3.2 1B w1": [8192, 2048], "Llama 3.2 1B classifier": [128256, 2048] };
   const BRIDGE_ROUNDS = 2000;
-  // T135's candidates for a token (T134): the same weights in fewer dispatches, and the next token chosen on the GPU
-  const GPU_WAYS: [string, any][] = [["fused", { fused: true }], ["chosen on the GPU", { sample: true }],
-    ["fused and chosen on the GPU", { fused: true, sample: true }]];
+  // T135's candidate for a token (T134): the next token chosen on the GPU (the fewer dispatches are T150's layer)
+  const GPU_WAYS: [string, any][] = [["chosen on the GPU", { sample: true }]];
   const PROMPT_COUNTS = [1, 16, 64];
   async function gpu(): Promise<Result> {
     const w = worker("benchmark/gpu.js");
@@ -367,8 +366,10 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
         await step(`a token of ${name}`, { step: "token", model: name, kind: "widen" });
         if (info.packed) await step(`a token of ${name}, packed int8`, { step: "token", model: name, kind: "packed" });
       }
-      // T135's candidates on Llama 3.2 1B: fewer dispatches, the token chosen on the GPU, both
+      // T135's candidate on Llama 3.2 1B: the token chosen on the GPU
       for (const [label, how] of GPU_WAYS) await step(`a token of Llama 3.2 1B, ${label}`, { step: "token", model: "Llama 3.2 1B", kind: "widen", ...how });
+      // T150: a layer of a token as separate steps and fused into fewer dispatches
+      await step("a layer of a token", { step: "layer" });
       await step("what a token costs besides the weights", { step: "overhead" });
       // T168: the ceilings just before the prompt, so that both are measured as warm as each other
       await step("the device's ceilings", { step: "ceilings" });
@@ -422,6 +423,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     const baseline = cpuBaseline(results.cpu);
     const gpu = { fallback: r.fallback, lost, check: check?.result };
     lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline, gpu));
+    lines.push("", ...layerTable(steps.find((s) => s.name === "a layer of a token"), check?.result, gpu));
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
       "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),
       "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline, gpu));
