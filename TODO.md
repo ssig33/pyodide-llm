@@ -223,6 +223,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   - should 3: 最初の行（widened (T134)）を最後にもう一度測って「widened (T134), again at the end」の行に（最速には選ばない）。
   - should 4: CPU の行の名前を「CPU matmul_q8, one thread (not the page's forward)」に。CPU の節の GB/s に替える形は T157 が「GPU ÷ CPU」の列でやるので、重ならない名前の方を取った（データの `result.cpu` は T157 が読むのでそのまま）。
   - should 5: フォールバックのアダプタでは 32 MB を超える形（分類器）を測らず、行に「not on a fallback adapter」。コピーも 1 つ。
+  - デバイスが失われた後は、表の % を出さない（その後の時間は偽物に速く、100% を超えて出うる。T157 のレビューと同じ理由）。表の上にその 1 行。表は `src/bench.js` の `matVecTable()` に移し、`tests/bench.mjs` が % の有無（失われた・フォールバック）と誤りの文の `|` を見る（失われたときの条件を外すと落ちる、`tableCell()` を外すと落ちる）。
   - ほかに: lavapipe の負荷の下で n と 2n の差の中央値が負になった回があった（旧版の 1B の w1 で −1.35 GB/s と読めた）。`paired()` は差が 0 以下のとき steady と見ず、測り直しても 0 以下なら誤りにする（上限の計測も同じ関数）。
   - 確かめ: `.venv` の pytest 504 passed、smoke、`node tests/bench.mjs`、build、SwiftShader の `bench-check.mjs --dist chromium --run gpu`（5GB の枠、gpu ok、約 15 分。直す前の 13 分より長いのは load が 5〜6 と高かったため。分類器の 8 行を外して減ったのは SwiftShader の 0.1 GB/s で数十秒で、節の時間の大半は 1 トークンとプロンプトの段）。lavapipe の幅 4（`LP_NATIVE_VECTOR_WIDTH=128`）と幅 16（`=512`）で検査が全部 ok（新しい 6 つの最悪は幅 4 で 1.8e-8〜4.1e-8、幅 16 で 1.5e-8〜4.0e-8）、わざと壊した 16 通りは幅 16 でも全部その形だけが落ちた（subgroupAdd を外すと 0.18〜0.23）。
 - **端末の数字は未計測**（持ち主の Android・iPhone・PC で `/benchmark/` を開いて GPU の節のボタン）。lavapipe の数字（CPU が GPU の代わり）はどれが速いかの材料にしない。どの形をエンジンに使うかは T152 で端末ごとに測って選ぶ。

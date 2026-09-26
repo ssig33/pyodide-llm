@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, environmentOf, loginUrl, parseReport, reportBody,
-         reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         matVecTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -169,4 +169,15 @@ assert.ok(withCpu.some((line) => line.includes("could not hold \\| the weights a
 // and the report with it still reads as the model's table alone
 const withGpu = parseReport(reportBody([markdown, "#### GPU", ...withCpu].join("\n\n")));
 assert.deepEqual(withGpu.rows.map((row) => row.name), ["everything", "without the kernels"]);
+// T149: the matrix × vector table holds each GB/s against the buffer's reads, but not after a lost device (its times
+// are no GPU's, and too fast: past 100%) nor on a fallback adapter; a failure's | stays in its cell
+const matVecSteps = [{ name: "bandwidth: Llama 3.2 1B w1", result: { rows: [{ shader: "widened (T134)", check: "widen", GBps: 20 },
+  { shader: "llama.cpp MMVQ, 4 rows", check: "llama.cpp MMVQ, 4 rows", error: "a | b" }], cpu: { GBps: 9 } } }];
+const matVecCeilings = { global: { GBps: 40 } };
+const matVecRow = (lines) => lines.find((line) => line.startsWith("| widened (T134) |"));
+assert.equal(matVecRow(matVecTable(matVecSteps, {}, matVecCeilings)), "| widened (T134) | 20.0 GB/s (50.0%) |");
+assert.equal(matVecRow(matVecTable(matVecSteps, {}, matVecCeilings, { lost: "lost" })), "| widened (T134) | 20.0 GB/s |");
+assert.ok(matVecTable(matVecSteps, {}, matVecCeilings, { lost: "lost" }).some((line) => line.includes("the device was lost")));
+assert.equal(matVecRow(matVecTable(matVecSteps, {}, { ...matVecCeilings, fallback: true })), "| widened (T134) | 20.0 GB/s |");
+assert.ok(matVecTable(matVecSteps, {}, matVecCeilings).includes("| llama.cpp MMVQ, 4 rows | failed: a \\| b |"));
 console.log("ok");
