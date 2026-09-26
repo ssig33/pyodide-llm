@@ -416,15 +416,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       : `${k} ${v.ok ? "ok" : "WRONG"} (worst ${v.worstRelative.toExponential(1)}${v.apart === undefined ? "" : `, quantized ${v.far ? "far apart" : `${fixed(100 * v.apart, 2)}% apart by 1`}`})`);
     if (check?.result) lines.push(`**Shaders against JavaScript**: ${Object.entries(check.result).map(verdict).join(", ")}`, "");
     const bandwidths = steps.filter((s) => s.name.startsWith("bandwidth"));
-    lines.push("| int8 matrix × vector | GPU, widened in the shader | GPU, packed int8 | CPU, one thread |", "|---|---:|---:|---:|");
-    for (const s of bandwidths) {
-      const b = s.result ?? {};
-      lines.push(`| ${s.name.slice(11)} | ${s.error ?? `${fixed(b.widen?.GBps)} GB/s`} | ${b.packed ? `${fixed(b.packed.GBps)} GB/s` : "–"} | ${b.cpu ? `${fixed(b.cpu.GBps)} GB/s` : ""} |`);
-    }
     const ceilings = steps.find((s) => s.name === "the device's ceilings")?.result;
-    const best = Math.max(0, ...bandwidths.flatMap((s) => [s.result?.widen?.GBps ?? 0, s.result?.packed?.GBps ?? 0]));
-    if (best && ceilings?.global?.GBps && !ceilings.fallback && !ceilings.global.unsteady) lines.push("", `The fastest of these reads ${percent(best, ceilings.global.GBps)} of what a loop that only reads a buffer reads (${fixed(ceilings.global.GBps)} GB/s, below).`);
-    lines.push("");
+    lines.push(...matVecMarkdown(bandwidths, check?.result, ceilings), "");
     // T157: the CPU beside the GPU is the CPU section's forward pass, rewritten when the CPU section runs after this one
     const baseline = cpuBaseline(results.cpu);
     const gpu = { fallback: r.fallback, lost, check: check?.result };
@@ -434,6 +427,30 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline, gpu));
     lines.push("", `**Bridge** (Atomics.wait ↔ Atomics.waitAsync, ${BRIDGE_ROUNDS} round trips): ${bridge.error ?? `${fixed(bridge.microseconds)} µs each`}`);
     return lines.join("\n");
+  }
+
+  // T149: an int8 matrix times a vector by every shader (T134's two and those of llama.cpp and ONNX Runtime), a row
+  // each, with its share of what a loop that only reads a buffer reads (T168); a shader the check found WRONG says so
+  // and is never the fastest
+  function matVecMarkdown(bandwidths: any[], check?: any, ceilings?: any) {
+    const reads = ceilings && !ceilings.fallback && !ceilings.global?.unsteady ? ceilings.global?.GBps : undefined;
+    const wrong = (row: any) => check && check[row.check] && !check[row.check].ok;
+    const shaders = [...new Map(bandwidths.flatMap((s) => (s.result?.rows ?? []).map((row: any) => [row.shader, row]))).values()];
+    const cell = (s: any, name: string) => {
+      const row = s.result?.rows?.find((one: any) => one.shader === name);
+      if (s.error || !row) return tableCell(s.error ?? "");
+      if (row.none || row.error) return tableCell(row.none ?? `failed: ${row.error}`);
+      return `${row.unsteady ? "unsteady: " : ""}${fixed(row.GBps)} GB/s${reads ? ` (${percent(row.GBps, reads)})` : ""}`;
+    };
+    const fastest = (s: any) => {
+      const best = (s.result?.rows ?? []).filter((row: any) => row.GBps && !row.unsteady && !wrong(row)).sort((a: any, b: any) => b.GBps - a.GBps)[0];
+      return best ? `${s.name.slice(11)} ${best.shader}, ${fixed(best.GBps)} GB/s` : "";
+    };
+    return [`**An int8 matrix × vector** (a generated token's; a shader's name says whose form it takes and the rows a workgroup takes${reads ? `; in parentheses, the share of what a loop that only reads a buffer reads, ${fixed(reads)} GB/s below` : ""}):`, "",
+      `| shader | ${bandwidths.map((s) => s.name.slice(11)).join(" | ")} |`, `|---|${bandwidths.map(() => "---:|").join("")}`,
+      ...shaders.map((row: any) => `| ${row.shader}${wrong(row) ? " (WRONG in the check)" : ""} | ${bandwidths.map((s) => cell(s, row.shader)).join(" | ")} |`),
+      `| CPU, one thread | ${bandwidths.map((s) => (s.result?.cpu ? `${fixed(s.result.cpu.GBps)} GB/s` : "")).join(" | ")} |`,
+      "", `**Fastest on the GPU** (of the shaders the check found right): ${bandwidths.map(fastest).filter(Boolean).join("; ") || "nothing measured"}`];
   }
 
   // what a token costs on the GPU besides reading its weights (T135: the phones' 18 to 20 ms, T94)

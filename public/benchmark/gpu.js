@@ -5,7 +5,8 @@
 //   { step: "info" }                      the adapter, its limits and features, WGSL's language features
 //   { step: "check" }                     the int8 shaders against JavaScript on small matrices (T146: the tiled ones
 //                                         too, with their edges)
-//   { step: "bandwidth", shape }          GB/s of one int8 matrix times a vector, both shaders, and the CPU's
+//   { step: "bandwidth", shape }          GB/s of one int8 matrix times a vector, by every shader of matVecShaders()
+//                                         (T134's two and T149's from llama.cpp and ONNX Runtime), and the CPU's
 //   { step: "token", model, kind, fused, sample }
 //                                         a whole token's work of a model's shapes (every layer's matrices, a few small
 //                                         dispatches, the classifier, the logits read back), ms per token. fused: the
@@ -154,14 +155,37 @@ function promptShaders() {
   if (subgroups) shaders.push({ name: "ORT DP4A 64×64, subgroups", tile: WGSL.DP4A_SHAPE, packed: true, code: WGSL.dp4a(true), none: dp4aNone });
   return shaders;
 }
-// what matrix() takes for a shader: "batched", or { pipeline, tile, packed } of a tiled one
+// T149: the shaders of a matrix times one vector (a generated token's): T134's two, then llama.cpp's mul_mat_vec (its
+// float form and its MMVQ one, each with the workgroup's reduction and, where subgroups are, with subgroupAdd) and
+// ONNX Runtime's MatMulNBits and DP4A for small M (shaders.js). rows: the rows a workgroup takes
+function matVecShaders() {
+  const noPacked = packed ? undefined : "no packed int8 dot here";
+  const subgroups = device.features.has("subgroups");
+  const noSubgroupId = navigator.gpu.wgslLanguageFeatures?.has("subgroup_id") ? undefined : "no subgroup_id in this WGSL";
+  // check: the name of the shader's verdict in check() (T134's two are checked on their own there)
+  const shaders = [{ name: "widened (T134)", kind: "widen", check: "widen" },
+    { name: "packed int8 (T134)", kind: "packed", check: "packed", none: noPacked }];
+  for (const [form, isPacked] of [["mul_mat_vec", false], ["MMVQ", true]]) {
+    for (const withSubgroups of subgroups ? [false, true] : [false]) {
+      shaders.push({ name: `llama.cpp ${form}, ${WGSL.MUL_MAT_VEC_ROWS} rows${withSubgroups ? ", subgroups" : ""}`,
+        code: WGSL.mulMatVec({ packed: isPacked, subgroups: withSubgroups }), rows: WGSL.MUL_MAT_VEC_ROWS, packed: isPacked,
+        none: (isPacked && noPacked) || (withSubgroups && noSubgroupId) || undefined });
+    }
+  }
+  shaders.push({ name: `ORT MatMulNBits, ${WGSL.ORT_MATVEC_ROWS} rows`, code: WGSL.ortMatVec, rows: WGSL.ORT_MATVEC_ROWS, packed: false });
+  shaders.push({ name: `ORT DP4A small M, ${WGSL.ORT_DP4A_MATVEC_ROWS} rows`, code: WGSL.ortDp4aMatVec,
+    rows: WGSL.ORT_DP4A_MATVEC_ROWS, packed: true, none: noPacked });
+  return shaders;
+}
+// what matrix() takes for a shader: "widen", "packed", "batched", or { pipeline, tile or rows, packed } of one with code
+// of its own (a tiled one, T146, or a matrix × vector's of T149)
 async function kindOf(shader) {
-  if (!shader.tile) return shader.kind;
+  if (!shader.code) return shader.kind;
   if (!tiledPipelines.has(shader.name)) {
     tiledPipelines.set(shader.name, validated(() => device.createComputePipelineAsync({ layout: "auto",
       compute: { module: device.createShaderModule({ code: shader.code }), entryPoint: "main", constants: shader.constants } })));
   }
-  return { pipeline: await tiledPipelines.get(shader.name), tile: shader.tile, packed: shader.packed };
+  return { pipeline: await tiledPipelines.get(shader.name), tile: shader.tile, rows: shader.rows, packed: shader.packed };
 }
 // the activations of the packed tiled shaders, quantized on the GPU (shaders.js's QUANTIZE): the first n values of
 // each of io's tokens, from io.x into io.xq and io.xs. One thread a group of 32, the tokens along y
@@ -181,10 +205,10 @@ function quantizer(io, n) {
 // hold them io.xStride and io.yStride floats apart); add: the products added to what y holds (the residual stream of
 // the model's layers), for the checks
 function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}) {
-  const tiled = typeof kind === "object";
+  const own = typeof kind === "object", tiled = own && Boolean(kind.tile), matVec = own && Boolean(kind.rows);
   const { widen, packed: packedPipeline, batched } = pipelinesFor();
-  const pipeline = tiled ? kind.pipeline : { widen, packed: packedPipeline, batched }[kind];
-  const quantized = tiled ? kind.packed : kind === "packed";
+  const pipeline = own ? kind.pipeline : { widen, packed: packedPipeline, batched }[kind];
+  const quantized = own ? kind.packed : kind === "packed";
   const words = n / 4, perRow = n / GROUP, rowBytes = n;
   const most = chunk ?? Math.max(1, Math.floor(Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize) / rowBytes));
   const dispatches = [], owned = [];
@@ -204,7 +228,7 @@ function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}
     const entries = [{ binding: 0, resource: { buffer: w } }, { binding: 1, resource: { buffer: s } },
       { binding: 2, resource: { buffer: quantized ? io.xq : io.x } }, { binding: 3, resource: { buffer: io.y } },
       { binding: 4, resource: { buffer: shape } }];
-    if (kind === "packed") entries.push({ binding: 5, resource: { buffer: io.xs } });
+    if (kind === "packed" || (matVec && quantized)) entries.push({ binding: 5, resource: { buffer: io.xs } });
     if (kind === "batched" || tiled) entries.push({ binding: 5, resource: { buffer: io.step } });
     if (tiled && quantized) entries.push({ binding: 6, resource: { buffer: io.xs } });
     const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
@@ -213,6 +237,10 @@ function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}
       const tiles = Math.ceil(count / kind.tile.rows) * Math.ceil(io.tokens / kind.tile.tokens);
       const across = Math.min(tiles, device.limits.maxComputeWorkgroupsPerDimension);
       dispatches.push([pipeline, group, across, Math.ceil(tiles / across)]);
+    } else if (matVec) {
+      // T149: kind.rows rows a workgroup, numbered over x and then y
+      const groups = Math.ceil(count / kind.rows), across = Math.min(groups, device.limits.maxComputeWorkgroupsPerDimension);
+      dispatches.push([pipeline, group, across, Math.ceil(groups / across)]);
     } else {
       const across = Math.min(count, device.limits.maxComputeWorkgroupsPerDimension);
       dispatches.push([pipeline, group, across, Math.ceil(count / across), kind === "batched" ? Math.ceil(io.tokens / TILE) : 1]);
@@ -328,8 +356,65 @@ async function check() {
   }
   destroyVectors(io);
   verdicts.batched = await checkBatched(w, s, rows, n);
+  Object.assign(verdicts, await checkMatVec());
   Object.assign(verdicts, await checkTiled());
   verdicts.argmax = await checkArgmax();
+  return verdicts;
+}
+// T149: every matrix × vector shader of its own (llama.cpp's and ONNX Runtime's) on 300 rows cut into chunks of 101 (a
+// workgroup's 4 or 8 rows and a part of them in each, and shape.first past 0), of widths 544 and 2080: 17 and 65 groups
+// of 32, a part of what llama.cpp's 64 groups a pass, ORT's 512 values a step and its DP4A's 32 groups a step take, and
+// 2080 more than one of them. x is 64 values longer than the width (a shader that takes the width from the buffer
+// reads them), and y holds a sentinel past the rows that must stay. The sums as checkTiled holds them: WORST_TILED of
+// the sum of the |products| of the row (a wrong index or scale is off by about 1/sqrt(n) of it); the packed ones on the
+// vector quantized in JavaScript (as PACKED is checked), whose products are exact integers times the two scales
+const SENTINEL = 7.25;
+async function checkMatVec() {
+  const rows = 300, past = 16, verdicts = {};
+  for (const shader of matVecShaders().filter((one) => one.code && !one.none)) {
+    try {
+      const kind = await kindOf(shader);
+      let worst = 0, over = false, touched = false;
+      for (const n of [544, 2080]) {
+        const perRow = n / GROUP, longest = n + 64;
+        const w = new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s = floats(rows * perRow, 0.01);
+        const signed = new Int8Array(w.buffer);
+        const io = vectors(longest, rows + past), x = floats(longest, 2), { xq, xs } = quantized(x);
+        device.queue.writeBuffer(io.x, 0, x);
+        device.queue.writeBuffer(io.xq, 0, new Uint8Array(xq.buffer));
+        device.queue.writeBuffer(io.xs, 0, xs);
+        device.queue.writeBuffer(io.y, 0, new Float32Array(rows + past).fill(SENTINEL));
+        const owned = [];
+        const got = await validated(async () => {
+          const m = matrix([rows, n], io, kind, { w, s }, { chunk: 101 });
+          owned.push(...m.owned);
+          const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+          m.dispatches.forEach((d) => run(pass, d));
+          pass.end();
+          return new Float32Array(await readBack(encoder, io.y, (rows + past) * 4));
+        }).finally(() => {
+          owned.forEach((b) => b.destroy());
+          destroyVectors(io);
+        });
+        for (let r = 0; r < rows; r++) {
+          let want = 0, size = 0;
+          for (let i = 0; i < n; i++) {
+            const g = r * perRow + Math.floor(i / GROUP);
+            const product = shader.packed ? signed[r * n + i] * xq[i] * s[g] * xs[Math.floor(i / GROUP)] : signed[r * n + i] * s[g] * x[i];
+            want += product;
+            size += Math.abs(product);
+          }
+          const off = Math.abs(got[r] - want);
+          worst = Math.max(worst, off / size);
+          over ||= !(off < WORST_TILED * size);
+        }
+        for (let r = rows; r < rows + past; r++) touched ||= got[r] !== SENTINEL;
+      }
+      verdicts[shader.name] = { worstRelative: worst, ok: !over && !touched, ...(touched ? { wrotePastTheRows: true } : {}) };
+    } catch (error) {
+      verdicts[shader.name] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+    }
+  }
   return verdicts;
 }
 // T146: every tiled shader on 300 rows of 544 (17 groups of 32), cut into chunks of 100 rows (tiles of 32 or 64 rows
@@ -467,30 +552,50 @@ async function checkArgmax() {
   return { worstRelative: 0, ok: right };
 }
 
-// ---- bandwidth: one matrix, 20 times in one submission after a warm-up; and the CPU's kernel on the same bytes
+// ---- bandwidth: one matrix by every shader of matVecShaders() (T149), timed as the ceilings are (paired: a submission
+// of 2n of it less one of n, so that what a submission costs besides its work drops out, T168); once on a fallback
+// adapter. widen and packed: T134's two, for the table as it was; and the CPU's kernel on the same bytes
+const MATVEC_MOST = 1 << 14;
 async function bandwidth(shape) {
   await gpu();
-  const found = {};
-  const io = vectors(shape[1], shape[0]);
-  for (const kind of packed ? ["widen", "packed"] : ["widen"]) {
-    const m = matrix(shape, io, kind);
-    const time = async (times) => {
-      const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-      for (let i = 0; i < times; i++) m.dispatches.forEach((d) => run(pass, d));
-      pass.end();
-      const began = performance.now();
-      device.queue.submit([encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-      return performance.now() - began;
-    };
-    const times = fallback ? 1 : 20;
-    if (!fallback) await time(2);
-    const ms = await time(times);
-    found[kind] = { GBps: (times * m.bytes) / (ms / 1000) / 1e9, msEach: ms / times };
-    m.owned.forEach((b) => b.destroy());
+  const io = vectors(shape[1], shape[0]), rows = [];
+  for (const shader of matVecShaders()) {
+    const row = { shader: shader.name, check: shader.check ?? shader.name };
+    if (shader.none) {
+      rows.push({ ...row, none: shader.none });
+      continue;
+    }
+    try {
+      rows.push({ ...row, ...await scoped(async (owned) => {
+        const m = matrix(shape, io, await kindOf(shader));
+        owned.push(...m.owned);
+        await device.queue.onSubmittedWorkDone();
+        const submission = async (n) => {
+          const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+          for (let i = 0; i < n; i++) m.dispatches.forEach((d) => run(pass, d));
+          pass.end();
+          const began = performance.now();
+          device.queue.submit([encoder.finish()]);
+          await device.queue.onSubmittedWorkDone();
+          return performance.now() - began;
+        };
+        if (fallback) {
+          const ms = await submission(1);
+          return { GBps: m.bytes / (ms / 1000) / 1e9, msEach: ms };
+        }
+        await submission(2);
+        const r = await paired(submission, MATVEC_MOST);
+        return { GBps: (r.dispatches * m.bytes) / (r.ms / 1000) / 1e9, msEach: r.ms / r.dispatches, dispatches: r.dispatches,
+          ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
+      }) });
+    } catch (error) {
+      rows.push({ ...row, error: String(error?.message ?? error) });
+    }
+    postMessage({ alive: true });
   }
-  found.cpu = await cpuBandwidth(shape);
-  return found;
+  destroyVectors(io);
+  const measured = (kind) => rows.find((row) => row.check === kind && row.GBps);
+  return { rows, widen: measured("widen"), packed: measured("packed"), cpu: await cpuBandwidth(shape) };
 }
 
 // the CPU on the kernel the model page uses for int8 on one thread (matmul_q8, without relaxed SIMD: every
@@ -672,22 +777,10 @@ async function ceilings() {
         setLoops();
       }
     }
-    let n = 1;
-    while ((await submission(n)) < SUBMISSION_MS) {
-      if ((n *= 2) > MOST_DISPATCHES) throw new Error(`${MOST_DISPATCHES} dispatches took less than ${SUBMISSION_MS} ms: the loop did no work`);
-    }
-    const work = n * (perLoop ? threads * loops * perLoop : perDispatch);
-    for (let tries = 0; ; tries++) {
-      const differences = [], ratios = [];
-      for (let i = 0; i < PAIRS; i++) {
-        const once = await submission(n), twice = await submission(2 * n);
-        differences.push(twice - once);
-        ratios.push(twice / once);
-        postMessage({ alive: true });
-      }
-      const ratio = middle(ratios), steady = ratio >= STEADY[0] && ratio <= STEADY[1];
-      if (steady || tries) return { rate: work / (middle(differences) / 1000), loops, dispatches: n, ratio, ...(steady ? {} : { unsteady: true }) };
-    }
+    const r = await paired(submission, MOST_DISPATCHES, true);
+    if (r.short) throw new Error(`${MOST_DISPATCHES} dispatches took less than ${SUBMISSION_MS} ms: the loop did no work`);
+    const work = r.dispatches * (perLoop ? threads * loops * perLoop : perDispatch);
+    return { rate: work / (r.ms / 1000), loops, dispatches: r.dispatches, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
   });
   const found = { fallback };
   const measure = async (name, why, how) => {
@@ -717,6 +810,26 @@ async function ceilings() {
     ...scaled("GBps", await rate(WGSL.GLOBAL_CEILING, { perDispatch: globalThreads * WGSL.GLOBAL_PER_THREAD,
       groups: globalThreads / WGSL.CEILING_WORKGROUP, bytes: globalThreads * WGSL.GLOBAL_PER_THREAD })) }));
   return found;
+}
+// the time of n dispatches (what submission(n) submits and waits for, in ms): n doubles, up to most, until a submission
+// takes SUBMISSION_MS (short: it never did), then PAIRS submissions of n and of 2n in turn, and the median of their
+// differences; past STEADY the pairs once more, then unsteady (T168, and T149's matrix × vector). strict: none of
+// the pairs when most never took SUBMISSION_MS (a loop that did no work), only { short: true }
+async function paired(submission, most, strict = false) {
+  let n = 1, ms;
+  while ((ms = await submission(n)) < SUBMISSION_MS && n < most) n *= 2;
+  if (strict && ms < SUBMISSION_MS) return { short: true };
+  for (let tries = 0; ; tries++) {
+    const differences = [], ratios = [];
+    for (let i = 0; i < PAIRS; i++) {
+      const once = await submission(n), twice = await submission(2 * n);
+      differences.push(twice - once);
+      ratios.push(twice / once);
+      postMessage({ alive: true });
+    }
+    const ratio = middle(ratios), steady = ratio >= STEADY[0] && ratio <= STEADY[1];
+    if (steady || tries) return { ms: middle(differences), dispatches: n, ratio, ...(steady ? {} : { unsteady: true }) };
+  }
 }
 // what fn does on the GPU (given an array for the buffers it makes, destroyed after), with an error of the device
 // thrown: validation (a pipeline or bind group refused) or out of memory (a buffer it could not give)
