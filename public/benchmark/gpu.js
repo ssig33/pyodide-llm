@@ -614,47 +614,81 @@ async function overhead() {
   return found;
 }
 
-// ---- the ceilings (T168): each loop of shaders.js alone, dispatched n times in one submission. n doubles until a
-// submission takes CEILING_MS, and the rate is that of the n dispatches a submission of 2n takes more than one of n:
-// what a submission costs besides its work (3.7 ms waited for on the owner's Android, T134) is in both and drops out.
-// A fallback adapter runs each once, small (its speed is no GPU's): one dispatch of FALLBACK_LOOPS
-const CEILING_MS = 40, CEILING_GROUPS = 256, CEILING_LOOPS = 32, FALLBACK_LOOPS = 2, MOST_DISPATCHES = 4096;
-// the storage buffer the global read streams through, meant to be larger than the GPU's caches (their sizes on the
-// owner's devices are not measured)
-const GLOBAL_BYTES = 64 << 20, FALLBACK_GLOBAL_BYTES = 4 << 20;
+// ---- the ceilings (T168): each loop of shaders.js alone. First its loop count doubles until one dispatch takes
+// DISPATCH_MS (a dispatch's own cost is then small beside its work), then the dispatches of a submission until it
+// takes SUBMISSION_MS. The time of n dispatches is that of a submission of 2n less one of n: what a submission costs
+// besides its work (3.7 ms waited for on the owner's Android, T134) is in both and drops out. The two are measured
+// in turn, PAIRS times, and the median of the pairs' differences taken: measured one after the other, a device's
+// load moved the numbers by several times (T168's review, lavapipe under load: 4 of 55 readings 30% or more off,
+// one ten times). A pair's 2n should take about twice its n: past STEADY the pairs are taken again once, and if
+// they are still past it the ceiling says "unsteady" and the prompt is not held against it. Everything runs in
+// error scopes, validation and out of memory: a pipeline, bind group or buffer the device refused makes an error,
+// not a number (a bind group that does not match took no time, and read as 13,915 GB/s). So does a loop that never
+// takes DISPATCH_MS in MOST_LOOPS or SUBMISSION_MS in MOST_DISPATCHES (a loop a compiler removed: lavapipe then read
+// 60 million GFLOPS). A fallback adapter runs the same (its speed is no GPU's, but a few seconds
+// a ceiling)
+const DISPATCH_MS = 2, SUBMISSION_MS = 40, PAIRS = 5, STEADY = [1.6, 2.2];
+// MOST_LOOPS: a dispatch of 65536 threads that many loops is 4 TFLOP of multiply-adds, 2 s at 2 TFLOPS
+const CEILING_GROUPS = 256, FIRST_LOOPS = 4, MOST_LOOPS = 1 << 14, MOST_DISPATCHES = 4096;
+// the storage buffer the global read streams through: 128 MiB, WebGPU's default largest binding (or the device's
+// largest, if smaller), meant to be larger than the GPU's caches (their sizes on the owner's devices are not measured)
+const GLOBAL_BYTES = 128 << 20;
+const middle = (values) => [...values].sort((x, y) => x - y)[values.length >> 1];
 async function ceilings() {
   await gpu();
-  const loops = fallback ? FALLBACK_LOOPS : CEILING_LOOPS, threads = CEILING_GROUPS * WGSL.CEILING_WORKGROUP;
-  const globalBytes = fallback ? FALLBACK_GLOBAL_BYTES : GLOBAL_BYTES;
-  const globalThreads = globalBytes / WGSL.GLOBAL_PER_THREAD;
-  const out = buffer(Math.max(threads, globalThreads) * 4, STORAGE), data = buffer(globalBytes);
-  fill(data, globalBytes);
-  const uniform = buffer(16, UNIFORM | COPY_DST);
-  device.queue.writeBuffer(uniform, 0, new Uint32Array([loops, (Math.random() * 2 ** 32) >>> 0, 0, 0]));
-  // what a loop counts (FLOPs, ops or bytes) a second: work is one dispatch's, of groups workgroups, the bindings
-  // out, the uniform and those of more
-  const rate = async (code, work, groups = CEILING_GROUPS, more = []) => {
-    const pipeline = await validated(() => device.createComputePipelineAsync({ layout: "auto",
-      compute: { module: device.createShaderModule({ code }), entryPoint: "main" } }));
+  const threads = CEILING_GROUPS * WGSL.CEILING_WORKGROUP;
+  const globalBytes = Math.min(GLOBAL_BYTES, device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize);
+  const globalThreads = Math.floor(globalBytes / WGSL.GLOBAL_PER_THREAD / WGSL.CEILING_WORKGROUP) * WGSL.CEILING_WORKGROUP;
+  // what a loop counts (FLOPs, ops or bytes) a second: perLoop a thread and a loop, or perDispatch (the global read)
+  const rate = (code, { perLoop, perDispatch, groups = CEILING_GROUPS, bytes = 0 }) => scoped(async (owned) => {
+    const out = buffer(Math.max(threads, groups * WGSL.CEILING_WORKGROUP) * 4, STORAGE), plan = buffer(16, UNIFORM | COPY_DST);
+    owned.push(out, plan);
+    const more = bytes ? [buffer(bytes)] : [];
+    owned.push(...more);
+    if (bytes) fill(more[0], bytes);
+    let loops = FIRST_LOOPS;
+    const setLoops = () => device.queue.writeBuffer(plan, 0, new Uint32Array([loops, (Math.random() * 2 ** 32) >>> 0,
+      new Uint32Array(new Float32Array([0.999]).buffer)[0], new Uint32Array(new Float32Array([0.001]).buffer)[0]]));
+    setLoops();
+    const pipeline = await device.createComputePipelineAsync({ layout: "auto",
+      compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
     const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
-      entries: [out, uniform, ...more].map((b, binding) => ({ binding, resource: { buffer: b } })) });
-    const submission = (n) => async () => {
+      entries: [out, plan, ...more].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+    const submission = async (n) => {
       const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
       for (let i = 0; i < n; i++) run(pass, [pipeline, group, groups, 1]);
       pass.end();
+      const began = performance.now();
       device.queue.submit([encoder.finish()]);
       await device.queue.onSubmittedWorkDone();
+      return performance.now() - began;
     };
-    if (fallback) return work / (await median(submission(1)) / 1000);
-    await submission(1)();
+    await submission(1);
+    // a dispatch of DISPATCH_MS (8 of them, so that the submission's own cost is an eighth in each)
+    if (perLoop) {
+      while ((await submission(8)) / 8 < DISPATCH_MS) {
+        if ((loops *= 2) > MOST_LOOPS) throw new Error(`${MOST_LOOPS} loops took less than ${DISPATCH_MS} ms a dispatch: the loop did no work`);
+        setLoops();
+      }
+    }
     let n = 1;
-    while (n < MOST_DISPATCHES && await median(submission(n), 1, 0) < CEILING_MS) n *= 2;
-    const once = await median(submission(n), 5, 1), twice = await median(submission(2 * n), 5, 1);
-    // a submission of 2n no slower than one of n (the times went wrong): the whole of 2n, fixed cost and all, which
-    // can only read lower than the ceiling
-    return (n * work) / ((twice > once ? twice - once : twice / 2) / 1000);
-  };
-  const found = { loops, fallback };
+    while ((await submission(n)) < SUBMISSION_MS) {
+      if ((n *= 2) > MOST_DISPATCHES) throw new Error(`${MOST_DISPATCHES} dispatches took less than ${SUBMISSION_MS} ms: the loop did no work`);
+    }
+    const work = n * (perLoop ? threads * loops * perLoop : perDispatch);
+    for (let tries = 0; ; tries++) {
+      const differences = [], ratios = [];
+      for (let i = 0; i < PAIRS; i++) {
+        const once = await submission(n), twice = await submission(2 * n);
+        differences.push(twice - once);
+        ratios.push(twice / once);
+        postMessage({ alive: true });
+      }
+      const ratio = middle(ratios), steady = ratio >= STEADY[0] && ratio <= STEADY[1];
+      if (steady || tries) return { rate: work / (middle(differences) / 1000), loops, dispatches: n, ratio, ...(steady ? {} : { unsteady: true }) };
+    }
+  });
+  const found = { fallback };
   const measure = async (name, why, how) => {
     if (why) return (found[name] = { none: why });
     try {
@@ -665,16 +699,41 @@ async function ceilings() {
       postMessage({ alive: true });
     }
   };
-  const flops = threads * loops * WGSL.FMA_PER_LOOP;
-  await measure("f32", null, async () => ({ GFLOPS: (await rate(WGSL.fmaCeiling(false), flops)) / 1e9 }));
-  await measure("f16", device.features.has("shader-f16") ? null : "no shader-f16 here",
-    async () => ({ GFLOPS: (await rate(WGSL.fmaCeiling(true), flops)) / 1e9 }));
+  // the multiply-adds in both shapes; the faster is the ceiling (an unsteady one only when both are)
+  const fma = async (half) => {
+    const shapes = [];
+    for (const shape of WGSL.FMA_SHAPES) shapes.push({ shape, ...await rate(WGSL.fmaCeiling(half, shape), { perLoop: WGSL.FMA_PER_LOOP }) });
+    const best = [...shapes].sort((x, y) => Boolean(x.unsteady) - Boolean(y.unsteady) || y.rate - x.rate)[0];
+    return { GFLOPS: best.rate / 1e9, shape: best.shape, unsteady: best.unsteady, shapes: shapes.map(({ shape, rate: r }) => ({ shape, GFLOPS: r / 1e9 })) };
+  };
+  const scaled = (key, r) => ({ [key]: r.rate / 1e9, unsteady: r.unsteady, loops: r.loops, dispatches: r.dispatches, ratio: r.ratio });
+  await measure("f32", null, () => fma(false));
+  await measure("f16", device.features.has("shader-f16") ? null : "no shader-f16 here", () => fma(true));
   await measure("dot4", packed ? null : "no packed int8 dot here",
-    async () => ({ GOPS: (await rate(WGSL.DOT4_CEILING, threads * loops * WGSL.DOT4_PER_LOOP)) / 1e9 }));
-  await measure("shared", null, async () => ({ GBps: (await rate(WGSL.SHARED_CEILING, threads * loops * WGSL.SHARED_PER_LOOP)) / 1e9 }));
-  await measure("global", null, async () => ({ GBps: (await rate(WGSL.GLOBAL_CEILING, globalBytes, globalThreads / WGSL.CEILING_WORKGROUP, [data])) / 1e9, MB: globalBytes / 1e6 }));
-  [out, data, uniform].forEach((b) => b.destroy());
+    async () => scaled("GOPS", await rate(WGSL.DOT4_CEILING, { perLoop: WGSL.DOT4_PER_LOOP })));
+  await measure("shared", null, async () => scaled("GBps", await rate(WGSL.SHARED_CEILING, { perLoop: WGSL.SHARED_PER_LOOP })));
+  await measure("global", null, async () => ({ MiB: globalThreads * WGSL.GLOBAL_PER_THREAD / 2 ** 20,
+    ...scaled("GBps", await rate(WGSL.GLOBAL_CEILING, { perDispatch: globalThreads * WGSL.GLOBAL_PER_THREAD,
+      groups: globalThreads / WGSL.CEILING_WORKGROUP, bytes: globalThreads * WGSL.GLOBAL_PER_THREAD })) }));
   return found;
+}
+// what fn does on the GPU (given an array for the buffers it makes, destroyed after), with an error of the device
+// thrown: validation (a pipeline or bind group refused) or out of memory (a buffer it could not give)
+async function scoped(fn) {
+  const owned = [];
+  device.pushErrorScope("out-of-memory");
+  device.pushErrorScope("validation");
+  let result, failure;
+  try {
+    result = await fn(owned);
+  } catch (error) {
+    failure = error;
+  }
+  const invalid = await device.popErrorScope(), outOfMemory = await device.popErrorScope();
+  owned.forEach((b) => b.destroy());
+  if (invalid ?? outOfMemory) throw new Error((invalid ?? outOfMemory).message);
+  if (failure) throw failure;
+  return result;
 }
 
 // ---- a prompt: its tokens through the matrices of the CPU section's made-up model (two layers of Llama 3.2 1B's

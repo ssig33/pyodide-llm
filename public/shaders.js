@@ -846,9 +846,14 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
 // (https://github.com/krrishnarraj/clpeak, src/opencl/kernels/: compute_sp, compute_int8_dp, global_bandwidth), taken
 // as a method only and written anew here: clpeak is under the GPL-3.0, and no line of it is copied. What the method
 // keeps a compiler from making the loops cheaper than they look:
-//   - a multiply-add chain is the squaring recurrence x = x·x + c (c differs by lane), which no algebra folds; two
-//     chains of vec4 give each thread 8 independent ones (clpeak: "N is 1 from width 4 up"). c is in [-1.55, -1], where
-//     the recurrence stays in [-2, 2] (the real axis of the Mandelbrot set): no infinities and no subnormals to time;
+//   - the multiply-adds in two shapes, as clpeak races two (mad_chain.cl) and keeps the faster, since no one shape is
+//     the fastest on every device: "square", the recurrence x = x·x + c (c differs by lane), which no algebra folds,
+//     two chains of vec4 (8 independent multiply-adds a thread); and "affine", x = x·a + b with a and b the same for
+//     every lane (from the uniform), one chain of vec4 (clpeak: "N is 1 from width 4 up": the vector is the
+//     parallelism), whose three operands are distinct registers (clpeak: Intel's GPUs halve a multiply-add that reads
+//     one register twice, as x·x does). Floating point does not reassociate, so the affine chain is not folded either.
+//     c is in [-1.55, -1], where the square stays in [-2, 2] (the real axis of the Mandelbrot set), and a = 0.999,
+//     b = 0.001 draw the affine one to 1: no infinities and no subnormals to time. Both do FMA_PER_LOOP a loop;
 //   - a dot4I8Packed chain is two accumulators feeding each other, a = dot(x, b) + a, b = dot(x, a) + b (clpeak's
 //     compute_int8_dp: with both operands loop-invariant a compiler may turn the chain into one multiply); four pairs;
 //     WGSL's dot has no accumulating form, so the add is part of each dot here as in the DP4A shader of the prompt;
@@ -857,28 +862,37 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
 //     thread with neighbours on neighbouring vec4s; the storage buffer as clpeak's global_offset kernels read it, each
 //     read a dispatch's threads apart, so that neighbours read neighbouring vec4s and the buffer once a dispatch.
 // Every ceiling runs CEILING_WORKGROUP threads a workgroup and writes one u32 a thread to out; the uniform (plan)
-// holds the loops and a seed. *_PER_LOOP: what one thread does in one pass of its loop, in FLOPs, ops or bytes
+// holds the loops, a seed and the affine chain's a and b. *_PER_LOOP: what one thread does in one pass of its loop, in FLOPs, ops or bytes
 export const CEILING_WORKGROUP = 256;
-export const FMA_PER_LOOP = 16 * 2 * 4 * 2;
+export const FMA_PER_LOOP = 32 * 4 * 2;
 export const DOT4_PER_LOOP = 8 * 4 * 2 * 8;
 export const SHARED_PER_LOOP = 16 * 16;
 export const GLOBAL_PER_THREAD = 16 * 16;
 const CEILING_HEAD = /* wgsl */ `
-struct Plan { loops: u32, seed: u32, unused0: u32, unused1: u32 }
+struct Plan { loops: u32, seed: u32, a: f32, b: f32 }
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @group(0) @binding(1) var<uniform> plan: Plan;`;
-export const fmaCeiling = (half) => {
+export const FMA_SHAPES = ["square", "affine"];
+export const fmaCeiling = (half, shape) => {
   const T = half ? "f16" : "f32";
-  return /* wgsl */ `${half ? "enable f16;" : ""}
-${CEILING_HEAD}
-@compute @workgroup_size(${CEILING_WORKGROUP})
-fn main(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_index) lane: u32) {
-  let c = vec4<${T}>(${T}(-1.0 - f32(lane) / 1024.0)) - vec4<${T}>(0.0, 0.1, 0.2, 0.3);
+  const body = shape === "square"
+    ? `  let c = vec4<${T}>(${T}(-1.0 - f32(lane) / 1024.0)) - vec4<${T}>(0.0, 0.1, 0.2, 0.3);
   var x = vec4<${T}>(${T}(f32(plan.seed & 255u) / 256.0));
   var y = x - vec4<${T}>(0.5);
   for (var i = 0u; i < plan.loops; i++) {
 ${"    x = fma(x, x, c);\n    y = fma(y, y, c);\n".repeat(16)}  }
-  out[id.x] = bitcast<u32>(dot(vec4<f32>(x + y), vec4<f32>(1.0)));
+  out[id.x] = bitcast<u32>(dot(vec4<f32>(x + y), vec4<f32>(1.0)));`
+    : `  let a = vec4<${T}>(${T}(plan.a));
+  let b = vec4<${T}>(${T}(plan.b));
+  var x = vec4<${T}>(${T}(f32(lane) / 256.0)) + vec4<${T}>(0.0, 0.1, 0.2, 0.3);
+  for (var i = 0u; i < plan.loops; i++) {
+${"    x = fma(x, a, b);\n".repeat(32)}  }
+  out[id.x] = bitcast<u32>(dot(vec4<f32>(x), vec4<f32>(1.0)));`;
+  return /* wgsl */ `${half ? "enable f16;" : ""}
+${CEILING_HEAD}
+@compute @workgroup_size(${CEILING_WORKGROUP})
+fn main(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_index) lane: u32) {
+${body}
 }`;
 };
 export const DOT4_CEILING = /* wgsl */ `requires packed_4x8_integer_dot_product;
@@ -906,7 +920,7 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_inde
 ${[...Array(16)].map((_, k) => `    s${k % 4} += held[at + ${k * 16}u];\n`).join("")}  }
   out[id.x] = bitcast<u32>(dot(s0 + s1 + s2 + s3, vec4<f32>(1.0)));
 }`;
-// the buffer read once a dispatch: 16 vec4s a thread, each a dispatch's threads after the one before
+// the buffer read once a dispatch (plan.loops unused: its size is the work): 16 vec4s a thread, each a dispatch's threads after the one before
 export const GLOBAL_CEILING = /* wgsl */ `${CEILING_HEAD}
 @group(0) @binding(2) var<storage, read> data: array<vec4<u32>>;
 @compute @workgroup_size(${CEILING_WORKGROUP})
