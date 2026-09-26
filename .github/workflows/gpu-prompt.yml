@@ -1,7 +1,8 @@
-# The prompt on the GPU (T135, ?gpu=on) against the CPU and NumPy, in Chromium-family browsers with WebGPU on a
-# software adapter (SwiftShader: the runners have no GPU): tests/gpu-check.mjs on the models this workflow builds (the
-# site's int8 models and a made-up one with grouped-query attention). It shows that the numbers are right; the speeds
-# that count are the owner's devices'. The page itself with ?gpu=on: models.yml with query "gpu=on". By hand only.
+# The prompt on the GPU (T135; by default since T148) against the CPU and NumPy, in Chromium-family browsers with WebGPU
+# on a software adapter (SwiftShader: the runners have no GPU): tests/gpu-check.mjs on the models this workflow builds
+# (the site's int8 models and a made-up one with grouped-query attention). It shows that the numbers are right; the
+# speeds that count are the owner's devices'. The page refuses a fallback adapter such as SwiftShader (T148): the
+# page itself on it with the tests' flag, models.yml with query "gpuTest=on". By hand only.
 # T147: SwiftShader compiles a tiled shader in 10 to 90 s and has no shader-f16, so the browsers take the made-up model
 # only (every shader, 150 tokens), and Dawn in Node on Mesa's lavapipe (shader-f16 and subgroups) takes every model
 # (about 5 minutes on the development machine).

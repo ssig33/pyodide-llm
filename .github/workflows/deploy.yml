@@ -54,6 +54,7 @@ jobs:
           node tests/ladder-check.mjs
           node tests/kept-check.mjs
           node tests/coi-js-check.mjs
+          node tests/gpu-choice-check.mjs
 
       - name: Smoke test with the latest Pyodide
         run: |

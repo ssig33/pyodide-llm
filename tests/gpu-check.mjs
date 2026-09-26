@@ -184,9 +184,13 @@ try {
     const checkpoint = await fetched(c.checkpoint), size = checkpoint.length, tokens = c.reference.tokens, n = tokens.length - 1;
     const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start }) });
     new Uint8Array(memory.buffer, base, size).set(checkpoint);
-    const run = async (gpu, gpuForce) => {
-      const engine = createForward({ memory, base, size, kernels, plan, gpu, gpuForce });
+    // T148: SwiftShader and lavapipe are fallback adapters, which the page refuses: the tests take them (fallback),
+    // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU)
+    const TESTS = { fallback: true, always: true };
+    const run = async (gpu, gpuForce, gpuRemembered) => {
+      const engine = createForward({ memory, base, size, kernels, plan, gpu, gpuForce: { ...TESTS, ...gpuForce }, gpuRemembered });
       const note = gpu ? await engine.gpu : undefined;
+      const ready = engine.gpuReady;
       const began = performance.now();
       // blocks of 16 at first (T108's, as Python handed them before T147): each block sees the keys and values the
       // GPU keeps of the ones before it, and the caches grow between them
@@ -194,7 +198,7 @@ try {
       const promptMs = performance.now() - began, gpuTokens = engine.gpuTokens;
       engine.forward(tokens[n], n);
       const logits = engine.logits().slice(), { keys, values } = engine.keysAndValues(0, n);
-      const out = { note, form: engine.gpuForm, attention: engine.gpuAttention, promptMs, gpuTokens, logits: b64(logits), keys: b64(keys), values: b64(values) };
+      const out = { note, ready, form: engine.gpuForm, attention: engine.gpuAttention, promptMs, gpuTokens, logits: b64(logits), keys: b64(keys), values: b64(values) };
       if (gpu) {
         // the same prompt again from position 0, all of it at once (one block of the GPU's): the GPU's keys and values
         // of the first run are written over
@@ -222,17 +226,19 @@ try {
         return { postMessage: (data) => data.type !== "stop" && inner.postMessage(data), set onmessage(f) { inner.onmessage = f; },
           set onerror(f) { inner.onerror = f; } };
       };
-      const engine = createForward({ memory, base, size, kernels, plan, gpu: stopLost, stalledMs: 1 });
+      const engine = createForward({ memory, base, size, kernels, plan, gpu: stopLost, gpuForce: TESTS, stalledMs: 1 });
       const note = await engine.gpu;
       const words = new Int32Array(memory.buffer, 0, GPU_WANTED + 1);
       engine.forwardMany(tokens.slice(0, -1), 0);
+      // T148: the CPU did the blocks the GPU gave up (the same numbers as the CPU's own run: its blocks of 16)
+      const cpuKeys = b64(engine.keysAndValues(0, n).keys);
       const gpuTokens = engine.gpuTokens;
       for (let beat = -1, still = 0, waited = 0; still < 1000 && waited < 120000; waited += 100) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         still = Atomics.load(words, GPU_BEAT) === beat ? still + 100 : 0;
         beat = Atomics.load(words, GPU_BEAT);
       }
-      const out = { note, gpuTokens, done: Atomics.load(words, GPU_DONE), failed: Atomics.load(words, GPU_FAILED) };
+      const out = { note, gpuTokens, keys: cpuKeys, done: Atomics.load(words, GPU_DONE), failed: Atomics.load(words, GPU_FAILED) };
       engine.release();
       inner.terminate();
       return out;
@@ -242,7 +248,18 @@ try {
     // the attention without subgroups or f16 (the lanes of the workgroup stand for a subgroup), where the adapter
     // has them and so chose the other
     if (forms.length) gpu.push(await run(openGpu, { matrices: forms[0], attention: "llama.cpp flash attention tiles" }));
-    results.push({ id: c.id, cpu: await run(undefined), gpu, late: c.id === "synthetic" ? await late() : undefined });
+    // T148 (the made-up model only): a fallback adapter refused as the page refuses it, before anything is compiled;
+    // the shaders of the first run remembered for this adapter (its key), which are then the only ones compiled, and
+    // not for another key
+    let refused, remembered;
+    if (c.id === "synthetic") {
+      const began = performance.now(), engine = createForward({ memory, base, size, kernels, plan, gpu: openGpu });
+      refused = { note: await engine.gpu, seconds: (performance.now() - began) / 1000 };
+      engine.release();
+      const first = gpu[0].ready ?? {}, kept = { key: first.key, matrices: first.matrices, attention: first.attention };
+      remembered = { same: (await run(openGpu, {}, kept)).ready, other: (await run(openGpu, {}, { ...kept, key: kept.key + "|another" })).ready };
+    }
+    results.push({ id: c.id, cpu: await run(undefined), gpu, late: c.id === "synthetic" ? await late() : undefined, refused, remembered });
   }
   postMessage({ results, forms });
 } catch (error) {
@@ -374,7 +391,7 @@ function worstRow(got, want, width) {
 }
 const argmax = (xs) => xs.reduce((best, x, i) => (x > xs[best] ? i : best), 0);
 let failed = false;
-for (const { id, cpu, gpu: runs, late } of outcome.results) {
+for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;
   const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (dim / heads) * kvHeads;
   const kv = (run) => Math.max(worstRow(floats(run.keys), floats(ref.keys), kvDim), worstRow(floats(run.values), floats(ref.values), kvDim));
@@ -388,9 +405,23 @@ for (const { id, cpu, gpu: runs, late } of outcome.results) {
   if (late) {
     // T147: a request forward.js gave up on is answered by nothing
     const tried = late.note === "prompts on WebGPU" && late.gpuTokens === 0;
-    const wrong = tried && (late.done !== 0 || late.failed !== 0);
-    console.log(`  a GPU that answers late: ${!tried ? `not tried (${late.note}, ${late.gpuTokens} tokens on the GPU)` : wrong ? `it answered (done ${late.done}, failed ${late.failed}) — FAILED` : "given up, and it wrote nothing"}`);
+    // T148: and the CPU did those blocks itself: its keys are the CPU's own run's, to the bit
+    const cpuDid = late.keys === cpu.keys;
+    const wrong = tried && (late.done !== 0 || late.failed !== 0 || !cpuDid);
+    console.log(`  a GPU that answers late: ${!tried ? `not tried (${late.note}, ${late.gpuTokens} tokens on the GPU)` : wrong ? `it answered (done ${late.done}, failed ${late.failed}) or the CPU did not do its blocks (${cpuDid ? "it did" : "it did not"}) — FAILED` : "given up, it wrote nothing, and the CPU did the blocks"}`);
     failed ||= wrong;
+  }
+  if (refused) {
+    // T148: refused before anything was compiled (SwiftShader compiles a shader in 10 to 90 s): within a few seconds
+    const right = /a fallback adapter/.test(refused.note) && refused.seconds < 30;
+    console.log(`  a fallback adapter without the tests' leave: ${refused.note} in ${refused.seconds.toFixed(1)} s${right ? "" : " — FAILED"}`);
+    failed ||= !right;
+  }
+  if (remembered) {
+    const right = remembered.same?.remembered === true && remembered.other?.remembered === false;
+    console.log(`  the shaders remembered: for this adapter ${remembered.same?.remembered ? "taken" : "not taken"} (${remembered.same?.matrices}), ` +
+      `for another ${remembered.other?.remembered ? "taken" : "not taken"}${right ? "" : " — FAILED"}`);
+    failed ||= !right;
   }
   for (const gpu of runs) {
     const failures = [];

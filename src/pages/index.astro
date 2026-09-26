@@ -397,6 +397,16 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     }
     return { fixed: fixedThreads, remembered, hint: navigator.hardwareConcurrency || 1 };
   };
+  // T148: what the GPU chose for a model on this device (its shaders: T147 times them all the first time), for the next
+  // visit: the worker's GPU compiles only those, where the adapter and browser are the same (gpu.js's key)
+  const gpuKey = (id: string) => `gpu:${id}`;
+  const gpuFor = (entry: { id: string }) => {
+    try {
+      return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry.id)) ?? "null") ?? undefined };
+    } catch {
+      return {};  // no storage here, or something else under the name: choose again
+    }
+  };
   const REPOSITORY = /^[\w.-]+\/[\w.-]+$/, REVISION = /^[\w.-]+$/;
   // a repository nobody has looked at, as an entry of the list: the same for ?hf= and for the sheet (T88). The
   // template and prompt of a link belong to the repository the link names, not to one opened later in the sheet
@@ -688,6 +698,15 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     chat.scrollTop = chat.scrollHeight;
   }
   const seconds = (value: number) => `${value.toFixed(value < 10 ? 2 : 1)} s`;
+  // the status line of a ready model: how it runs, and (T148) what the GPU takes of its prompts now
+  let readyLine: { backend: string; threads: number; pyodide: string } | undefined, gpuNote: string | undefined;
+  function showStatus(note?: string) {
+    if (note && note !== gpuNote) console.info(`gpu: ${note}`);
+    gpuNote = note ?? gpuNote;
+    if (!readyLine || benchmarking) return;
+    const { backend, threads, pyodide } = readyLine;
+    statusText.textContent = `${model.name} · ${backend}${threads > 1 ? `, ${threads} threads` : ""}${gpuNote ? `, ${gpuNote}` : ""} · Pyodide ${pyodide}`;
+  }
   // T135: how many of the prompt's tokens went through the GPU (the ones counted as the prompt: the one after them
   // makes the first logits, on the CPU)
   const onGpu = (data: any) => (!data.gpuTokens ? "" : data.gpuTokens >= data.prompt_tokens ? " on WebGPU"
@@ -791,9 +810,10 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       showSettings();
       // the model is in the Cache API now: ask the browser not to evict it (only a page may ask, not a worker)
       navigator.storage?.persist?.();
-      // T135: with ?gpu=on, whether the prompts go through the GPU, or why not (and the same line in the console)
-      statusText.textContent = `${model.name} · ${data.backend}${data.threads > 1 ? `, ${data.threads} threads` : ""}${data.gpu ? `, ${data.gpu}` : ""} · Pyodide ${data.pyodide}`;
-      if (data.gpu) console.info(`gpu: ${data.gpu}`);
+      // T135, T148: whether the prompts go through the GPU, or why not (and the same line in the console); it changes
+      // as the GPU gets ready and as the prompts are timed (the "gpu" and "done" messages)
+      readyLine = { backend: data.backend, threads: data.threads, pyodide: data.pyodide };
+      showStatus(data.gpu);
       const load = $("load-stats");
       load.textContent = "";
       rows(load, [
@@ -804,6 +824,20 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       $("load").classList.add("measured");
       showKept();
       remember(model, (model as any).hf && !data.notKept);
+    } else if (data.type === "gpu") {
+      // T148: the GPU is ready (or will not be): the status line says so, the load's breakdown says what it chose and
+      // how long it took, and what it chose is kept for the next visit on this device
+      showStatus(data.note);
+      if (data.matrices) {
+        $("load-stats").append(Object.assign(document.createElement("div"), {
+          textContent: `WebGPU ${seconds(data.seconds)} · ${data.matrices}${data.remembered ? " (remembered)" : ""} · ${data.attention}`,
+        }));
+        try {
+          localStorage.setItem(gpuKey(model.id), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention }));
+        } catch {
+          // no storage here: the next visit times them again
+        }
+      }
     } else if (data.type === "threads-compared") {
       // T114: how the worker chose the number of threads, one line per comparison (medians in ms per token)
       const kept = data.faster ? data.candidate : data.best;
@@ -827,6 +861,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
         chat.scrollTop = chat.scrollHeight;
       }
     } else if (data.type === "done") {
+      showStatus(data.gpu);  // T148: the prompts timed on either side may have moved the GPU's verdict
       // the settings this very answer was written with: with the seed the same text can be asked for again
       const how = used.temperature ? `temp ${used.temperature}` : "greedy";
       meta(answer!, `${model.name} · ${data.tokens} tokens · ${data.tokens_per_second.toFixed(1)} tok/s${data.threads > 1 ? ` · ${data.threads} threads` : ""} · ${how}`, [
@@ -864,7 +899,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     }
     // T172: only the messages that end a piece of the worker's work mean it is idle again (a load: ready, the
     // benchmark: bench, a text: done, any of them: error). The others come in the middle of one: status, progress
-    // and token, and the search for the number of threads (threads, threads-compared), which runs inside a text; read
+    // and token, and the search for the number of threads (threads, threads-compared), which runs inside a text, and gpu (T148); read
     // as idle, they gave the run button back and a press started a second text on the same engine
     if (["ready", "bench", "done", "error"].includes(data.type)) {
       progress.hidden = true;
@@ -895,7 +930,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       show(model);
     }
     if (loads === 1) {
-      worker.postMessage({ type: "init", search: location.search, model: weighed(model), load: loads, threads: threadsFor(model) });
+      worker.postMessage({ type: "init", search: location.search, model: weighed(model), load: loads, threads: threadsFor(model), gpu: gpuFor(model) });
     }
   })();
 
@@ -1086,13 +1121,14 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     benchmarking = false;  // the worker cancels the benchmark's round for the new model, and never reports it
     show(model);
     ready = false;
+    readyLine = gpuNote = undefined;  // T148: the status line waits for the new model's
     run.disabled = true;
     progress.hidden = true;
     // the timings of the previous load
     $("load").classList.remove("measured");
     ($("load") as HTMLDetailsElement).open = false;
     // search: this may reach the worker before init does, while the page looks at what is kept (T116)
-    worker.postMessage({ type: "load", search: location.search, model: weighed(model), load: ++loads, threads: threadsFor(model) });
+    worker.postMessage({ type: "load", search: location.search, model: weighed(model), load: ++loads, threads: threadsFor(model), gpu: gpuFor(model) });
   };
 
   // Enter breaks the line and Shift + Enter does too; Ctrl + Enter or Cmd + Enter sends. A phone has neither key

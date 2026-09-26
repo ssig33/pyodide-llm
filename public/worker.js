@@ -297,8 +297,15 @@ let sharedKernels, threadsRequest, outsideNow;
 let wideKernels;
 // ?wide=on: a 64-bit memory for every model, to try that path on a small one (measuring, tests), as ?offline=on says
 let forceWide = false;
-// ?gpu=on (T135): a prompt's tokens through the layers on the GPU (gpu.js), where forward.js can put the model there
-let gpuAsked = false;
+// T148: a prompt's tokens through the layers on the GPU (gpu.js) by default, wherever this worker has WebGPU and
+// forward.js can put the model there, and the GPU is faster than the CPU here (AGENTS.md's policy 9: no option).
+// ?gpuTest=on, for the tests only: a fallback adapter (SwiftShader, the only WebGPU of CI) taken as a GPU, and every
+// block of a prompt it can take given to it (its speed is no GPU's: the tests look at its numbers, not at its time),
+// and the first right shader of the matrices taken untimed (SwiftShader timed Llama 3.2 1B's past gpu.js's 180 s)
+const hasWebGpu = Boolean(self.navigator?.gpu);
+let gpuForce = {};
+// what the page kept of the GPU's shaders for the model asked for ({ remembered }), as threadsRequest
+let gpuRequest;
 // the optimizations this session leaves out (T52): ?without=relaxed,sampler, and ?kernel=off as it always was
 let disabled = [];
 // what the page's own URL said, to come back to after a benchmark has tried other combinations (T77)
@@ -389,7 +396,7 @@ async function init(search) {
   if (parts >= 1 && parts <= 64) hfPartBytes = Math.round(parts * 1024 * 1024);
   if (connections >= 1 && connections <= 32) hfConnections = Math.floor(connections);
   forceWide = asked.get("wide") === "on";
-  gpuAsked = asked.get("gpu") === "on";
+  gpuForce = asked.get("gpuTest") === "on" ? { fallback: true, always: true, quick: true } : {};
   const version = await resolvePyodideVersion(search);
   const base = `https://cdn.jsdelivr.net/pyodide/v${version}/full/`;
   // Each step says its name, and ends in an error rather than never: loadPyodide() does not fail when a fetch of
@@ -497,7 +504,7 @@ const spawnThread = (data) => new Promise((resolve, reject) => {
   worker.postMessage(data);
 });
 
-// T135: the GPU's worker of forward.js (?gpu=on), a module worker of its own; forward.js starts it
+// T135: the GPU's worker of forward.js, a module worker of its own; forward.js starts it
 const openGpu = () => new Worker(new URL(`gpu.js${self.location.search}`, import.meta.url), { type: "module" });
 
 // T96: one memory of forward.js, kept from model to model. A browser reserves address space for every WebAssembly
@@ -551,7 +558,7 @@ function afterCheckpoint(header, size, options, shared) {
   return forwardModule.footprint(header, size, {
     ...options, dtype, int8, relaxed: Boolean(jsKernels?.relaxed) && !disabled.includes("relaxed"),
     halfKV: shared && quantized && int8 && !disabled.includes("kv16"),
-    kvStart: llama2_numpy.KV_START, outliers: llama2_numpy.OUTLIER_CHANNELS, gpu: gpuAsked,
+    kvStart: llama2_numpy.KV_START, outliers: llama2_numpy.OUTLIER_CHANNELS, gpu: hasWebGpu,
   });
 }
 // the page cross-origin isolated (stage 3), shared memories to be had, and not ?threads=1: the memory is shared
@@ -592,12 +599,19 @@ function weightsBuffer(size, header, options) {
     const { memory, base, shared } = pooledWeights(size, after, wanted && (!wide || Boolean(wideKernels.shared)), wide);
     const kernels = wide ? (shared ? wideKernels.shared : wideKernels.plain) : (shared ? sharedKernels : jsKernels);
     const spawn = shared ? spawnThread : undefined;
+    // T148: the layers on the GPU are a second copy of them (T156 will keep one), in the same memory where the GPU is
+    // a phone's or an Apple's: both, with the rest of this model, within half of what the device says it has (as
+    // src/models.js's weightsFor asks for six bits past half). A browser that does not say (Safari, Firefox): 4 GB
+    const gpuRoom = (self.navigator?.deviceMemory ?? 4) * 2 ** 30 / 2 - (size + after);
     weightsNow = memory;
     return {
       write: (offset, chunk) => new Uint8Array(memory.buffer, base + offset, chunk.length).set(chunk),
       slice: (begin, end) => new Uint8Array(memory.buffer, base + begin, end - begin).slice(),
       llama: (tokenizer, options) => {
-        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: gpuAsked ? openGpu : undefined });
+        // (not in the benchmark's rounds, T45: they time the CPU's combinations, which a GPU starting beside them
+        // would slow down with its upload and compilation)
+        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benching ? openGpu : undefined, gpuRoom,
+          gpuRemembered: gpuRequest?.remembered, gpuForce });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
       },
       destroy() {},
@@ -1148,10 +1162,9 @@ async function load(model, signal, id) {
     signal.throwIfAborted();
     const converted = await convert(model, signal, id);
     await startThreads(model);
-    const gpu = await gpuFor(model, id, signal);
     postMessage({
       type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
-      seconds: { ...loadSeconds }, heap: heapBytes(), threads: threadsNow(), gpu, ...converted,
+      seconds: { ...loadSeconds }, heap: heapBytes(), threads: threadsNow(), gpu: watchGpu(id), ...converted,
     });
     return;
   }
@@ -1214,10 +1227,10 @@ async function load(model, signal, id) {
     tokenizer?.buffer.destroy();
   }
   await startThreads(model);
-  const gpu = await gpuFor(model, id, signal);
   postMessage({
     type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
-    seconds: { ...loadSeconds }, heap: heapBytes(), threads: threadsNow(), gpu, overlapped: checkpoint.overlapped === true && pyodideAt > downloadStarted,
+    seconds: { ...loadSeconds }, heap: heapBytes(), threads: threadsNow(), gpu: watchGpu(id),
+    overlapped: checkpoint.overlapped === true && pyodideAt > downloadStarted,
   });
   if (!model.file && !model.url) {
     dropStaleParts(model);
@@ -1248,22 +1261,17 @@ async function startThreads(model) {
 }
 const threadsNow = () => outsideNow?.engine?.threads ?? 1;
 
-// T135: what the status line says of the GPU where the page asked for it (?gpu=on), once the layers of the model just
-// loaded are on it or it is known that they will not be (forward.js says which, and why). A load that is let go of
-// meanwhile ends here, not when the GPU is through: the next load waits for this one to end.
-async function gpuFor(model, id, signal) {
-  if (!gpuAsked) {
-    return undefined;
-  }
-  const pending = outsideNow?.engine?.gpu;
-  if (!pending) {
-    return "prompts on the CPU (the NumPy engine runs this model)";
-  }
-  postMessage({ type: "status", load: id, text: `${model.name}: putting its layers on the GPU...` });
-  signal.throwIfAborted();
-  return Promise.race([pending, new Promise((resolve, reject) => {
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  })]);
+// T135, T148: what the status line says of the GPU as the model is ready (nothing waits for the GPU: the model runs on
+// the CPU until the GPU is ready, and the prompts go where they are faster from then on, forward.js). Once the layers
+// are on the GPU, or it is known that they will not be, the page is told { type: "gpu", note, ... } (what the GPU
+// chose, and how long it took: the page shows it and remembers the shaders for the next visit). A load let go of
+// meanwhile says it too; the page drops what is not of its latest load.
+function watchGpu(id) {
+  const engine = outsideNow?.engine;
+  if (!engine) return "prompts on the CPU (the NumPy engine runs this model)";
+  if (!engine.gpu) return `prompts on the CPU (${benching ? "the benchmark times the CPU" : "no WebGPU in a worker here"})`;
+  engine.gpu.then((note) => outsideNow?.engine === engine && postMessage({ type: "gpu", load: id, note, ...(engine.gpuReady ?? {}) }));
+  return engine.gpuStatus;
 }
 
 // the run that is going on, and whether the page asked it to stop
@@ -1304,7 +1312,7 @@ async function generate({ type, prompt, ...options }) {
   } finally {
     pieces.destroy();
   }
-  postMessage({ type: "done", threads: threadsNow(), gpuTokens: outsideNow?.engine?.gpuTokens ?? 0,
+  postMessage({ type: "done", threads: threadsNow(), gpuTokens: outsideNow?.engine?.gpuTokens ?? 0, gpu: outsideNow?.engine?.gpuStatus,
                 ...llama.stats.toJs({ dict_converter: Object.fromEntries }) });
 }
 
@@ -1320,6 +1328,7 @@ self.onmessage = async ({ data }) => {
   try {
     if (data.type === "init" || data.type === "load") {
       threadsRequest = data.threads;
+      gpuRequest = data.gpu;
       // The latest choice wins: the download that is going on stops, and its parts that are complete stay in
       // the cache. Pyodide is loaded once, whatever happens to the model that was asked for first.
       loading?.abort();

@@ -1,13 +1,20 @@
-// gpu.js (T135, T147): the model page's GPU, in a worker of its own. forward.js (in the model's worker) makes it where
-// the page asked for it (?gpu=on) and the model is one it takes, and hands it the blocks of a prompt (up to plan.batch
-// tokens) one at a time, waiting in Atomics.wait for the answer: the model's worker cannot wait for a promise while
-// Python calls forwardMany(), and this one can (T94's design; T134's bridge measured 12 to 95 µs a round trip).
+// gpu.js (T135, T147, T148): the model page's GPU, in a worker of its own. forward.js (in the model's worker) makes it
+// wherever the worker has WebGPU and the model is one it takes (T148: by default, no option), and hands it the blocks
+// of a prompt (up to plan.batch tokens) one at a time that it finds faster here than on the CPU, waiting in
+// Atomics.wait for the answer: the model's worker cannot wait for a promise while Python calls forwardMany(), and this
+// one can (T94's design; T134's bridge measured 12 to 95 µs a round trip).
 //
 //   { type: "start", memory, plan }  the layers of the model onto the GPU, read from the shared memory of forward.js
 //                                    (plan: what forward.js says of them, addresses in that memory). Says
 //                                    { type: "progress" } after every step (a layer's weights, a shader compiled,
 //                                    checked, timed: STEP_MS each at most, T147), then { type: "ready",
-//                                    adapter, bytes, seconds, form, attention, forms } or { type: "unusable", reason }
+//                                    adapter, key, bytes, seconds, form, attention, forms, remembered, blocks } or
+//                                    { type: "unusable", reason }. T148: a fallback adapter (the CPU in the GPU's
+//                                    place) is refused before anything is compiled, unless plan.force.fallback
+//                                    (tests); plan.remembered ({ key, matrices, attention }: what the page kept of an
+//                                    earlier visit) spares the timing of the matrices' shaders where key is this
+//                                    adapter's and the shader is still right here; blocks: what a whole block of 16
+//                                    and of 64 tokens takes here (forward.js weighs the GPU against the CPU by it)
 //   { type: "prompt", serial, count, pos }
 //                                    the rows of count tokens at positions pos, pos + 1, ... (embedded by forward.js,
 //                                    at plan.rows) through every layer, and their keys and values of every layer into
@@ -80,6 +87,12 @@ async function start(memory, plan) {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (stopping) return end();
     if (!adapter) return unusable("no GPU adapter here");
+    // T148: a fallback adapter is the CPU doing the GPU's work (SwiftShader, lavapipe): never faster than the CPU's
+    // own kernels, and its compilation of the shaders alone took 2 to 4 minutes (T147). Refused before anything is
+    // made on it, but where a test asks for it (it is the only WebGPU of CI and of the development machine)
+    const info = adapter.info ?? {};
+    const fallback = Boolean(info.isFallbackAdapter ?? adapter.isFallbackAdapter);
+    if (fallback && !plan.force.fallback) return unusable("a fallback adapter: the CPU in the GPU's place");
     // the largest buffer of the layers: one of a layer's matrices
     const largest = Math.max(...Object.values(plan.matrices).map(({ rows, n }) => rows * n));
     const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
@@ -93,8 +106,10 @@ async function start(memory, plan) {
       requiredLimits: { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup,
         maxComputeWorkgroupSizeX } });
     device.lost.then((info) => { lost = `the GPU was lost (${info.reason}${info.message ? `: ${info.message}` : ""})`; });
-    const info = adapter.info ?? {};
-    model = { device, memory, plan, wgsl, owned: [], limit, info, fallback: Boolean(info.isFallbackAdapter ?? adapter.isFallbackAdapter) };
+    // T148: what the page keeps of an earlier visit counts only for the same adapter and browser
+    const key = adapterKey(adapter);
+    const remembered = plan.remembered?.key === key ? plan.remembered : null;
+    model = { device, memory, plan, wgsl, owned: [], limit, info, fallback, remembered };
     if (stopping) return end();
     // a buffer the device cannot give fails quietly, as an error of these scopes
     device.pushErrorScope("out-of-memory");
@@ -107,14 +122,17 @@ async function start(memory, plan) {
     await chooseMatrices(model);
     if (stopping) return end();
     bindLayers(model);
-    grow(model, Math.min(plan.kvStart, plan.seqLen));
+    grow(model, Math.max(Math.min(plan.kvStart, plan.seqLen), Math.min(plan.batch, plan.seqLen)));
     await within(device.queue.onSubmittedWorkDone(), "the GPU's work");
     const invalid = await device.popErrorScope(), full = await device.popErrorScope();
     if (stopping) return end();
     if (invalid || full) return unusable(`the GPU did not take the layers (${(invalid ?? full).message})`);
+    // (not for the page's tests: SwiftShader took more than STEP_MS to time Llama 3.2 1B's shaders, T147 in CI)
+    const blocks = plan.force.quick ? [] : await within(timeBlocks(model), "timing a block");
+    if (stopping) return end();
     if (lost) return unusable(lost);
-    postMessage({ type: "ready", adapter: describe(adapter), bytes, seconds: (performance.now() - began) / 1000,
-      form: model.form.name, attention: model.attention.name, forms: model.forms });
+    postMessage({ type: "ready", adapter: describe(adapter), key, bytes, seconds: (performance.now() - began) / 1000,
+      form: model.form.name, attention: model.attention.name, forms: model.forms, remembered: Boolean(model.form.remembered), blocks });
   } catch (error) {
     unusable(String(error?.message ?? error));
   } finally {
@@ -128,6 +146,12 @@ function describe(adapter) {
   const name = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(" ") || "a GPU";
   return (info.isFallbackAdapter ?? adapter.isFallbackAdapter) ? `${name} (a fallback adapter: the CPU in the GPU's place)` : name;
 }
+// T148: the adapter and the browser whose shaders the page remembers: another GPU, driver architecture or browser
+// version chooses anew (the user agent carries the browser's version)
+const adapterKey = (adapter) => {
+  const info = adapter.info ?? {};
+  return [info.vendor, info.architecture, info.device, info.description, self.navigator?.userAgent].map((part) => part ?? "").join("|");
+};
 
 function unusable(reason) {
   postMessage({ type: "unusable", reason });
@@ -275,10 +299,13 @@ async function chooseAttention(m) {
   const limits = { memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device),
     subgroupMin: m.info.subgroupMinSize, subgroupMax: m.info.subgroupMaxSize };
   const tried = [];
-  const options = [{ half, subgroups }, { half: false, subgroups: false }].filter((o, i) => i === 0 || o.half !== half || o.subgroups !== subgroups);
+  const nameOf = (option) => `llama.cpp flash attention tiles${option.half ? ", f16" : ""}${option.subgroups ? ", subgroups" : ""}`;
+  // T148: the one the page remembers for this adapter first (it was the first right one then: the other was wrong)
+  const options = [{ half, subgroups }, { half: false, subgroups: false }].filter((o, i) => i === 0 || o.half !== half || o.subgroups !== subgroups)
+    .sort((a, b) => (nameOf(b) === m.remembered?.attention) - (nameOf(a) === m.remembered?.attention));
   for (const option of options) {
     const shape = wgsl.flashShape({ headSize: plan.headSize, ...option, ...limits });
-    const name = `llama.cpp flash attention tiles${option.half ? ", f16" : ""}${option.subgroups ? ", subgroups" : ""}`;
+    const name = nameOf(option);
     if (plan.force.attention && plan.force.attention !== name) continue;
     if (shape.none) {
       tried.push(`${name}: ${shape.none}`);
@@ -375,8 +402,29 @@ async function chooseMatrices(m) {
     memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device) });
   if (plan.force.matrices) forms = forms.filter((form) => form.name === plan.force.matrices);
   m.forms = [];
+  // T148: the shader the page remembers for this adapter, alone, where it is one this device still makes and it is
+  // still right here (a driver may have changed under the same names): no other is compiled or timed. Else all of them
+  const kept = !plan.force.matrices && forms.find((form) => !form.none && form.name === m.remembered?.matrices);
+  if (kept) {
+    try {
+      const tiled = { ...kept, remembered: true, pipeline: await within(validated(m, () => pipelineOf(m, kept.code, kept.constants)), `compiling ${kept.name}`) };
+      const wrong = await within(checkForm(m, tiled), `checking ${kept.name}`);
+      if (!wrong) {
+        m.forms.push({ name: kept.name, remembered: true });
+        m.form = tiled;
+        return;
+      }
+      m.forms.push({ name: kept.name, none: `remembered, but wrong now: ${wrong}` });
+    } catch (error) {
+      if (error?.late) throw error;
+      m.forms.push({ name: kept.name, none: `remembered, but ${error?.message ?? error}` });
+    }
+    if (stopping) return;
+  }
   const right = [];
   for (const form of forms) {
+    if (plan.force.quick && right.length) break;  // T148: the page's tests, the first right one untimed
+    if (form === kept) continue;  // wrong just now
     if (form.none) {
       m.forms.push({ name: form.name, none: form.none });
       continue;
@@ -559,6 +607,30 @@ function grow(m, needed) {
   m.cache = cache;
 }
 
+// T148: what a whole block takes here, from the submission to its keys and values read back, for 16 and for 64 tokens
+// (plan.batch) at position 0 of the GPU's own cache (which holds nothing of forward.js's yet): forward.js weighs a
+// block of a prompt on the GPU against the same tokens on the CPU by it (a line through the two, scaled by the blocks
+// it then times itself). The two in turn, BLOCK_ROUNDS rounds after one of each to warm up (the pipelines' first
+// dispatches, the weights' first reads), the median of each (a device that warms up or is loaded meanwhile falls on
+// both alike); one round on a fallback adapter (tests: its times are no GPU's)
+const BLOCK_ROUNDS = 3;
+async function timeBlocks(m) {
+  const { batch, seqLen } = m.plan, counts = [...new Set([Math.min(16, batch, seqLen), Math.min(batch, seqLen)])], times = counts.map(() => []);
+  const timed = async (count) => {
+    const began = performance.now();
+    await block(m, count, 0, () => false, true);
+    return performance.now() - began;
+  };
+  for (const count of counts) await timed(count);
+  for (let round = 0; round < (m.fallback ? 1 : BLOCK_ROUNDS); round++) {
+    for (let i = 0; i < counts.length; i++) {
+      times[i].push(await timed(counts[i]));
+      if (stopping) return [];
+    }
+  }
+  return counts.map((count, i) => ({ count, ms: times[i].sort((a, b) => a - b)[times[i].length >> 1] }));
+}
+
 // ---- a block of a prompt
 async function prompt({ serial, count, pos }) {
   const { memory, plan } = model;
@@ -585,15 +657,22 @@ async function prompt({ serial, count, pos }) {
   }
 }
 
-async function block(m, count, pos, wanted) {
+// A block of count tokens at pos through the layers, its keys and values into plan.staging where wanted() still says
+// so. timing (T148, timeBlocks): rows and angles of zeros instead of forward.js's, and nothing written back
+async function block(m, count, pos, wanted, timing = false) {
   const { device, plan } = m, B = plan.batch, half = plan.headSize / 2, kvDim = plan.kvHeads * plan.headSize;
   // the rows forward.js embedded (dense), and the angles of their positions (the tables forward.js has)
-  const F = new Float32Array(m.memory.buffer);
-  m.rows.set(F.subarray(plan.rows / 4, plan.rows / 4 + count * plan.dim));
-  for (let t = 0; t < count; t++) {
-    const cos = plan.cos / 4 + (pos + t) * half, sin = plan.sin / 4 + (pos + t) * half;
-    m.turns.set(F.subarray(cos, cos + half), t * plan.headSize);
-    m.turns.set(F.subarray(sin, sin + half), t * plan.headSize + half);
+  if (timing) {
+    m.rows.fill(0);
+    m.turns.fill(0);
+  } else {
+    const F = new Float32Array(m.memory.buffer);
+    m.rows.set(F.subarray(plan.rows / 4, plan.rows / 4 + count * plan.dim));
+    for (let t = 0; t < count; t++) {
+      const cos = plan.cos / 4 + (pos + t) * half, sin = plan.sin / 4 + (pos + t) * half;
+      m.turns.set(F.subarray(cos, cos + half), t * plan.headSize);
+      m.turns.set(F.subarray(sin, sin + half), t * plan.headSize + half);
+    }
   }
   device.pushErrorScope("out-of-memory");
   device.pushErrorScope("validation");
@@ -639,7 +718,7 @@ async function block(m, count, pos, wanted) {
   await m.readback.mapAsync(MAP_READ);
   try {
     const bytes = 2 * plan.layers * B * row;
-    if (wanted()) new Uint8Array(m.memory.buffer, plan.staging, bytes).set(new Uint8Array(m.readback.getMappedRange(), 0, bytes));
+    if (!timing && wanted()) new Uint8Array(m.memory.buffer, plan.staging, bytes).set(new Uint8Array(m.readback.getMappedRange(), 0, bytes));
   } finally {
     m.readback.unmap();
   }

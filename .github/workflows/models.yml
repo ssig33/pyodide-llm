@@ -31,8 +31,12 @@ on:
         type: boolean
         default: false
       query:
-        description: 'more of the page URL for every run, such as bench=1 or hfParts=16&hfConnections=8'
+        description: 'more of the page URL for every run, such as bench=1 or hfParts=16&hfConnections=8 (gpuTest=on: the prompt on SwiftShader, T148)'
         required: false
+      swiftshader:
+        description: 'T148: SwiftShader as the WebGPU of Chromium without gpuTest=on: the page must refuse it and answer on the CPU'
+        type: boolean
+        default: false
       then:
         description: 'model ids chosen after the answer in the same page, one after another (a visitor changing models)'
         required: false
@@ -99,6 +103,7 @@ jobs:
           E2E_TWICE: ${{ inputs.twice && '1' || '' }}
           E2E_OFFLINE: ${{ inputs.offline && '1' || '' }}
           E2E_QUERY: ${{ inputs.query }}
+          E2E_GPU: ${{ inputs.swiftshader && 'swiftshader' || '' }}
           E2E_THEN: ${{ inputs.then }}
           E2E_LONG: ${{ inputs.long }}
         run: |

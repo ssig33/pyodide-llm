@@ -29,8 +29,13 @@
 //                  offline, loads the page again and must answer once more (Pyodide, NumPy and the page from the
 //                  service worker's copies, the model from the worker's cache).
 //   E2E_QUERY      more of the page's URL, such as hfParts=16&hfConnections=8 (T107), added to what the model needs
-//                  and kept in the JSON line. With gpu=on (T135) a Chromium gets WebGPU without a GPU (SwiftShader, as
-//                  tests/bench-check.mjs has it), and the run fails unless the prompt went through it.
+//                  and kept in the JSON line. With gpuTest=on (T148: the tests' flag; the page takes the GPU by default,
+//                  and refuses a fallback adapter) a Chromium gets WebGPU without a GPU (SwiftShader, as
+//                  tests/bench-check.mjs has it), the page takes it and every block of a prompt it can, and the run
+//                  fails unless the prompt went through it.
+//   E2E_GPU        swiftshader (T148): a Chromium gets SwiftShader's WebGPU without gpuTest=on, and the page must refuse
+//                  it (a fallback adapter: the CPU in the GPU's place) before it compiles anything, and answer on the CPU
+//                  (the status line says why: the fallback adapter, or a reason before it such as ?coi=off).
 //   E2E_THEN       model ids of the list, separated by spaces: after the answer they are chosen one after another
 //                  in the same page, as a visitor changes models, and each must answer too (the worker keeps one
 //                  memory from model to model, T96). They write what the page sets for them, not 256 tokens.
@@ -98,9 +103,10 @@ const watchdog = setTimeout(async () => {
   process.stdout.write(`${engine} ${browserVersion}, ${model}: timed out after ${seconds}s\n`, () => process.exit(2));
 }, limit);
 const kind = playwright[channel ? "chromium" : engine], viewport = { width: 390, height: 844 };
-// T135: ?gpu=on asks for the prompt on the GPU; a runner has none, SwiftShader stands in (its speed means nothing)
-const gpuAsked = /(^|&)gpu=on(&|$)/.test(process.env.E2E_QUERY ?? "");
-const args = gpuAsked && kind === playwright.chromium ? ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader"] : [];
+// T135, T148: a runner has no GPU; SwiftShader stands in (its speed means nothing), taken with ?gpuTest=on, refused without
+const gpuTest = /(^|&)gpuTest=on(&|$)/.test(process.env.E2E_QUERY ?? "");
+const swiftShader = gpuTest || process.env.E2E_GPU === "swiftshader";
+const args = swiftShader && kind === playwright.chromium ? ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader"] : [];
 if (process.env.E2E_TWICE) {
   // A profile on disk, as a visitor's browser has: Playwright's usual context is like private browsing, and WebKit
   // kept nothing across a reload there (T99)
@@ -198,6 +204,14 @@ if (opens) {
   await idle();
 }
 const readySeconds = (Date.now() - started) / 1000;
+// T148: the model is ready before the GPU is: where there is a GPU to see, the status line's verdict on it first (the
+// layers on SwiftShader and its shaders compiled, with gpuTest=on: minutes; refused without it: at once)
+let gpuVerdict = null;
+if (swiftShader && kind === playwright.chromium) {
+  await page.waitForFunction(() => /prompts on WebGPU|prompts on the CPU \((?!while)/.test(document.getElementById("status-text")?.textContent ?? ""), null, { timeout: 0 });
+  gpuVerdict = { seconds: (Date.now() - started) / 1000 - readySeconds, status: await page.evaluate(() => document.getElementById("status-text").textContent) };
+  console.log(`the GPU's verdict ${gpuVerdict.seconds.toFixed(1)}s after ready: ${gpuVerdict.status}`);
+}
 // T84: the worker's own breakdown (Pyodide, download, the conversion's share of it, Llama()) and its memory
 const reported = await page.evaluate(() => window.__ready ?? null).catch(() => null);
 // By default a model writes until its context is full (4096 tokens for llm-jp-3-150m). The test, and every tok/s in
@@ -249,7 +263,11 @@ if (!/tok\/s/.test(result.meta)) failures.push("no speed line under the answer")
 if (result.pageScrolls) failures.push("the page itself scrolls");
 if (result.early.length) failures.push(`before the answer ended: ${[...new Set(result.early)].join(", ")}`);
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
-if (gpuAsked && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
+if (gpuTest && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
+// (refused as a fallback adapter, or before that for another reason: a page that is not cross-origin isolated)
+if (swiftShader && !gpuTest && (!/prompts on the CPU \(/.test(gpuVerdict?.status ?? "") || /on WebGPU/.test(result.prompt))) {
+  failures.push(`SwiftShader was not refused (${gpuVerdict?.status}; ${result.prompt})`);
+}
 console.log(`${engine} ${browserVersion}, ${model}: ready in ${readySeconds.toFixed(1)}s, ${result.meta}`);
 console.log(`status: ${result.status}${result.isolated ? "" : " (not cross-origin isolated)"}`);
 if (result.prompt) console.log(result.prompt);
@@ -325,7 +343,7 @@ if (process.env.E2E_OFFLINE && !failures.length) {
 const speed = Number(result.meta.match(/([\d.]+) tok\/s/)?.[1]);
 record({ ok: !failures.length, timedOut: false, readySeconds, tokPerSecond: Number.isFinite(speed) ? speed : null,
          backend: result.status, meta: result.meta, failures, isolated: result.isolated, load: reported?.seconds ?? null,
-         heapMB: reported?.heap ? Math.round(reported.heap / 1e6) : null, notKept: reported?.notKept ?? null, again, offline,
+         heapMB: reported?.heap ? Math.round(reported.heap / 1e6) : null, notKept: reported?.notKept ?? null, again, offline, gpuVerdict,
          ...(then.length ? { then } : {}) });
 if (failures.length) await keepArtifacts(failures.join("; "));
 clearTimeout(watchdog);
