@@ -205,13 +205,15 @@ function quantizer(io, n) {
 // hold them io.xStride and io.yStride floats apart); add: the products added to what y holds (the residual stream of
 // the model's layers), for the checks
 function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}) {
-  const own = typeof kind === "object", tiled = own && Boolean(kind.tile), matVec = own && Boolean(kind.rows);
-  const { widen, packed: packedPipeline, batched } = pipelinesFor();
-  const pipeline = own ? kind.pipeline : { widen, packed: packedPipeline, batched }[kind];
-  const quantized = own ? kind.packed : kind === "packed";
+  const held = placed([rows, n], io, data, { add, chunk });
+  return { ...bound(held, io, kind), owned: held.owned, bytes: held.bytes };
+}
+// the weights of a matrix on the GPU, in chunks of rows that each fit a binding, with each chunk's Shape (T149: placed
+// once and bound by every shader of a matrix × vector)
+function placed([rows, n], io, data, { add = false, chunk } = {}) {
   const words = n / 4, perRow = n / GROUP, rowBytes = n;
   const most = chunk ?? Math.max(1, Math.floor(Math.min(device.limits.maxStorageBufferBindingSize, device.limits.maxBufferSize) / rowBytes));
-  const dispatches = [], owned = [];
+  const chunks = [], owned = [];
   for (let first = 0; first < rows; first += most) {
     const count = Math.min(most, rows - first);
     const w = buffer(count * rowBytes), s = buffer(count * perRow * 4), shape = buffer(32, UNIFORM | COPY_DST);
@@ -225,6 +227,18 @@ function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}
     }
     // the batched and tiled shaders' shape goes on with the strides of the tokens and "add", the others read four
     device.queue.writeBuffer(shape, 0, new Uint32Array([count, words, perRow, first, io.xStride ?? 0, io.yStride ?? 0, add ? 1 : 0, 0]));
+    chunks.push({ w, s, shape, count });
+  }
+  return { chunks, owned, bytes: matrixBytes([rows, n]) };
+}
+// the dispatches that multiply placed weights by x into y for a shader: [pipeline, bind group, workgroups x, y, z] each
+function bound({ chunks }, io, kind = "widen") {
+  const own = typeof kind === "object", tiled = own && Boolean(kind.tile), matVec = own && Boolean(kind.rows);
+  const { widen, packed: packedPipeline, batched } = pipelinesFor();
+  const pipeline = own ? kind.pipeline : { widen, packed: packedPipeline, batched }[kind];
+  const quantized = own ? kind.packed : kind === "packed";
+  const dispatches = [];
+  for (const { w, s, shape, count } of chunks) {
     const entries = [{ binding: 0, resource: { buffer: w } }, { binding: 1, resource: { buffer: s } },
       { binding: 2, resource: { buffer: quantized ? io.xq : io.x } }, { binding: 3, resource: { buffer: io.y } },
       { binding: 4, resource: { buffer: shape } }];
@@ -246,7 +260,7 @@ function matrix([rows, n], io, kind = "widen", data, { add = false, chunk } = {}
       dispatches.push([pipeline, group, across, Math.ceil(count / across), kind === "batched" ? Math.ceil(io.tokens / TILE) : 1]);
     }
   }
-  return { dispatches, owned, bytes: matrixBytes([rows, n]) };
+  return { dispatches };
 }
 // the vectors every matrix reads and writes: x of the longest row, y of the most rows, tokens of each (the batched and
 // tiled shaders take several); xq and xs: x quantized, 8 bits a value and a float32 scale a group of 32, of every token
@@ -553,49 +567,84 @@ async function checkArgmax() {
 }
 
 // ---- bandwidth: one matrix by every shader of matVecShaders() (T149), timed as the ceilings are (paired: a submission
-// of 2n of it less one of n, so that what a submission costs besides its work drops out, T168); once on a fallback
-// adapter. widen and packed: T134's two, for the table as it was; and the CPU's kernel on the same bytes
-const MATVEC_MOST = 1 << 14;
+// of 2n of it less one of n, so that what a submission costs besides its work drops out, T168). The weights are
+// placed once for every shader (only the bind groups are the shader's), in as many copies as make MATVEC_BYTES, read
+// in turn: the same small matrix read again and again stays in the GPU's caches (a phone's system cache of 19 MB and
+// more holds Llama 3.2 1B's w1, T149's review), and a token reads each matrix once. The first shader is measured again
+// at the end (a device that slows down as it warms shows it there, as the prompt's batched row does). A packed shader
+// takes its vector quantized: what QUANTIZE costs for this width, once, goes beside them. On a fallback adapter each
+// once, one copy, and no matrix past FALLBACK_BYTES (the check holds the shaders to JavaScript; SwiftShader took 13
+// minutes of bench-check's 20 for the GPU section with the classifier's 295 MB 8 times). widen and packed: T134's two;
+// cpu: the CPU's kernel on the same bytes
+const MATVEC_MOST = 1 << 14, MATVEC_BYTES = 128 << 20, FALLBACK_BYTES = 32 << 20;
 async function bandwidth(shape) {
   await gpu();
-  const io = vectors(shape[1], shape[0]), rows = [];
-  for (const shader of matVecShaders()) {
-    const row = { shader: shader.name, check: shader.check ?? shader.name };
-    if (shader.none) {
-      rows.push({ ...row, none: shader.none });
-      continue;
-    }
+  const bytes = matrixBytes(shape), shaders = matVecShaders(), rows = [];
+  const label = (shader) => ({ shader: shader.name, check: shader.check ?? shader.name });
+  if (fallback && bytes > FALLBACK_BYTES) {
+    return { rows: shaders.map((shader) => ({ ...label(shader), none: "not on a fallback adapter" })), cpu: await cpuBandwidth(shape) };
+  }
+  const io = vectors(shape[1], shape[0]), held = [];
+  const copies = fallback ? 1 : Math.ceil(MATVEC_BYTES / bytes);
+  // what the dispatches do, timed: n of them a submission, each on the next copy (never the one just read)
+  let next = 0;
+  const timer = (each) => async (n) => {
+    const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+    for (let i = 0; i < n; i++) each[next++ % each.length].forEach((d) => run(pass, d));
+    pass.end();
+    const began = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    return performance.now() - began;
+  };
+  const time = async (each) => {
+    const submission = timer(each);
+    if (fallback) return { ms: await submission(1), dispatches: 1 };
+    await submission(2);
+    return paired(submission, MATVEC_MOST);
+  };
+  try {
+    await scoped(async () => {
+      for (let c = 0; c < copies; c++) held.push(placed(shape, io));
+      await device.queue.onSubmittedWorkDone();
+    });
+    const measure = async (shader, again = false) => {
+      const row = { ...label(shader), ...(again ? { shader: `${shader.name}, again at the end`, again } : {}) };
+      if (shader.none) return { ...row, none: shader.none };
+      try {
+        const r = await validated(async () => {
+          const kind = await kindOf(shader);
+          return time(held.map((h) => bound(h, io, kind).dispatches));
+        });
+        return { ...row, GBps: (r.dispatches * bytes) / (r.ms / 1000) / 1e9, msEach: r.ms / r.dispatches, dispatches: r.dispatches,
+          ...(r.ratio ? { ratio: r.ratio } : {}), ...(r.unsteady ? { unsteady: true } : {}) };
+      } catch (error) {
+        return { ...row, error: String(error?.message ?? error) };
+      } finally {
+        postMessage({ alive: true });
+      }
+    };
+    for (const shader of shaders) rows.push(await measure(shader));
+    rows.push(await measure(shaders[0], true));
+  } finally {
+    held.forEach((h) => h.owned.forEach((b) => b.destroy()));
+  }
+  // the vector of a packed shader quantized (QUANTIZE, one dispatch a vector of this width)
+  let quantize;
+  if (packed) {
+    const q = quantizer(io, shape[1]);
     try {
-      rows.push({ ...row, ...await scoped(async (owned) => {
-        const m = matrix(shape, io, await kindOf(shader));
-        owned.push(...m.owned);
-        await device.queue.onSubmittedWorkDone();
-        const submission = async (n) => {
-          const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-          for (let i = 0; i < n; i++) m.dispatches.forEach((d) => run(pass, d));
-          pass.end();
-          const began = performance.now();
-          device.queue.submit([encoder.finish()]);
-          await device.queue.onSubmittedWorkDone();
-          return performance.now() - began;
-        };
-        if (fallback) {
-          const ms = await submission(1);
-          return { GBps: m.bytes / (ms / 1000) / 1e9, msEach: ms };
-        }
-        await submission(2);
-        const r = await paired(submission, MATVEC_MOST);
-        return { GBps: (r.dispatches * m.bytes) / (r.ms / 1000) / 1e9, msEach: r.ms / r.dispatches, dispatches: r.dispatches,
-          ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
-      }) });
+      const r = await validated(() => time([[q.dispatch]]));
+      quantize = { msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) };
     } catch (error) {
-      rows.push({ ...row, error: String(error?.message ?? error) });
+      quantize = { error: String(error?.message ?? error) };
+    } finally {
+      q.owned.forEach((b) => b.destroy());
     }
-    postMessage({ alive: true });
   }
   destroyVectors(io);
-  const measured = (kind) => rows.find((row) => row.check === kind && row.GBps);
-  return { rows, widen: measured("widen"), packed: measured("packed"), cpu: await cpuBandwidth(shape) };
+  const measured = (kind) => rows.find((row) => row.check === kind && !row.again && row.GBps);
+  return { rows, copies, quantize, widen: measured("widen"), packed: measured("packed"), cpu: await cpuBandwidth(shape) };
 }
 
 // the CPU on the kernel the model page uses for int8 on one thread (matmul_q8, without relaxed SIMD: every
@@ -813,8 +862,9 @@ async function ceilings() {
 }
 // the time of n dispatches (what submission(n) submits and waits for, in ms): n doubles, up to most, until a submission
 // takes SUBMISSION_MS (short: it never did), then PAIRS submissions of n and of 2n in turn, and the median of their
-// differences; past STEADY the pairs once more, then unsteady (T168, and T149's matrix × vector). strict: none of
-// the pairs when most never took SUBMISSION_MS (a loop that did no work), only { short: true }
+// differences; past STEADY the pairs once more, then unsteady, or an error where 2n took no longer than n (lavapipe
+// under load once read a negative time, T149). T168's, and T149's matrix × vector. strict: none of the pairs when
+// most never took SUBMISSION_MS (a loop that did no work), only { short: true }
 async function paired(submission, most, strict = false) {
   let n = 1, ms;
   while ((ms = await submission(n)) < SUBMISSION_MS && n < most) n *= 2;
@@ -827,8 +877,13 @@ async function paired(submission, most, strict = false) {
       ratios.push(twice / once);
       postMessage({ alive: true });
     }
-    const ratio = middle(ratios), steady = ratio >= STEADY[0] && ratio <= STEADY[1];
-    if (steady || tries) return { ms: middle(differences), dispatches: n, ratio, ...(steady ? {} : { unsteady: true }) };
+    // a median difference of 0 or less (2n no longer than n: the load moved) is no time at all, never steady
+    const ratio = middle(ratios), took = middle(differences), steady = took > 0 && ratio >= STEADY[0] && ratio <= STEADY[1];
+    if (steady) return { ms: took, dispatches: n, ratio };
+    if (tries) {
+      if (!(took > 0)) throw new Error(`a submission of ${2 * n} took no longer than one of ${n}: the device's load moved`);
+      return { ms: took, dispatches: n, ratio, unsteady: true };
+    }
   }
 }
 // what fn does on the GPU (given an array for the buffers it makes, destroyed after), with an error of the device

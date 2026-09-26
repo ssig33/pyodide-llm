@@ -431,7 +431,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
 
   // T149: an int8 matrix times a vector by every shader (T134's two and those of llama.cpp and ONNX Runtime), a row
   // each, with its share of what a loop that only reads a buffer reads (T168); a shader the check found WRONG says so
-  // and is never the fastest
+  // and is never the fastest, nor is a row measured again at the end
+  const QUANTIZED_A_TOKEN = 16 * 4 + 1;  // Llama 3.2 1B: q, o, gate and down a layer read an input of their own, and the classifier
   function matVecMarkdown(bandwidths: any[], check?: any, ceilings?: any) {
     const reads = ceilings && !ceilings.fallback && !ceilings.global?.unsteady ? ceilings.global?.GBps : undefined;
     const wrong = (row: any) => check && check[row.check] && !check[row.check].ok;
@@ -443,13 +444,23 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       return `${row.unsteady ? "unsteady: " : ""}${fixed(row.GBps)} GB/s${reads ? ` (${percent(row.GBps, reads)})` : ""}`;
     };
     const fastest = (s: any) => {
-      const best = (s.result?.rows ?? []).filter((row: any) => row.GBps && !row.unsteady && !wrong(row)).sort((a: any, b: any) => b.GBps - a.GBps)[0];
+      const best = (s.result?.rows ?? []).filter((row: any) => row.GBps && !row.again && !row.unsteady && !wrong(row)).sort((a: any, b: any) => b.GBps - a.GBps)[0];
       return best ? `${s.name.slice(11)} ${best.shader}, ${fixed(best.GBps)} GB/s` : "";
     };
-    return [`**An int8 matrix × vector** (a generated token's; a shader's name says whose form it takes and the rows a workgroup takes${reads ? `; in parentheses, the share of what a loop that only reads a buffer reads, ${fixed(reads)} GB/s below` : ""}):`, "",
+    const quantized = bandwidths.filter((s) => s.result?.quantize?.msEach);
+    const wide = quantized.find((s) => s.name.includes("1B"));
+    const quantizing = quantized.length ? `**Quantizing the vector** of a packed row (QUANTIZE, one dispatch; not in the packed rows): ` +
+      quantized.map((s) => `${s.name.slice(11)} ${fixed(s.result.quantize.msEach, 3)} ms`).join(", ") +
+      (wide ? `; a token of Llama 3.2 1B quantizes ${QUANTIZED_A_TOKEN} vectors (16 of them 8192 wide), ${fixed(QUANTIZED_A_TOKEN * wide.result.quantize.msEach, 2)} ms or more` : "") : "";
+    return [`**An int8 matrix × vector** (a generated token's). A shader's name says whose form it takes and the rows a workgroup takes. ` +
+      "Each is timed as a submission of 2n of it less one of n: what waiting for a submission costs is not in it (a token pays it once, in the table of what it costs besides the weights below), " +
+      "and each matrix is read from copies of it that make 128 MiB in turn, as a token reads it once, not from the GPU's caches: not to be compared with reports from before T149. " +
+      `The packed rows take the vector quantized already${reads ? `. In parentheses, the share of what a loop that only reads a buffer reads, ${fixed(reads)} GB/s below` : ""}.`, "",
       `| shader | ${bandwidths.map((s) => s.name.slice(11)).join(" | ")} |`, `|---|${bandwidths.map(() => "---:|").join("")}`,
       ...shaders.map((row: any) => `| ${row.shader}${wrong(row) ? " (WRONG in the check)" : ""} | ${bandwidths.map((s) => cell(s, row.shader)).join(" | ")} |`),
-      `| CPU, one thread | ${bandwidths.map((s) => (s.result?.cpu ? `${fixed(s.result.cpu.GBps)} GB/s` : "")).join(" | ")} |`,
+      // Safari's kernel on one thread, for scale; the page's forward on the CPU is the CPU section's (T157)
+      `| CPU matmul_q8, one thread (not the page's forward) | ${bandwidths.map((s) => (s.result?.cpu ? `${fixed(s.result.cpu.GBps)} GB/s` : "")).join(" | ")} |`,
+      ...(quantizing ? ["", quantizing] : []),
       "", `**Fastest on the GPU** (of the shaders the check found right): ${bandwidths.map(fastest).filter(Boolean).join("; ") || "nothing measured"}`];
   }
 
