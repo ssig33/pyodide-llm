@@ -494,8 +494,9 @@ async function bandwidth(shape) {
 }
 
 // the CPU on the kernel the model page uses for int8 on one thread (matmul_q8, without relaxed SIMD: every
-// browser has it), on four matrices of this shape in turn so that no cache holds them. The page's software threads
-// reach about twice this at most (T93: the memory's bandwidth).
+// browser has it), on four matrices of this shape in turn so that no cache holds them. The page's forward pass does
+// more than this with relaxed SIMD and its software threads (2.9 times on the owner's Android, T157), which is why the
+// token's table holds the GPU against the CPU section instead.
 let cpuKernel;
 async function cpuBandwidth([rows, n]) {
   const weights = rows * n, scales = (rows * n / GROUP) * 4, copies = Math.max(1, Math.min(4, Math.floor(128e6 / weights)));

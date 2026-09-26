@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, environmentOf, loginUrl, parseReport, reportBody,
-         reportTooLong, reportUrl, reportsTable, timesFaster, tokenTable } from "../src/bench.js";
+         reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -98,13 +98,13 @@ assert.ok(new URL(longUrl).searchParams.get("body").includes("**Device**: ("), "
 // T157: the GPU's token table against the CPU section's forward pass. The owner's Android (T134's first report): the
 // CPU section 11.2, 10.3 and 7.3 ms a token with 1, 2 and 4 threads (18.9, 20.5, 28.7 GB/s), its prompt 5.80, 4.50
 // and 2.77; the GPU's packed token of Llama 3.2 1B 48.4 ms, which the old column called 1.44×
-const cpuSection = { status: "ok", data: { rows: [
+const cpuSection = { status: "ok", data: { shared: true, rows: [
   { asked: 1, threads: 1, msPerToken: 11.2, GBps: 18.9, promptMsPerToken: 5.80 },
   { asked: 2, threads: 2, msPerToken: 10.3, GBps: 20.5, promptMsPerToken: 4.50 },
   { asked: 4, threads: 4, msPerToken: 7.3, GBps: 28.7, promptMsPerToken: 2.77 },
   { asked: 8, threads: 3, none: "the browser did not start that many software threads" }] } };
 const baseline = cpuBaseline(cpuSection);
-assert.deepEqual(baseline, { token: { threads: 4, msPerToken: 7.3, GBps: 28.7 }, prompt: { threads: 4, msPerToken: 2.77 } });
+assert.deepEqual(baseline, { token: { threads: 4, msPerToken: 7.3, GBps: 28.7, isolated: true }, prompt: { threads: 4, msPerToken: 2.77, isolated: true } });
 // the fastest of each on its own: a device whose prompt is fastest at another count than its token
 assert.equal(cpuBaseline({ status: "ok", data: { rows: [{ threads: 1, msPerToken: 5, GBps: 40, promptMsPerToken: 3 },
   { threads: 2, msPerToken: 6, GBps: 35, promptMsPerToken: 2 }] } }).prompt.threads, 2);
@@ -114,29 +114,58 @@ assert.equal(cpuBaseline({ status: "error", markdown: "stopped" }).why, "the CPU
 assert.equal(cpuBaseline({ status: "wrong", data: cpuSection.data }).why, "the CPU section computed something wrong");
 assert.equal(cpuBaseline({ status: "none", markdown: "no WebAssembly SIMD" }).why, "the CPU section found nothing to run on here");
 assert.ok(cpuBaseline({ status: "ok", data: { rows: [{ asked: 1, none: "x" }] } }).why);
+// the counts of threads: doubling up to the logical cores, and the cores themselves
+assert.deepEqual(threadCounts(8), [1, 2, 4, 8]);
+assert.deepEqual(threadCounts(6), [1, 2, 4, 6]);
+assert.deepEqual(threadCounts(1), [1]);
+assert.deepEqual(threadCounts(undefined), [1, 2, 4]);
+// ratios of one run each: one decimal from 1, two significant digits below
 assert.equal(timesFaster(2.77, 5.51), "0.50×");
+assert.equal(times(1.44), "1.4×");
+assert.equal(times(0.0712), "0.071×");
+assert.equal(times(277.3), "277×");
 assert.equal(timesFaster(undefined, 5.51), "");
 assert.equal(timesFaster(2.77, NaN), "");
 const tokenSteps = [
-  { name: "a token of Llama 3.2 1B", result: { GB: 1.39, dispatches: 241, msPerToken: 81.6, tokPerSecond: 12.25 } },
-  { name: "a token of Llama 3.2 1B, packed int8", result: { GB: 1.39, dispatches: 241, msPerToken: 48.4, tokPerSecond: 20.66 } },
+  { name: "a token of Llama 3.2 1B", result: { kind: "widen", GB: 1.39, dispatches: 241, msPerToken: 81.6, tokPerSecond: 12.25 } },
+  { name: "a token of Llama 3.2 1B, packed int8", result: { kind: "packed", GB: 1.39, dispatches: 241, msPerToken: 48.4, tokPerSecond: 20.66 } },
+  { name: "a token of Llama 3.2 1B, chosen on the GPU", result: { kind: "widen", sample: true, GB: 1.39, dispatches: 242, msPerToken: 59.6, tokPerSecond: 16.78 } },
   { name: "a token of Llama 3.2 3B", error: "could not hold | the weights\nat all" },
   { name: "a token of llm-jp-3 150M", result: { model: "llm-jp-3 150M", error: "the GPU did not take 0.2 GB of weights" } }];
-for (const [label, table] of [["with the CPU", tokenTable(tokenSteps, baseline)], ["without it", tokenTable(tokenSteps, cpuBaseline(undefined))]]) {
+const right = { widen: { ok: true }, packed: { ok: true }, argmax: { ok: true } };
+const variants = [["with the CPU", tokenTable(tokenSteps, baseline, { check: right })], ["without it", tokenTable(tokenSteps, cpuBaseline(undefined))],
+  ["a lost device", tokenTable(tokenSteps, baseline, { lost: "lost" })], ["a fallback adapter", tokenTable(tokenSteps, baseline, { fallback: true })],
+  ["a WRONG argmax", tokenTable(tokenSteps, baseline, { check: { ...right, argmax: { ok: false } } })]];
+// the page's reading of a row (src/pages/benchmark.astro's rendered(), and GitHub's): a \| is a | of a cell
+const cellsOf = (line) => line.split(/(?<!\\)\|/).slice(1, -1);
+for (const [label, table] of variants) {
   // every row of the table as many cells as its header: a report that renders
   const rowsOf = table.filter((line) => line.startsWith("|"));
   assert.equal(rowsOf.length, 2 + tokenSteps.length, label);
-  const count = (line) => line.replace(/\\\|/g, "").split("|").length;
-  for (const line of rowsOf) assert.equal(count(line), count(rowsOf[0]), `${label}: ${line}`);
+  for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
   assert.ok(!table.join("\n").includes("undefined") && !table.join("\n").includes("NaN"), label);
 }
-const withCpu = tokenTable(tokenSteps, baseline);
-// 1.39 GB at 28.7 GB/s is 48.4 ms: the packed token the old column called 1.44× is 1.00×
-assert.ok(withCpu.includes("| Llama 3.2 1B, packed int8 | 1.39 | 241 | 48.4 | 20.7 | 48.4 | 1.00× |"), withCpu.join("\n"));
-assert.ok(withCpu[0].includes("4 software threads") && withCpu[0].includes("28.7 GB/s"), withCpu[0]);
-const withoutCpu = tokenTable(tokenSteps, cpuBaseline(undefined));
+const ratios = (table) => table.filter((line) => /^\| Llama 3\.2 1B/.test(line)).map((line) => cellsOf(line).at(-1).trim());
+const [withCpu, withoutCpu, lostTable, fallbackTable, wrongTable] = variants.map(([, table]) => table);
+// 1.39 GB at 28.7 GB/s is 20.6 tok/s: the packed token the old column called 1.44× is 1.0×, GPU tok/s over CPU tok/s
+assert.ok(withCpu.includes("| Llama 3.2 1B, packed int8 | 1.39 | 241 | 48.4 | 20.7 | 20.6 | 1.0× |"), withCpu.join("\n"));
+assert.deepEqual(ratios(withCpu), ["0.59×", "1.0×", "0.81×"]);
+assert.ok(withCpu[0].startsWith("The CPU (an estimate): each model's weights at the CPU section's fastest, 28.7 GB/s with 4 software threads."), withCpu[0]);
 assert.ok(withoutCpu[0].includes("run the CPU section for it"), withoutCpu[0]);
 assert.ok(withoutCpu.includes("| Llama 3.2 1B | 1.39 | 241 | 81.6 | 12.3 |  |  |"), withoutCpu.join("\n"));
+// no ratio from a lost device (its times too fast), a fallback adapter, or a shader the check found wrong
+assert.deepEqual(ratios(lostTable), ["", "", ""]);
+assert.ok(lostTable.some((line) => line.includes("the device was lost")));
+assert.deepEqual(ratios(fallbackTable), ["", "", ""]);
+assert.deepEqual(ratios(wrongTable), ["0.59×", "1.0×", ""]);
+assert.ok(wrongTable.some((line) => line.startsWith("| Llama 3.2 1B, chosen on the GPU (WRONG in the check) |")));
+assert.deepEqual(ratios(tokenTable(tokenSteps, baseline, { check: { ...right, packed: { ok: false, error: "no dot4I8Packed" } } })), ["0.59×", "", "0.81×"]);
+// a page that was not cross-origin isolated has one thread, and says so
+const alone = cpuBaseline({ status: "ok", data: { shared: false, rows: [cpuSection.data.rows[0]] } });
+assert.ok(tokenTable(tokenSteps, alone)[0].includes("18.9 GB/s with 1 software thread (not cross-origin isolated)."));
+// an error's | and line breaks stay in their cell
+assert.equal(tableCell("a | b\n c"), "a \\| b c");
+assert.ok(withCpu.some((line) => line.includes("could not hold \\| the weights at all")));
 // and the report with it still reads as the model's table alone
 const withGpu = parseReport(reportBody([markdown, "#### GPU", ...withCpu].join("\n\n")));
 assert.deepEqual(withGpu.rows.map((row) => row.name), ["everything", "without the kernels"]);

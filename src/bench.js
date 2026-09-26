@@ -138,6 +138,17 @@ export function reportsTable(issues) {
 // matmul_q8 doubled, which read low: 1.44× on the owner's Android where the CPU section's numbers make about 1.0×.
 const STATES = { none: "found nothing to run on here", wrong: "computed something wrong", error: "failed" };
 
+/** The counts of software threads the CPU section measures: 1, 2, 4 and on, doubling, up to the logical cores, and
+ * the cores themselves where they are no power of two (T157's review: the owner's Android has 8, and 2 to 4 threads
+ * still gave 1.41 to 1.46 times). */
+export function threadCounts(cores) {
+  const most = Number.isInteger(cores) && cores > 0 ? cores : 4;
+  const counts = [];
+  for (let n = 1; n <= most; n *= 2) counts.push(n);
+  if (counts.at(-1) !== most) counts.push(most);
+  return counts;
+}
+
 /**
  * The CPU the GPU is held against: of the CPU section's rows, the fastest count of software threads for a token and,
  * each on its own, for a prompt's tokens 16 at once. section: the page's result of the CPU section ({status, data}),
@@ -151,39 +162,77 @@ export function cpuBaseline(section) {
   const fastest = (key) => rows.filter((row) => Number.isFinite(row[key]) && row[key] > 0).sort((a, b) => a[key] - b[key])[0];
   const token = fastest("msPerToken"), prompt = fastest("promptMsPerToken");
   if (!token) return { why: "the CPU section measured no token" };
-  return { token: { threads: token.threads, msPerToken: token.msPerToken, GBps: token.GBps },
-           ...(prompt ? { prompt: { threads: prompt.threads, msPerToken: prompt.promptMsPerToken } } : {}) };
+  const isolated = section.data?.shared !== false;
+  return { token: { threads: token.threads, msPerToken: token.msPerToken, GBps: token.GBps, isolated },
+           ...(prompt ? { prompt: { threads: prompt.threads, msPerToken: prompt.promptMsPerToken, isolated } } : {}) };
 }
 
-/** How many times faster the GPU is than the CPU on the same work ("0.52×": the CPU is faster); "" where either is
+/** "4 software threads", "1 software thread (not cross-origin isolated)" */
+export const threadsOf = ({ threads, isolated }) =>
+  `${threads} software thread${threads === 1 ? "" : "s"}${isolated ? "" : " (not cross-origin isolated)"}`;
+
+/** A ratio as the tables write it: to one decimal from 1 up, to two significant digits below ("0.50×", "0.071×"),
+ * whole from 100; "" where it is no number. The measurements are one run each: more digits would be noise. */
+export function times(value) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return `${value >= 100 ? value.toFixed(0) : value >= 1 ? value.toFixed(1) : value.toPrecision(2)}×`;
+}
+
+/** How many times faster the GPU is than the CPU on the same work ("0.50×": the CPU is faster); "" where either is
  * missing. */
 export const timesFaster = (cpuMs, gpuMs) => (Number.isFinite(cpuMs) && Number.isFinite(gpuMs) && cpuMs > 0 && gpuMs > 0
-  ? `${(cpuMs / gpuMs).toFixed(2)}×` : "");
+  ? times(cpuMs / gpuMs) : "");
+
+/** Why the GPU section shows no ratios at all, whatever the CPU: a lost device (its later times are no GPU's, and
+ * too fast: a lost device answers every wait at once) or a fallback adapter (the CPU in a GPU's place). undefined
+ * where the ratios stand. gpu: { fallback, lost }. */
+export function noRatios({ fallback, lost } = {}) {
+  if (lost) return "none: the device was lost, and the times after it are no GPU's";
+  if (fallback) return "none on a fallback adapter: its times are no GPU's";
+  return undefined;
+}
+
+/** Words for one cell of a table: a | or a line break of them would break the row (the page and GitHub both read
+ * \| as a | in a cell). */
+export const tableCell = (text) => String(text).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
+
+/** Whether the check of the shaders found the one a token's row ran with wrong (or could not run it): widened or
+ * packed, and the choosing on the GPU where it chose. */
+function tokenWrong(t, check) {
+  if (!check) return false;
+  const bad = (key) => check[key] !== undefined && !check[key].ok;
+  return bad(t.kind === "packed" ? "packed" : "widen") || (Boolean(t.sample) && bad("argmax"));
+}
 
 /**
  * The GPU section's table of a token, with the CPU beside it. steps: the GPU section's steps whose name begins with
- * "a token of " ({name, result: {GB, dispatches, msPerToken, tokPerSecond}} or {name, error}); baseline: cpuBaseline().
- * The CPU section's model (two layers of Llama 3.2 1B's width) is not the GPU's, so the CPU's time of a token is its
- * weights read at the GB/s the CPU section measured: a token of the model page is its weights read once (T93).
+ * "a token of " ({name, result: {kind, sample, GB, dispatches, msPerToken, tokPerSecond}} or {name, error});
+ * baseline: cpuBaseline(); gpu: { fallback, lost, check } (check: the shaders against JavaScript).
+ * The CPU section's model (two layers of Llama 3.2 1B's width) is not the GPU's, so the CPU's speed on each model is
+ * an estimate: its weights read at the GB/s the CPU section measured (a token of the model page reads its weights once,
+ * T93). GPU ÷ CPU is then the GPU's tok/s over that.
  */
-export function tokenTable(steps, baseline) {
-  const cpu = baseline.token;
-  const lines = [cpu ? `The CPU: the CPU section's forward pass with ${cpu.threads} software thread${cpu.threads === 1 ? "" : "s"}, its fastest ` +
-      `(${number(cpu.GBps)} GB/s), each model's weights read at that. Above 1× the GPU is faster.`
-    : `The CPU: not measured (${baseline.why}).`, "",
-    "| a token (weights, dispatches, logits back) | GB | dispatches | GPU ms | GPU tok/s | CPU ms | GPU ÷ CPU |",
+export function tokenTable(steps, baseline, gpu = {}) {
+  const cpu = baseline.token, none = noRatios(gpu);
+  const lines = [cpu ? `The CPU (an estimate): each model's weights at the CPU section's fastest, ${number(cpu.GBps)} GB/s with ${threadsOf(cpu)}. ` +
+      "Its model is as wide as Llama 3.2 1B; a narrower one such as llm-jp-3 150M runs slower than this says. Above 1× the GPU is faster. " +
+      "Each number is one run of this page (the same device has differed by more than twice from one run to another)."
+    : `The CPU: not measured (${baseline.why}).`,
+    ...(none && cpu ? [`GPU ÷ CPU: ${none}.`] : []), "",
+    "| a token (weights, dispatches, logits back) | GB | dispatches | GPU ms | GPU tok/s | CPU tok/s (estimate) | GPU ÷ CPU |",
     "|---|---:|---:|---:|---:|---:|---:|"];
   for (const s of steps) {
     const t = s.result ?? {};
     const name = s.name.replace(/^a token of /, "");
     if (s.error || t.error) {
-      // an error's words in one cell: a | or a line break of it would break the table
-      lines.push(`| ${name} | | | ${String(s.error ?? t.error).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ")} | | | |`);
+      lines.push(`| ${name} | | | ${tableCell(s.error ?? t.error)} | | | |`);
       continue;
     }
-    const cpuMs = cpu && Number.isFinite(t.GB) ? (t.GB / cpu.GBps) * 1000 : undefined;
-    lines.push(`| ${name} | ${number(t.GB, 2)} | ${t.dispatches} | ${number(t.msPerToken)} | ${number(t.tokPerSecond)} | ` +
-               `${cpuMs === undefined ? "" : number(cpuMs)} | ${timesFaster(cpuMs, t.msPerToken)} |`);
+    const cpuTok = cpu && Number.isFinite(t.GB) && t.GB > 0 ? cpu.GBps / t.GB : undefined;
+    const wrong = tokenWrong(t, gpu.check);
+    const ratio = none || wrong || cpuTok === undefined ? "" : times(t.tokPerSecond / cpuTok);
+    lines.push(`| ${name}${wrong ? " (WRONG in the check)" : ""} | ${number(t.GB, 2)} | ${t.dispatches} | ${number(t.msPerToken)} | ` +
+               `${number(t.tokPerSecond)} | ${cpuTok === undefined ? "" : number(cpuTok)} | ${ratio} |`);
   }
   return lines;
 }

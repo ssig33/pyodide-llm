@@ -45,7 +45,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       <section data-section="cpu">
         <h2>CPU</h2>
         <p class="about">The model page's own forward pass on a made-up int8 model as wide as Llama 3.2 1B (211 MB of
-          weights a token), with 1, 2 and 4 software threads.</p>
+          weights a token), with 1, 2, 4 and on software threads, doubling up to the logical cores.</p>
       </section>
       <section data-section="model">
         <h2>Model</h2>
@@ -117,7 +117,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
 </style>
 
 <script>
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, reportTooLong, reportUrl, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -198,7 +198,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line.startsWith("|")) {
-        const cells = (row: string) => row.split("|").slice(1, -1).map((cell) => cell.trim());
+        // a \| in a cell is a | of its words, as GitHub reads it (T157's review: an error's words)
+        const cells = (row: string) => row.split(/(?<!\\)\|/).slice(1, -1).map((c) => c.trim().replace(/\\\|/g, "|"));
         const head = cells(line);
         const rows: string[][] = [];
         for (i += 2; i < lines.length && lines[i].startsWith("|"); i++) rows.push(cells(lines[i]));
@@ -285,7 +286,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
   async function cpu(): Promise<Result> {
     const w = worker("benchmark/sections.js");
     try {
-      const answer = await ask(w, { step: "cpu", threads: [1, 2, 4] });
+      const answer = await ask(w, { step: "cpu", threads: threadCounts(navigator.hardwareConcurrency) });
       if (answer.error) return { status: "error", markdown: answer.error };
       const r = answer.result;
       if (r.none) return { status: "none", markdown: r.none };
@@ -426,10 +427,11 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     lines.push("");
     // T157: the CPU beside the GPU is the CPU section's forward pass, rewritten when the CPU section runs after this one
     const baseline = cpuBaseline(results.cpu);
-    lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline));
+    const gpu = { fallback: r.fallback, lost, check: check?.result };
+    lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline, gpu));
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
       "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),
-      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline));
+      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline, gpu));
     lines.push("", `**Bridge** (Atomics.wait ↔ Atomics.waitAsync, ${BRIDGE_ROUNDS} round trips): ${bridge.error ?? `${fixed(bridge.microseconds)} µs each`}`);
     return lines.join("\n");
   }
@@ -453,7 +455,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     const c = s.result;
     // three digits where it is small (a fallback adapter's reads of the workgroup's memory are well under 1 GB/s); an
     // unsteady one (its 2n not about twice its n) says so, and the prompt is not held against it
-    const cell = (v: any, key: string, unit: string) => (v.none ?? (v.error ? `failed: ${v.error}`
+    const cell = (v: any, key: string, unit: string) => (v.none ?? (v.error ? tableCell(`failed: ${v.error}`)
       : `${v.unsteady ? "unsteady: " : ""}${v[key] < 100 ? v[key].toPrecision(3) : fixed(v[key], 0)} ${unit}${v.shape ? ` (${v.shape})` : ""}`));
     return [`**The device's ceilings** (each a loop of that alone; the multiply-adds in two shapes, the faster shown)${c.fallback ? ". A fallback adapter: its ceilings are no GPU's, and the prompt is not held against them" : ""}:`, "",
       "| ceiling | GPU |", "|---|---:|",
@@ -480,9 +482,9 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
   // Llama 3.2 1B's width, no classifier), by every shader of it (T146: the tiled ones beside T135's batched one), with
   // the GFLOPS of each (a multiply and an add for each weight and token) and the CPU's GOPS from the same count; and
   // how many times faster each is than the CPU's fastest count of threads (T157)
-  function promptMarkdown(s: any, check?: any, ceilings?: any, baseline?: any) {
+  function promptMarkdown(s: any, check?: any, ceilings?: any, baseline?: any, gpu?: any) {
     if (!s || s.error) return [`**A prompt all at once**: ${s?.error ?? "not measured"}`];
-    const r = s.result, cpuPrompt = baseline?.prompt;
+    const r = s.result, cpuPrompt = baseline?.prompt, none = noRatios(gpu);
     const cpuRows = (results.cpu?.data?.rows ?? []).filter((row: any) => row.promptMsPerToken);
     const cpu = cpuRows.length ? cpuRows.map((row: any) => `${fixed(row.promptMsPerToken, 2)} ms with ${row.threads} (${fixed((2 * r.weights) / (row.promptMsPerToken / 1000) / 1e9, 0)} GOPS)`).join(", ")
       : "run the CPU section for it";
@@ -498,11 +500,13 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       `the CPU, 16 tokens at once: ${cpu}. A tiled shader's name says whose form it takes (llama.cpp's, TensorFlow.js's, ONNX Runtime's) and the rows × tokens of a workgroup's tile. ` +
       "The batched shader is measured again at the end: a device that slows down as it warms up shows it there. " +
       "Of the ceiling: its GFLOPS against the lower of the device's ceiling above for what the shader multiplies with (f32, or the int8 dots) and the buffer's reads at that many tokens. " +
-      (cpuPrompt ? `GPU ÷ CPU: against the CPU's ${fixed(cpuPrompt.msPerToken, 2)} ms a token with ${cpuPrompt.threads} (its fastest); above 1× the GPU is faster`
-        : `GPU ÷ CPU: not measured (${baseline?.why ?? "the CPU section measured no prompt"})`), "",
+      (!cpuPrompt ? `GPU ÷ CPU: not measured (${baseline?.why ?? "the CPU section measured no prompt"})`
+        : none ? `GPU ÷ CPU: ${none}`
+        : `GPU ÷ CPU: against the CPU's ${fixed(cpuPrompt.msPerToken, 2)} ms a token with ${threadsOf(cpuPrompt)}, 16 at once (its fastest). ` +
+          "The GPU rows are the matrices only, the CPU's the whole forward pass. Above 1× the GPU is faster"), "",
       "| shader | tokens at once on the GPU | GPU ms | GPU ms a token | GFLOPS | of the ceiling | GPU ÷ CPU |", "|---|---:|---:|---:|---:|---:|---:|",
-      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${row.none ?? `failed: ${row.error}`} | | | | | |`
-        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} | ${ceilingOf(row, ceilings)} | ${timesFaster(cpuPrompt?.msPerToken, row.msPerToken)} |`)),
+      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${tableCell(row.none ?? `failed: ${row.error}`)} | | | | | |`
+        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} | ${ceilingOf(row, ceilings)} | ${none || wrong(row) ? "" : timesFaster(cpuPrompt?.msPerToken, row.msPerToken)} |`)),
       "", `**Fastest on the GPU** (of the shaders the check found right): ${[fastest(16), fastest(64)].filter(Boolean).join("; ") || "nothing measured"}`];
   }
 
