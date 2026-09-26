@@ -246,7 +246,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 
 ### T170 [整理] `external=` を `backend=` に、`llama2_numpy.py` を中身に合う名前に — 状態: 未着手（2026-09-27、T169 と同じ回。GPU の列が `forward.js`・`gpu.js`・`shaders.js` を触っている間はやらない（衝突する）。T151 と T152 の間の区切りで。規模 小〜中）
 - 根拠: `Llama(external=)` の中身は「forward を外（`forward.js`）に任せる」ことで、`backend=` のほうが合う。`llama2_numpy.py` は GPT-2・NeoX・Qwen2・Qwen3 も読むので、名前が中身より狭い。
-- 作るもの: 引数とファイルの改名（候補 `llm.py`。名前は持ち主が決める）。Worker の読み込み、`?v=`、tests、AGENTS.md の表と記録の名前をそろえる。保存した変換（`kept.js`）と `CONVERTER` に触れないことを確かめる。カーネルの名前（`matmul_q8r` など）は変えず、README に正式な名前を並べる。
+- 作るもの: 引数とファイルの改名（候補 `llm.py`。名前は持ち主が決める）。Worker の読み込み、`?v=`、tests、AGENTS.md の表と記録の名前をそろえる。保存した変換（`kept.js`）と `CONVERTER` に触れないことを確かめる。**カーネルの名前を ggml（llama.cpp）の書き方に寄せる**（2026-09-27、持ち主「どっちかに寄せたほうがよくないか？改名にそんなコストかからんだろ」。調べた慣習: 短い名前の BLAS・ggml と、全部を名前に書く XNNPACK・KleidiAI。うちは ggml に近く、GPU の形も llama.cpp から取るので ggml に）: 演算は ggml の名前（行列 × ベクトルは `mul_mat_vec_<型>`、行列 × 行列は `mul_mat_<型>`、`rms_norm`・`norm`・`rope`・`gelu`・`swiglu`・`add`・`argmax`・`flash_attn` など）、型は `f32`・`f16`・`q8`・`q6`（ggml の `q8_0` はスケールが f16 の別の形なので、うちの int8（32 個ずつ、f32 のスケール）は `q8` とし、README で定める。GGUF の `q8_0` を広げる `widen_q8_0` はそのまま）。relaxed SIMD の区別は名前の `r` でなく、ggml の命令セットごとの置き場と同じくファイル（`simdkernel_relaxed_*`）でする（同じ名前を 2 つのファイルに置き、`forward.js` が読むファイルで選ぶ）。gemv と gemm を名前で分ける（T159 のタイルは `mul_mat_q8`）。対応表を README に。
 - 完了条件: pytest・smoke・forward-check・threads-check・gpu-check・e2e が通り、保存した変換がそのまま使われる。
 
 ### T171 [設計] forward の単位で backend を分ける（CPU の WASM と GPU を並べる） — 状態: 未着手（2026-09-27、T169 と同じ回。T152 の設計に入れる。規模 中）
