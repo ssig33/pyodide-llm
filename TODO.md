@@ -219,6 +219,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   - T148 に回したもの（T148 の項の末尾）: GPU を待たない準備完了、フォールバックのアダプタを断る、選んだ形を覚える、画面に出す。
 - **完了条件の書き方（レビューの案）**: 1B 級で 64 トークン以上のプロンプトが CPU より速い。**覆す条件**: `/benchmark/` の「A prompt」の最速が 64 トークンで 90 GFLOPS 未満なら、1B でも CPU に負ける。
 
+- **本番の確認（2026-09-27、8c1062c のデプロイの後）**: gpu-prompt.yml（36277493235）は Chromium・Chrome・Edge の SwiftShader の synthetic と、新しい Dawn（lavapipe）のジョブ（4 モデル、3.4 分）が通った。models.yml の `gpu=on`（36277494297）: llm-jp-3 150M と sarashina2.2 0.5B は「prompts on WebGPU」で答えた。**Llama 3.2 1B は SwiftShader で形の計測の段が 180 秒の期限を越え、「prompts on the CPU (timing the tiled shaders took more than 180 s)」で CPU に戻って答えた**（準備完了 210.4 秒。T148 でフォールバックのアダプタを断れば訪問者には起きない。試験の道具で SwiftShader を通すときは形を固定するなど）。Qwen2.5 0.5B（bias）と Firefox（Worker に WebGPU なし）は理由を出して CPU で答えた（e2e が「GPU を通らなかった」と落とすのは、頼んだ試しの形のせいで期待どおり）。
 ### T148 [性能] 既定で GPU、端末で測って選ぶ（方針 9） — 状態: 未着手（T147 の後。規模 小〜中）
 - 作るもの: オプションなしで GPU を使う。読み込みか最初のプロンプトで GPU と CPU を短く測り、その端末で GPU が遅ければ CPU に戻す（ソフトウェアスレッドの本数の検索と同じ形）。判断はコンソールに 1 行、ステータス行に「prompts on WebGPU」か「on the CPU (理由)」。重みを 2 重に持つと入らないモデル（T156 の前）は CPU。`?gpu=` の旗は外す。
 - 止まる点: 持ち主の端末（Android・iPhone・PC）で、既定のページで遅くならないこと。レビューは Opus xhigh（全部の訪問者の既定が変わるので、測り方の揺れ・熱・最初のプロンプトの短さで選び違えないかを見る）。
@@ -254,6 +255,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   - 確かめ: `.venv` の pytest 504 passed、smoke、`node tests/bench.mjs`、build、SwiftShader の `bench-check.mjs --dist chromium --run gpu`（5GB の枠、gpu ok、約 15 分。直す前の 13 分より長いのは load が 5〜6 と高かったため。分類器の 8 行を外して減ったのは SwiftShader の 0.1 GB/s で数十秒で、節の時間の大半は 1 トークンとプロンプトの段）。lavapipe の幅 4（`LP_NATIVE_VECTOR_WIDTH=128`）と幅 16（`=512`）で検査が全部 ok（新しい 6 つの最悪は幅 4 で 1.8e-8〜4.1e-8、幅 16 で 1.5e-8〜4.0e-8）、わざと壊した 16 通りは幅 16 でも全部その形だけが落ちた（subgroupAdd を外すと 0.18〜0.23）。
 - **端末の数字は未計測**（持ち主の Android・iPhone・PC で `/benchmark/` を開いて GPU の節のボタン）。lavapipe の数字（CPU が GPU の代わり）はどれが速いかの材料にしない。どの形をエンジンに使うかは T152 で端末ごとに測って選ぶ。
 
+- **本番の確認（2026-09-27、c3a13dd のデプロイの後）**: bench.yml（36275955846）は Windows の WebKit が 1 回「Target page, context or browser has been closed」で落ち、そのジョブだけ走らせ直して通った（Windows の GPU の節は前から none で、T149 と関係ない。T141 の Windows の WebKit と同じ種類の揺れ）。Linux と macOS の GPU の節は ok。
 ### T150 [性能] 融合でディスパッチを減らす — 状態: 未着手（T149 の後。規模 中）
 - 根拠: 1 トークンに約 240 回のディスパッチで、空のディスパッチだけで 2〜9 ms（持ち主の Android）。ベンチの「fused」は回数の効きだけを見る形で、計算の中身は畳んでいない。
 - 作るもの: 同じ入力を読む行列を 1 つに（q・k・v、gate・up）、norm を次の行列の入力の読みへ、残差の足しを前の行列へ、本当に畳む。
@@ -297,6 +299,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   - CPU の節が無いとき: 「The CPU: not measured (run the CPU section for it).」（failed は「the CPU section failed」、WRONG は「the CPU section computed something wrong」）。比の無いとき: 「GPU ÷ CPU: none: the device was lost, and the times after it are no GPU's.」「GPU ÷ CPU: none on a fallback adapter: its times are no GPU's.」
 - **持ち主に見てもらうこと**: 本線に入った後、`/benchmark/` で「Run all」を押し（または CPU の節と GPU の節のボタン）、GPU の節の 2 つの表の右端が出ること。GPU の節のボタンを先に押してから CPU の節のボタンを押すと、GPU の節の右端が埋まること。CPU の節の行が論理コア数まで（8 コアなら 8 本まで）あること。見た目は `preview.yml` で撮れる。
 - レビュー（Opus xhigh、2026-09-27）: must-fix 0。書き直しの経路は Playwright で確かめた。1 トークンの換算は、a1-free で作り物を交互に測ると Llama 3.2 1B の形で実測の 0.99〜1.04、llm-jp-3 150M の形で 1.09〜1.21（CPU を速く見せる）。持ち主の端末の 4 本での差は未計測。should は 9（失ったデバイス・フォールバック・WRONG の比を空に、見出しの向き、本数、揺れ、表の `|`、古いコメント、bench-check の見張り）。
+- **本番の確認（2026-09-27、2e17b63 のデプロイの後）**: bench.yml（36274777116）は 3 つの OS × 5 ブラウザで通った（SwiftShader なので比の列は理由の 1 行で空）。
 ### T169 [文書] README を書き直し、しくみと計測の記録を docs/ に分ける — 状態: 未着手（2026-09-27、持ち主「採番せよ」。外からの設計の意見を持ち主が持ち込み、そのうち採るものを 3 つに分けた。規模 小〜中）
 - 根拠: README の冒頭が古い（「Python が層を順に呼び、ctypes でカーネルを呼ぶ」は T93 の前の形。いまの forward は JS と WASM で、GPU もある）。初めての人の「これは何か・どう使うか・どのブラウザで・何 MB か・自分のモデルは」が探しにくい。
 - 作るもの: README の頭を短い説明と構成図（ブラウザ → Worker → Pyodide → 実行エンジン → WASM SIMD の CPU と WebGPU の GPU）に。しくみ・量子化・計測・WebGPU・開発の記録を docs/ の別のファイルに分ける。訪問者に見える文なので、文面は持ち主に先に見せる。
