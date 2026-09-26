@@ -108,7 +108,6 @@ def test_a_prompt_goes_through_forward_many_and_writes_the_same():
     """T108: with forward_many, generate() hands the prompt's tokens over in blocks, each at its positions, and the
     text, the counts and what follows are what they are one token at a time. forward_many here is the NumPy forward
     token by token, so any difference is generate()'s bookkeeping."""
-    import llama2_numpy
     config, weights = synthetic_weights()
     tensors, published = hugging_face(config, weights, True)
     checkpoint = converted(Safetensors(reader(safetensors_file(tensors))), published, "float32")
@@ -126,13 +125,11 @@ def test_a_prompt_goes_through_forward_many_and_writes_the_same():
             batched.forward(token, pos + i, need_logits=False)
 
     batched.forward_many = many
-    old, llama2_numpy.PROMPT_BLOCK = llama2_numpy.PROMPT_BLOCK, 5
-    try:
-        assert "".join(batched.generate(prompt, steps=40, temperature=0.0)) == expected
-        assert "".join(batched.generate(prompt, steps=40, temperature=0.0, echo=False)) == \
-            "".join(plain.generate(prompt, steps=40, temperature=0.0, echo=False))
-    finally:
-        llama2_numpy.PROMPT_BLOCK = old
+    # T147: the block is what the engine says now (forward.js's promptBlock: more where the GPU takes the prompt)
+    batched.prompt_block = lambda: 5
+    assert "".join(batched.generate(prompt, steps=40, temperature=0.0)) == expected
+    assert "".join(batched.generate(prompt, steps=40, temperature=0.0, echo=False)) == \
+        "".join(plain.generate(prompt, steps=40, temperature=0.0, echo=False))
     prompt_tokens = plain.tokenizer.encode(prompt, plain.specials)
     fed = [plain.bos] + prompt_tokens[:-1]
     assert [pos for _, pos in blocks[:len(blocks) // 2]] == list(range(0, len(fed), 5))

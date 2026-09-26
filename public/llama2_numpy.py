@@ -656,11 +656,13 @@ def check_tokenizer(tokenizer, header):
 
 # T108: how many tokens of a prompt forward_many() takes at once: forward.js's BATCH. The worker cannot answer a
 # message (stop, a new model) while one call runs, and a block of 16 keeps that under a second on a 1.5B model.
+# T147: forward.js says how many it takes (promptBlock: more where the GPU takes the prompt)
 PROMPT_BLOCK = 16
 
 
 class Llama:
     forward_many = None  # T108: forward.js's forwardMany(tokens, pos) for a prompt, where there is one
+    prompt_block = staticmethod(lambda: PROMPT_BLOCK)  # T147: how many tokens forward_many() takes at once, now
 
     def __init__(self, checkpoint, tokenizer, dtype="float32", rope_theta=10000.0,
                  tokenizer_kind="bpe", nfkc=False, nfc=False, pretokenizer="gpt2", bias=False, arch="llama",
@@ -922,6 +924,8 @@ class Llama:
         many = getattr(engine, "forwardMany", None)
         if many is not None:
             self.forward_many = lambda tokens, pos: many(list(tokens), pos)
+            if getattr(engine, "promptBlock", None) is not None:
+                self.prompt_block = lambda: int(engine.promptBlock)
 
         def forward(token, pos, need_logits=True):
             run(token, pos, need_logits)
@@ -1113,10 +1117,12 @@ class Llama:
         try:
             if self.forward_many is not None and len(prompt_tokens) > 1:
                 # T108: the tokens of the prompt that make no logits (all but the last) go through the layers
-                # PROMPT_BLOCK at a time; the text comes out as it would one by one, only a block at once
+                # prompt_block() at a time (T147: as many as the engine takes now); the text comes out as it would
+                # one by one, only a block at once
                 fed = [self.bos] + prompt_tokens[:-1]
-                for at in range(0, len(fed), PROMPT_BLOCK):
-                    block = fed[at:at + PROMPT_BLOCK]
+                step = self.prompt_block()
+                for at in range(0, len(fed), step):
+                    block = fed[at:at + step]
                     self.forward_many(block, at)
                     for pos in range(at, at + len(block)):
                         next_token = prompt_tokens[pos]

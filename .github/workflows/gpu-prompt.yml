@@ -17,7 +17,8 @@ jobs:
   gpu:
     name: ${{ matrix.os }} ${{ matrix.engine }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # T147: every tiled shader on SwiftShader, which compiles one in 10 to 90 s: about an hour on the development machine
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:

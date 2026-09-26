@@ -1,6 +1,7 @@
 // shaders.js (T135): the WGSL of this project in one place. The GPU section of /benchmark/ (public/benchmark/gpu.js,
 // T134) measures with some of them; the model's GPU worker (public/gpu.js) runs a prompt's tokens through the layers
-// with the batched matrix and the steps of a layer below it. A plain ES module: both import it with the ?v= of their
+// with the tiled matrices of T146 (the one each device runs fastest, T147), the flash attention and the steps of a
+// layer below them. A plain ES module: both import it with the ?v= of their
 // own URL (GitHub Pages keeps a file for ten minutes: all must come from the same deployment).
 //
 // The weights are this project's int8: values in groups of GROUP with one float32 scale each (llama2_numpy's layout),
@@ -632,6 +633,88 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   xs[token * (quantize.xStride / ${GROUP}u) + g] = scale;
 }`;
 
+// ---- T147: the tiled shaders a device may run a prompt's matrices with (T146's), for the model's GPU worker, which
+// checks each against JavaScript on a small matrix (tiledOff) and times the right ones on the model's own weights, and
+// takes the fastest: which is fastest differs from GPU to GPU (T146), and only the device can say. none: why a shape
+// is not made here (the device's threads or workgroup memory), as the benchmark says it (public/benchmark/gpu.js).
+export const promptForms = ({ half, subgroups, packed, memory, threads }) => {
+  const past = ({ threads: wanted }, bytes) => (wanted > threads ? `${wanted} threads, the device ${threads}`
+    : bytes > memory ? `${bytes} bytes of workgroup memory, the device ${memory}` : undefined);
+  const forms = REG_TILES.map((tile) => {
+    const shape = regTileShape(tile);
+    return { name: `llama.cpp tiles ${shape.rows}×${shape.tokens}, ${half ? "f16" : "f32"}`, tile: shape, packed: false, half,
+      code: regTile(half), constants: { WORKGROUP_SIZE_M: tile.m, WORKGROUP_SIZE_N: tile.n }, none: past(shape, regTileBytes(tile, half)) };
+  });
+  forms.push({ name: "TF.js tiles 32×32, vec4", tile: TFJS_SHAPE, packed: false, half: false, code: tfjsTile, none: past(TFJS_SHAPE, 2 * 32 * 32 * 4) });
+  if (packed) {
+    forms.push({ name: "ORT DP4A 64×64", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(false), none: past(DP4A_SHAPE, 4608) });
+    if (subgroups) forms.push({ name: "ORT DP4A 64×64, subgroups", tile: DP4A_SHAPE, packed: true, half: false, code: dp4a(true), none: past(DP4A_SHAPE, 4608) });
+  }
+  return forms;
+};
+
+// x (groups of GROUP values) quantized as the CPU's quantize_x does it (and QUANTIZE): the largest |value| / 127,
+// round half to even
+export function quantizedLikeCpu(x) {
+  const xq = new Int8Array(x.length), xs = new Float32Array(x.length / GROUP);
+  for (let g = 0; g < xs.length; g++) {
+    let largest = 0;
+    for (let i = 0; i < GROUP; i++) largest = Math.max(largest, Math.abs(x[g * GROUP + i]));
+    xs[g] = Math.fround(largest / 127);
+    for (let i = 0; i < GROUP; i++) {
+      const v = x[g * GROUP + i] / xs[g], r = Math.round(v);
+      xq[g * GROUP + i] = Math.abs(v - Math.trunc(v)) === 0.5 && r % 2 ? r - 1 : r;
+    }
+  }
+  return { xq, xs };
+}
+
+// How far a tiled shader's products (got: y after the product twice, the second added: 2 × W·x) are from
+// JavaScript's, the check of T146's review (public/benchmark/gpu.js's checkTiled): w, int8 [rows][n] with the float32
+// scales s [rows][n / 32]; x, the tokens xStride apart; got, yStride apart. A packed form multiplies what the GPU
+// quantized (xq, xs, xStride apart), held to JavaScript's quantize_x first: a scale may differ in its last bits (WGSL's
+// division is not rounded exactly) and a value then by 1, a wrong index by far more. f32 forms: no more than 1e-4 of
+// the row's and token's sum of |products| (a float32 sum in another order may differ by 544 × 2^-24 = 3.2e-5 of it at
+// most; a wrong index, scale or group by about 1 / sqrt(544) = 4e-2). f16 forms: WGSL leaves the direction of the
+// rounding to f16 to the device, so each weight × scale and activation is within 1 ulp (2^-10, or 2^-24 where it is
+// subnormal): no more than |products| × (2^-9 + 2^-20 + (n + 1) × 2^-24) + 2^-24 × Σ(|weight| + |activation|).
+// Returns { worst, wrong }: the worst difference over the sum of |products|, and why it is wrong, or null.
+export function tiledOff({ w, s, x, got, xq, xs, rows, n, tokens, xStride, yStride, half }) {
+  const perRow = n / GROUP;
+  let worst = 0, over = false, far = false, apart = 0, values = 0;
+  for (let t = 0; t < tokens; t++) {
+    const at = t * xStride, groups = t * (xStride / GROUP);
+    const mine = xq ? quantizedLikeCpu(x.subarray(at, at + n)) : null;
+    if (mine) {
+      for (let g = 0; g < perRow; g++) far ||= Math.abs(xs[groups + g] - mine.xs[g]) > 1e-6 * mine.xs[g];
+      for (let i = 0; i < n; i++) {
+        far ||= Math.abs(xq[at + i] - mine.xq[i]) > 1;
+        apart += xq[at + i] !== mine.xq[i];
+      }
+      values += n;
+    }
+    for (let r = 0; r < rows; r++) {
+      let want = 0, size = 0, small = 0;
+      for (let g = 0; g < perRow; g++) {
+        const scale = s[r * perRow + g] * (mine ? xs[groups + g] : 1);
+        for (let i = g * GROUP; i < (g + 1) * GROUP; i++) {
+          const weight = Math.fround(w[r * n + i] * s[r * perRow + g]), value = x[at + i];
+          const product = mine ? w[r * n + i] * xq[at + i] * scale : half ? weight * value : w[r * n + i] * value * s[r * perRow + g];
+          want += product;
+          size += Math.abs(product);
+          small += Math.abs(weight) + Math.abs(value);
+        }
+      }
+      const off = Math.abs(got[t * yStride + r] / 2 - want);
+      worst = Math.max(worst, off / size);
+      over ||= half ? off > size * (2 ** -9 + 2 ** -20 + (n + 1) * 2 ** -24) + small * 2 ** -24 : off >= 1e-4 * size;
+    }
+  }
+  const wrong = far ? "the quantized activations are far from quantize_x's" : apart > 0.01 * values
+    ? `${apart} of ${values} quantized activations are not quantize_x's` : over ? `products ${worst.toExponential(2)} from JavaScript's` : null;
+  return { worst, wrong };
+}
+
 // the most likely token: the first index of the largest logit, in one workgroup, so that only 4 bytes come back
 export const ARGMAX = /* wgsl */ `
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
@@ -705,15 +788,17 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
 
 // RoPE on q and k, and the keys and values of every token into this layer's cache at its position (step.pos + the
 // token): one workgroup per token. Pairs of neighbours turn (llama2.c's order), the first turned of every head (all
-// of it but for GPT-NeoX); angles holds, per token, the cos of its headSize / 2 angles and then their sin.
+// of it but for GPT-NeoX); angles holds, per token, the cos of its headSize / 2 angles and then their sin. The cache
+// holds float16 (T147: as the CPU's cache does, T110, and as llama.cpp's flash attention reads its K and V), a pair of
+// neighbours to a u32 (pack2x16float: no shader-f16 needed), the pair RoPE turns together.
 export const ROPE = /* wgsl */ `
 struct Rope { heads: u32, kvHeads: u32, headSize: u32, turned: u32 }
 ${STEP}
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k: array<f32>;
 @group(0) @binding(2) var<storage, read> v: array<f32>;
-@group(0) @binding(3) var<storage, read_write> keys: array<f32>;
-@group(0) @binding(4) var<storage, read_write> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> keys: array<u32>;
+@group(0) @binding(4) var<storage, read_write> values: array<u32>;
 @group(0) @binding(5) var<storage, read> angles: array<f32>;
 @group(0) @binding(6) var<uniform> rope: Rope;
 @group(0) @binding(7) var<uniform> step: Step;
@@ -736,91 +821,325 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
     q[at] = v0 * c - v1 * s;
     q[at + 1u] = v0 * s + v1 * c;
   }
-  // k turned on its way into the cache (the first of a pair from both, the second from both), v as it is
+  // k turned on its way into the cache, v as it is: a pair of neighbours per thread
   let kvDim = rope.kvHeads * size;
-  let row = (step.pos + token) * kvDim;
-  for (var j = t; j < kvDim; j += 64u) {
-    let at = token * kvDim + j;
-    var key = k[at];
-    let inHead = j % size;
+  let row = (step.pos + token) * kvDim / 2u;
+  for (var j = t; j < kvDim / 2u; j += 64u) {
+    let at = token * kvDim + 2u * j;
+    var key = vec2<f32>(k[at], k[at + 1u]);
+    let inHead = (2u * j) % size;
     if (inHead < rope.turned) {
       let c = angles[angle + inHead / 2u];
       let s = angles[angle + half + inHead / 2u];
-      if (inHead % 2u == 0u) { key = k[at] * c - k[at + 1u] * s; } else { key = k[at - 1u] * s + k[at] * c; }
+      key = vec2<f32>(key.x * c - key.y * s, key.x * s + key.y * c);
     }
-    keys[row + j] = key;
-    values[row + j] = v[at];
+    keys[row + j] = pack2x16float(key);
+    values[row + j] = pack2x16float(vec2<f32>(v[at], v[at + 1u]));
   }
 }`;
 
-// Attention: one workgroup per head and token. The token at position step.pos + token sees the positions up to its own
-// (causal: none after it, also where the cache holds the later tokens of the same request). The scores go to scores
-// ([tokens][heads][positions]), then their softmax, then the weighted sum of the values into out. Grouped-query
-// attention: heads / kvHeads query heads share a head of keys and values.
-export const ATTENTION = /* wgsl */ `
-struct Attention { heads: u32, kvHeads: u32, headSize: u32, positions: u32, scale: f32, unused0: u32, unused1: u32, unused2: u32 }
+// T147: the attention of a prompt's tokens, llama.cpp's flash attention with tiles (flash_attn_tile.wgsl), where
+// T135's (one workgroup a head and token) wrote every score to memory and read it three times, and read the same keys
+// and values again for every head of q that shares them. A workgroup takes Q_TILE (4) tokens of one head: their q
+// (scaled) in its memory, then KV_TILE positions of the head's keys at a time in its memory as f16 (or f32 where there
+// is no shader-f16), one row of q a subgroup, a position a lane; the softmax online (the largest so far and the sum
+// rescaled as a tile brings a larger one: subgroupMax and subgroupAdd), and the values of the tile the same way into
+// each lane's vec4s of the output. Changed from the source, and why: the causal mask is the positions' order (a
+// position past the row's own is not seen; llama.cpp adds a mask tensor of -inf), so the tiles stop at the last
+// token's position; the keys and values are this project's cache (float16 pairs in u32, [positions][kvHeads ×
+// headSize], a head's row from its offset), read four at a time as llama.cpp's vec4 loader (flash_attn_staging.tmpl);
+// q and the output are float32 [tokens][heads × headSize]; no ALiBi, soft-cap or sinks. Where there are no subgroups
+// (or no subgroup_id), LANES threads of the workgroup stand for a row's subgroup and add up in the workgroup's memory
+// (this project's: llama.cpp's tile path needs subgroups). The shape is llama.cpp's choice
+// (ggml-webgpu-shader-lib.hpp): Q_TILE 4, KV_TILE at most 64 and what the workgroup's memory holds, WG_SIZE the larger
+// of 128 and 4 subgroups; MIN_SUBGROUP_SIZE sizes the registers.
+export const FLASH_Q_TILE = 4;
+export const flashShape = ({ headSize, half, subgroups, memory, threads, subgroupMin = 4, subgroupMax = 128 }) => {
+  const bytes = half ? 2 : 4;
+  const wgSize = subgroups ? Math.min(threads, Math.max(128, FLASH_Q_TILE * subgroupMax)) : 128;
+  // llama.cpp's ggml_webgpu_flash_attn_wg_mem_bytes, for this shader's arrays: q, then per position its keys or values
+  // and a weight of each row
+  const base = FLASH_Q_TILE * headSize * 4 + (subgroups ? 0 : wgSize * 4), perPosition = headSize * bytes + FLASH_Q_TILE * bytes;
+  const kvTile = Math.min(64, Math.floor((memory - base) / perPosition));
+  return { headSize, half, subgroups, wgSize, kvTile, minSubgroup: subgroups ? subgroupMin : wgSize / FLASH_Q_TILE,
+    none: subgroups && wgSize < FLASH_Q_TILE * subgroupMax ? `subgroups of ${subgroupMax} are more than ${threads} threads / 4`
+      : kvTile < 1 ? `a head of ${headSize} is more than the workgroup's memory (${memory} bytes)` : undefined };
+};
+
+// Adapted from llama.cpp, ggml/src/ggml-webgpu/wgsl-shaders/flash_attn_tile.wgsl, flash_attn_decls.tmpl and
+// flash_attn_staging.tmpl (https://github.com/ggml-org/llama.cpp, commit 2145525a, 2026-09-26), under the MIT License:
+//
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+export const flashTile = ({ headSize, half, subgroups, wgSize, kvTile, minSubgroup }) => /* wgsl */ `${half ? "enable f16;\n" : ""}${subgroups ? "enable subgroups;\n" : ""}
+struct Params { heads: u32, kvHeads: u32, scale: f32, unused: u32 }
 ${STEP}
-@group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> keys: array<f32>;
-@group(0) @binding(2) var<storage, read> values: array<f32>;
-@group(0) @binding(3) var<storage, read_write> scores: array<f32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
-@group(0) @binding(5) var<uniform> attention: Attention;
-@group(0) @binding(6) var<uniform> step: Step;
-var<workgroup> head: array<f32, 256>;
-var<workgroup> partial: array<f32, 64>;
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u32) {
-  let h = id.x;
-  let token = id.y;
-  if (token >= step.tokens) { return; }
-  let size = attention.headSize;
-  let kvDim = attention.kvHeads * size;
-  let kv = (h / (attention.heads / attention.kvHeads)) * size;
-  let at = token * attention.heads * size + h * size;
-  let seen = step.pos + token + 1u;
-  let first = (token * attention.heads + h) * attention.positions;
-  for (var j = t; j < size; j += 64u) { head[j] = q[at + j]; }
+@group(0) @binding(0) var<storage, read> Q: array<f32>;             // [tokens][heads × HEAD_DIM]
+@group(0) @binding(1) var<storage, read> K: array<vec2<u32>>;       // [positions][kvHeads × HEAD_DIM]: 4 f16 a vec2<u32>
+@group(0) @binding(2) var<storage, read> V: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read_write> dst: array<vec4<f32>>;  // [tokens][heads × HEAD_DIM]
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<uniform> step: Step;
+
+alias shmem_t = ${half ? "f16" : "f32"};
+const HEAD_DIM_QK: u32 = ${headSize}u;
+const HEAD_DIM_V: u32 = ${headSize}u;
+const Q_TILE: u32 = ${FLASH_Q_TILE}u;
+const KV_TILE: u32 = ${kvTile}u;
+const WG_SIZE: u32 = ${wgSize}u;
+const MIN_SUBGROUP_SIZE: u32 = ${minSubgroup}u;
+// Just a very small float value.
+const FLOAT_MIN: f32 = -1.0e9;
+
+const Q_CHUNKS: u32 = HEAD_DIM_QK / 4u;
+const V_CHUNKS: u32 = HEAD_DIM_V / 4u;
+const SCORE_REGS_PER_LANE: u32 = (KV_TILE + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
+const OUT_REGS_PER_LANE: u32 = (V_CHUNKS + MIN_SUBGROUP_SIZE - 1u) / MIN_SUBGROUP_SIZE;
+
+const kv_shmem_size = KV_TILE * max(HEAD_DIM_QK, HEAD_DIM_V);
+var<workgroup> kv_shmem: array<shmem_t, kv_shmem_size>;
+var<workgroup> q_shmem: array<f32, Q_TILE * HEAD_DIM_QK>;
+var<workgroup> p_shmem: array<shmem_t, Q_TILE * KV_TILE>;
+
+fn halves(pair: vec2<u32>) -> vec4<f32> {
+  return vec4<f32>(unpack2x16float(pair.x), unpack2x16float(pair.y));
+}
+fn load_k_tile_block(local_x: u32, kv_count: u32, kv_tile: u32, k_head_offset: u32) {
+    let stride_k1 = params.kvHeads * HEAD_DIM_QK;
+    for (var vec_idx_local = local_x; vec_idx_local < kv_count * Q_CHUNKS; vec_idx_local += WG_SIZE) {
+        let kv_local = vec_idx_local / Q_CHUNKS;
+        let chunk = vec_idx_local % Q_CHUNKS;
+        let global_k_row = kv_tile + kv_local;
+        let k_vec_index = (k_head_offset + global_k_row * stride_k1 + chunk * 4u) >> 2u;
+        let k4 = halves(K[k_vec_index]);
+        let kv_off = kv_local * HEAD_DIM_QK + chunk * 4u;
+        kv_shmem[kv_off + 0u] = shmem_t(k4.x);
+        kv_shmem[kv_off + 1u] = shmem_t(k4.y);
+        kv_shmem[kv_off + 2u] = shmem_t(k4.z);
+        kv_shmem[kv_off + 3u] = shmem_t(k4.w);
+    }
+}
+fn load_v_tile_block(local_x: u32, kv_count: u32, kv_tile: u32, v_head_offset: u32) {
+    let stride_v1 = params.kvHeads * HEAD_DIM_V;
+    for (var vec_idx_local = local_x; vec_idx_local < kv_count * V_CHUNKS; vec_idx_local += WG_SIZE) {
+        let kv_local = vec_idx_local / V_CHUNKS;
+        let chunk = vec_idx_local % V_CHUNKS;
+        let global_v_row = kv_tile + kv_local;
+        let v_vec_index = (v_head_offset + global_v_row * stride_v1 + chunk * 4u) >> 2u;
+        let v4 = halves(V[v_vec_index]);
+        let kv_off = kv_local * HEAD_DIM_V + chunk * 4u;
+        kv_shmem[kv_off + 0u] = shmem_t(v4.x);
+        kv_shmem[kv_off + 1u] = shmem_t(v4.y);
+        kv_shmem[kv_off + 2u] = shmem_t(v4.z);
+        kv_shmem[kv_off + 3u] = shmem_t(v4.w);
+    }
+}
+${subgroups ? `fn row_max(value: f32) -> f32 { return subgroupMax(value); }
+fn row_sum(value: f32) -> f32 { return subgroupAdd(value); }` : `// a row's LANES threads stand for its subgroup: their largest and their sum through the workgroup's memory
+const LANES: u32 = WG_SIZE / Q_TILE;
+var<workgroup> lanes: array<f32, WG_SIZE>;
+var<private> lane_x: u32;
+fn row_max(value: f32) -> f32 {
+  lanes[lane_x] = value;
   workgroupBarrier();
-  // 1. the scores, and the largest
-  var largest = -3.4e38;
-  for (var p = t; p < seen; p += 64u) {
-    var dot = 0.0;
-    for (var j = 0u; j < size; j++) { dot += head[j] * keys[p * kvDim + kv + j]; }
-    let score = dot * attention.scale;
-    scores[first + p] = score;
-    largest = max(largest, score);
-  }
-  partial[t] = largest;
-  workgroupBarrier();
-  for (var half = 32u; half > 0u; half >>= 1u) {
-    if (t < half) { partial[t] = max(partial[t], partial[t + half]); }
+  for (var half = LANES / 2u; half > 0u; half >>= 1u) {
+    if (lane_x % LANES < half) { lanes[lane_x] = max(lanes[lane_x], lanes[lane_x + half]); }
     workgroupBarrier();
   }
-  let most = partial[0];
+  let result = lanes[lane_x - lane_x % LANES];
   workgroupBarrier();
-  // 2. the exponentials and their sum
-  var sum = 0.0;
-  for (var p = t; p < seen; p += 64u) {
-    let e = exp(scores[first + p] - most);
-    scores[first + p] = e;
-    sum += e;
-  }
-  partial[t] = sum;
+  return result;
+}
+fn row_sum(value: f32) -> f32 {
+  lanes[lane_x] = value;
   workgroupBarrier();
-  for (var half = 32u; half > 0u; half >>= 1u) {
-    if (t < half) { partial[t] += partial[t + half]; }
+  for (var half = LANES / 2u; half > 0u; half >>= 1u) {
+    if (lane_x % LANES < half) { lanes[lane_x] += lanes[lane_x + half]; }
     workgroupBarrier();
   }
-  let inverse = 1.0 / partial[0];
-  // every thread reads every position's weight now, written by the others
-  storageBarrier();
-  // 3. the weighted sum of the values, a value of the head per thread
-  for (var d = t; d < size; d += 64u) {
-    var total = 0.0;
-    for (var p = 0u; p < seen; p++) { total += scores[first + p] * values[p * kvDim + kv + d]; }
-    out[at + d] = total * inverse;
-  }
+  let result = lanes[lane_x - lane_x % LANES];
+  workgroupBarrier();
+  return result;
+}`}
+
+@compute @workgroup_size(WG_SIZE)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>${subgroups ? `,
+        @builtin(subgroup_id) subgroup_id: u32,
+        @builtin(subgroup_size) subgroup_size: u32,
+        @builtin(num_subgroups) num_subgroups: u32,
+        @builtin(subgroup_invocation_id) sg_inv_id: u32) {
+    if (subgroup_size == 0u || num_subgroups < Q_TILE) {
+        return;
+    }` : `) {
+    lane_x = local_id.x;
+    let subgroup_id = local_id.x / LANES;
+    let subgroup_size = LANES;
+    let sg_inv_id = local_id.x % LANES;`}
+
+    let wg_per_head = (step.tokens + Q_TILE - 1u) / Q_TILE;
+    let head_idx = wg_id.x / wg_per_head;
+    let k_head_idx = head_idx / (params.heads / params.kvHeads);
+    let k_head_offset = k_head_idx * HEAD_DIM_QK;
+    let v_head_offset = k_head_idx * HEAD_DIM_V;
+    let stride_q1 = params.heads * HEAD_DIM_QK;
+
+    let wg_in_head = wg_id.x % wg_per_head;
+    let q_row_start = wg_in_head * Q_TILE;
+    let global_q_row = q_row_start + subgroup_id;
+    let row_active = subgroup_id < Q_TILE && global_q_row < step.tokens;
+    // causal: the tile's positions up to its last token's, each row's up to its own
+    let seq_len_kv = step.pos + min(q_row_start + Q_TILE, step.tokens);
+    let row_position = step.pos + global_q_row;
+
+    for (var elem_idx = local_id.x; elem_idx < Q_TILE * HEAD_DIM_QK; elem_idx += WG_SIZE) {
+        let q_tile_row = elem_idx / HEAD_DIM_QK;
+        let q_col = elem_idx % HEAD_DIM_QK;
+        let head_q_row = q_row_start + q_tile_row;
+        let global_q_row_offset = head_q_row * stride_q1 + head_idx * HEAD_DIM_QK;
+        q_shmem[elem_idx] = select(
+            0.0,
+            Q[global_q_row_offset + q_col] * params.scale,
+            head_q_row < step.tokens);
+    }
+
+    workgroupBarrier();
+
+    var row_max_now = FLOAT_MIN;
+    var exp_sum = 0.0;
+    var out_regs: array<vec4<f32>, OUT_REGS_PER_LANE>;
+    for (var reg_idx = 0u; reg_idx < OUT_REGS_PER_LANE; reg_idx += 1u) {
+        out_regs[reg_idx] = vec4<f32>(0.0);
+    }
+
+    let q_base = subgroup_id * HEAD_DIM_QK;
+    let subgroup_p_offset = subgroup_id * KV_TILE;
+
+    for (var kv_tile = 0u; kv_tile < seq_len_kv; kv_tile += KV_TILE) {
+        let kv_count = min(KV_TILE, seq_len_kv - kv_tile);
+        let score_slots = min(SCORE_REGS_PER_LANE, (kv_count + subgroup_size - 1u) / subgroup_size);
+        let out_slots = min(OUT_REGS_PER_LANE, (V_CHUNKS + subgroup_size - 1u) / subgroup_size);
+        var local_scores: array<f32, SCORE_REGS_PER_LANE>;
+        for (var slot = 0u; slot < SCORE_REGS_PER_LANE; slot += 1u) {
+            local_scores[slot] = FLOAT_MIN;
+        }
+
+        load_k_tile_block(local_id.x, kv_count, kv_tile, k_head_offset);
+
+        workgroupBarrier();
+
+        var local_max = FLOAT_MIN;
+        if (row_active) {
+            for (var slot = 0u; slot < score_slots; slot += 1u) {
+                let kv_local = sg_inv_id + slot * subgroup_size;
+                if (kv_local >= kv_count) {
+                    continue;
+                }
+
+                let global_k_row = kv_tile + kv_local;
+                var dot_val = 0.0;
+                for (var chunk = 0u; chunk < Q_CHUNKS; chunk += 1u) {
+                    let q_off = q_base + chunk * 4u;
+                    let qv = vec4<f32>(
+                        q_shmem[q_off + 0u],
+                        q_shmem[q_off + 1u],
+                        q_shmem[q_off + 2u],
+                        q_shmem[q_off + 3u]);
+                    let kv_off = kv_local * HEAD_DIM_QK + chunk * 4u;
+                    let kv = vec4<shmem_t>(
+                        kv_shmem[kv_off + 0u],
+                        kv_shmem[kv_off + 1u],
+                        kv_shmem[kv_off + 2u],
+                        kv_shmem[kv_off + 3u]);
+                    dot_val += dot(qv, vec4<f32>(kv));
+                }
+                // the causal mask: no position after the row's own
+                if (global_k_row > row_position) {
+                    dot_val = FLOAT_MIN;
+                }
+                local_scores[slot] = dot_val;
+                local_max = max(local_max, dot_val);
+            }
+        }
+
+        let tile_max = row_max(local_max);
+        let new_max = max(row_max_now, tile_max);
+        let cur_exp = exp(row_max_now - new_max);
+        exp_sum *= cur_exp;
+        for (var reg_idx = 0u; reg_idx < OUT_REGS_PER_LANE; reg_idx += 1u) {
+            out_regs[reg_idx] *= cur_exp;
+        }
+
+        var local_sum = 0.0;
+        for (var slot = 0u; slot < score_slots; slot += 1u) {
+            let kv_local = sg_inv_id + slot * subgroup_size;
+            if (row_active && kv_local < kv_count) {
+                let p = exp(local_scores[slot] - new_max);
+                p_shmem[subgroup_p_offset + kv_local] = shmem_t(p);
+                local_sum += p;
+            }
+        }
+
+        workgroupBarrier();
+
+        load_v_tile_block(local_id.x, kv_count, kv_tile, v_head_offset);
+
+        workgroupBarrier();
+
+        let tile_sum = row_sum(local_sum);
+        exp_sum += tile_sum;
+        row_max_now = new_max;
+
+        if (row_active) {
+            for (var reg_idx = 0u; reg_idx < out_slots; reg_idx += 1u) {
+                let chunk = sg_inv_id + reg_idx * subgroup_size;
+                if (chunk >= V_CHUNKS) {
+                    continue;
+                }
+
+                var acc = out_regs[reg_idx];
+                for (var kv_local = 0u; kv_local < kv_count; kv_local += 1u) {
+                    let p = f32(p_shmem[subgroup_p_offset + kv_local]);
+                    let kv_off = kv_local * HEAD_DIM_V + chunk * 4u;
+                    let v4 = vec4<shmem_t>(
+                        kv_shmem[kv_off + 0u],
+                        kv_shmem[kv_off + 1u],
+                        kv_shmem[kv_off + 2u],
+                        kv_shmem[kv_off + 3u]);
+                    acc += p * vec4<f32>(v4);
+                }
+                out_regs[reg_idx] = acc;
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    if (row_active) {
+        let inv_exp_sum = select(0.0, 1.0 / exp_sum, exp_sum != 0.0);
+        let row_base = global_q_row * stride_q1 + head_idx * HEAD_DIM_V;
+        let out_slots = min(OUT_REGS_PER_LANE, (V_CHUNKS + subgroup_size - 1u) / subgroup_size);
+        for (var reg_idx = 0u; reg_idx < out_slots; reg_idx += 1u) {
+            let chunk = sg_inv_id + reg_idx * subgroup_size;
+            if (chunk >= V_CHUNKS) {
+                continue;
+            }
+            let dst_vec_index = (row_base + chunk * 4u) >> 2u;
+            dst[dst_vec_index] = out_regs[reg_idx] * inv_exp_sum;
+        }
+    }
 }`;
 
 // SwiGLU: gate = silu(gate) * up, for every token (the second dimension of the dispatch)

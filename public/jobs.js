@@ -24,10 +24,11 @@ export const BATCH = 16;
 export const SCRATCH = 4608;
 // T135: the words of the GPU's worker (gpu.js), which runs the blocks of a prompt that forward.js hands it while
 // forward.js waits: GPU_DONE, the number of the last request it finished; GPU_FAILED, whether that one failed;
-// GPU_BEAT, counted up while it works (a worker that stopped counting has stopped)
-export const GPU_DONE = 1280, GPU_FAILED = 1281, GPU_BEAT = 1282;
+// GPU_BEAT, counted up while it works (a worker that stopped counting has stopped); GPU_WANTED, the request forward.js
+// waits for (T147: 0 once it gave the GPU up, and the GPU's worker writes nothing for a request no longer wanted)
+export const GPU_DONE = 1280, GPU_FAILED = 1281, GPU_BEAT = 1282, GPU_WANTED = 1283;
 if (JOB_TABLE <= JOBS * 4 || JOB_TABLE % 8 || JOB_TABLE + BATCH * JOB * 8 > SCRATCH || SCRATCH + 448 > GPU_DONE * 4 ||
-    (GPU_BEAT + 1) * 4 > CONTROL_BYTES) {
+    (GPU_WANTED + 1) * 4 > CONTROL_BYTES) {
   throw new Error("the control area does not hold its jobs, the scratch and the GPU's words: see jobs.js");
 }
 
