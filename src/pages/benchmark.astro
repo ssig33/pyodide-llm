@@ -56,8 +56,9 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
         <h2>GPU</h2>
         <p class="about">WebGPU: the adapter, its shaders checked against JavaScript, how fast it reads int8 weights, and
           a token's work of three model sizes against the CPU. Then the same token in fewer dispatches and with the next
-          token chosen on the GPU, what a token costs besides its weights, and a prompt's tokens all at once. The weights
-          are random bytes.</p>
+          token chosen on the GPU, what a token costs besides its weights, the device's ceilings (loops of multiply-adds,
+          int8 dots or reads alone), and a prompt's tokens all at once, with the share of its ceiling each shader
+          reaches. The weights are random bytes.</p>
       </section>
       <section data-section="storage">
         <h2>Storage</h2>
@@ -368,6 +369,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       // T135's candidates on Llama 3.2 1B: fewer dispatches, the token chosen on the GPU, both
       for (const [label, how] of GPU_WAYS) await step(`a token of Llama 3.2 1B, ${label}`, { step: "token", model: "Llama 3.2 1B", kind: "widen", ...how });
       await step("what a token costs besides the weights", { step: "overhead" });
+      // T168: the ceilings just before the prompt, so that both are measured as warm as each other
+      await step("the device's ceilings", { step: "ceilings" });
       await step("a prompt all at once", { step: "prompt", counts: PROMPT_COUNTS });
       const bridge = await gpuBridge(w);
       const wrong = check && Object.values(check).some((v: any) => !v.ok && !v.error);
@@ -417,6 +420,9 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       const b = s.result ?? {};
       lines.push(`| ${s.name.slice(11)} | ${s.error ?? `${fixed(b.widen?.GBps)} GB/s`} | ${b.packed ? `${fixed(b.packed.GBps)} GB/s` : "–"} | ${b.cpu ? `${fixed(b.cpu.GBps)} GB/s` : ""} |`);
     }
+    const ceilings = steps.find((s) => s.name === "the device's ceilings")?.result;
+    const best = Math.max(0, ...bandwidths.flatMap((s) => [s.result?.widen?.GBps ?? 0, s.result?.packed?.GBps ?? 0]));
+    if (best && ceilings?.global?.GBps) lines.push("", `The fastest of these reads ${percent(best, ceilings.global.GBps)} of what a loop that only reads a buffer reads (${fixed(ceilings.global.GBps)} GB/s, below).`);
     lines.push("");
     // the CPU's side of a token: the weights read once at what one thread measured, and at twice that, which the
     // software threads reach at most (T93: the memory's bandwidth)
@@ -432,7 +438,8 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       lines.push(`| ${s.name.slice(11)} | ${fixed(t.GB, 2)} | ${t.dispatches} | ${fixed(t.msPerToken)} | ${fixed(t.tokPerSecond)} | ${fixed(one)} | ${one ? `${fixed(t.tokPerSecond / (2 * one), 2)}×` : ""} |`);
     }
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
-      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result));
+      "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),
+      "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings));
     lines.push("", `**Bridge** (Atomics.wait ↔ Atomics.waitAsync, ${BRIDGE_ROUNDS} round trips): ${bridge.error ?? `${fixed(bridge.microseconds)} µs each`}`);
     return lines.join("\n");
   }
@@ -448,10 +455,33 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       `| the token's id read back (4 bytes) | ${fixed(o.readToken, 2)} |`,
       `| every logit read back (${o.vocab} floats) | ${fixed(o.readLogits, 2)} |`];
   }
+  // T168: the device's ceilings, each a loop of that alone (public/shaders.js, the method of clpeak): what the
+  // prompt's shaders are held against
+  const percent = (part: number, whole: number) => `${fixed((100 * part) / whole, 1)}%`;
+  function ceilingsMarkdown(s: any) {
+    if (!s || s.error) return [`**The device's ceilings**: ${s?.error ?? "not measured"}`];
+    const c = s.result;
+    // three digits where it is small (a fallback adapter's reads of the workgroup's memory are well under 1 GB/s)
+    const cell = (v: any, key: string, unit: string) => (v.none ?? (v.error ? `failed: ${v.error}`
+      : `${v[key] < 100 ? v[key].toPrecision(3) : fixed(v[key], 0)} ${unit}`));
+    return [`**The device's ceilings** (each a loop of that alone${c.fallback ? ", run once" : ""}):`, "",
+      "| ceiling | GPU |", "|---|---:|",
+      `| f32 multiply-adds | ${cell(c.f32, "GFLOPS", "GFLOPS")} |`,
+      `| f16 multiply-adds | ${cell(c.f16, "GFLOPS", "GFLOPS")} |`,
+      `| int8 dots (dot4I8Packed) | ${cell(c.dot4, "GOPS", "GOPS")} |`,
+      `| reading the workgroup's memory | ${cell(c.shared, "GBps", "GB/s")} |`,
+      `| reading a buffer${c.global.MB ? ` (${fixed(c.global.MB, 0)} MB)` : ""} | ${cell(c.global, "GBps", "GB/s")} |`];
+  }
+  // what a row of the prompt is held against: the int8 dots for a packed shader, the f16 multiply-adds for one that
+  // multiplies halves, else the f32 ones
+  function ceilingOf(row: any, c: any) {
+    const [name, v] = row.packed ? ["int8 dots", c?.dot4?.GOPS] : row.half ? ["f16", c?.f16?.GFLOPS] : ["f32", c?.f32?.GFLOPS];
+    return v ? `${percent(row.GFLOPS, v)} of ${name}` : "";
+  }
   // a prompt's tokens at once on the GPU against the CPU section's blocks of 16 (the same made-up model: two layers of
   // Llama 3.2 1B's width, no classifier), by every shader of it (T146: the tiled ones beside T135's batched one), with
   // the GFLOPS of each (a multiply and an add for each weight and token) and the CPU's GOPS from the same count
-  function promptMarkdown(s: any, check?: any) {
+  function promptMarkdown(s: any, check?: any, ceilings?: any) {
     if (!s || s.error) return [`**A prompt all at once**: ${s?.error ?? "not measured"}`];
     const r = s.result;
     const cpuRows = (results.cpu?.data?.rows ?? []).filter((row: any) => row.promptMsPerToken);
@@ -467,10 +497,11 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     const name = (row: any) => (wrong(row) ? `${row.shader} (WRONG in the check)` : row.shader);
     return [`**A prompt** (the CPU section's model: two layers of Llama 3.2 1B's width, ${fixed(r.GB, 2)} GB, ${fixed(r.weights / 1e6, 0)} million weights, no classifier); ` +
       `the CPU, 16 tokens at once: ${cpu}. A tiled shader's name says whose form it takes (llama.cpp's, TensorFlow.js's, ONNX Runtime's) and the rows × tokens of a workgroup's tile. ` +
-      "The batched shader is measured again at the end: a device that slows down as it warms up shows it there", "",
-      "| shader | tokens at once on the GPU | GPU ms | GPU ms a token | GFLOPS |", "|---|---:|---:|---:|---:|",
-      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${row.none ?? `failed: ${row.error}`} | | | |`
-        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} |`)),
+      "The batched shader is measured again at the end: a device that slows down as it warms up shows it there. " +
+      "Of the ceiling: its GFLOPS against the device's ceiling above for what the shader multiplies with", "",
+      "| shader | tokens at once on the GPU | GPU ms | GPU ms a token | GFLOPS | of the ceiling |", "|---|---:|---:|---:|---:|---:|",
+      ...r.rows.map((row: any) => (row.none || row.error ? `| ${name(row)} | ${row.none ?? `failed: ${row.error}`} | | | | |`
+        : `| ${name(row)} | ${row.tokens} | ${fixed(row.ms)} | ${fixed(row.msPerToken, 2)} | ${fixed(row.GFLOPS, 0)} | ${ceilingOf(row, ceilings)} |`)),
       "", `**Fastest on the GPU** (of the shaders the check found right): ${[fastest(16), fastest(64)].filter(Boolean).join("; ") || "nothing measured"}`];
   }
 

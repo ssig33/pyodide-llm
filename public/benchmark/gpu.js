@@ -17,6 +17,9 @@
 //   { step: "prompt", counts }            the tokens of a prompt through the matrices all at once (matrix × matrix,
 //                                         T135's first candidate), on the made-up model of the CPU section's shape,
 //                                         by T135's batched shader and T146's tiled ones, with the GFLOPS of each
+//   { step: "ceilings" }                  T168: the device's ceilings: f32 and f16 multiply-adds (GFLOPS), dot4I8Packed
+//                                         (GOPS), reading the workgroup's memory and a storage buffer (GB/s), each a
+//                                         loop of that alone (shaders.js), for the share of them the prompt's shaders reach
 //   { step: "bridge", memory, rounds }    the round trip of a worker that waits with Atomics.wait and this one, which
 //                                         answers with Atomics.waitAsync (stage 1's design), in microseconds
 //
@@ -611,6 +614,69 @@ async function overhead() {
   return found;
 }
 
+// ---- the ceilings (T168): each loop of shaders.js alone, dispatched n times in one submission. n doubles until a
+// submission takes CEILING_MS, and the rate is that of the n dispatches a submission of 2n takes more than one of n:
+// what a submission costs besides its work (3.7 ms waited for on the owner's Android, T134) is in both and drops out.
+// A fallback adapter runs each once, small (its speed is no GPU's): one dispatch of FALLBACK_LOOPS
+const CEILING_MS = 40, CEILING_GROUPS = 256, CEILING_LOOPS = 32, FALLBACK_LOOPS = 2, MOST_DISPATCHES = 4096;
+// the storage buffer the global read streams through, meant to be larger than the GPU's caches (their sizes on the
+// owner's devices are not measured)
+const GLOBAL_BYTES = 64 << 20, FALLBACK_GLOBAL_BYTES = 4 << 20;
+async function ceilings() {
+  await gpu();
+  const loops = fallback ? FALLBACK_LOOPS : CEILING_LOOPS, threads = CEILING_GROUPS * WGSL.CEILING_WORKGROUP;
+  const globalBytes = fallback ? FALLBACK_GLOBAL_BYTES : GLOBAL_BYTES;
+  const globalThreads = globalBytes / WGSL.GLOBAL_PER_THREAD;
+  const out = buffer(Math.max(threads, globalThreads) * 4, STORAGE), data = buffer(globalBytes);
+  fill(data, globalBytes);
+  const uniform = buffer(16, UNIFORM | COPY_DST);
+  device.queue.writeBuffer(uniform, 0, new Uint32Array([loops, (Math.random() * 2 ** 32) >>> 0, 0, 0]));
+  // what a loop counts (FLOPs, ops or bytes) a second: work is one dispatch's, of groups workgroups, the bindings
+  // out, the uniform and those of more
+  const rate = async (code, work, groups = CEILING_GROUPS, more = []) => {
+    const pipeline = await validated(() => device.createComputePipelineAsync({ layout: "auto",
+      compute: { module: device.createShaderModule({ code }), entryPoint: "main" } }));
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+      entries: [out, uniform, ...more].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+    const submission = (n) => async () => {
+      const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+      for (let i = 0; i < n; i++) run(pass, [pipeline, group, groups, 1]);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    };
+    if (fallback) return work / (await median(submission(1)) / 1000);
+    await submission(1)();
+    let n = 1;
+    while (n < MOST_DISPATCHES && await median(submission(n), 1, 0) < CEILING_MS) n *= 2;
+    const once = await median(submission(n), 5, 1), twice = await median(submission(2 * n), 5, 1);
+    // a submission of 2n no slower than one of n (the times went wrong): the whole of 2n, fixed cost and all, which
+    // can only read lower than the ceiling
+    return (n * work) / ((twice > once ? twice - once : twice / 2) / 1000);
+  };
+  const found = { loops, fallback };
+  const measure = async (name, why, how) => {
+    if (why) return (found[name] = { none: why });
+    try {
+      found[name] = await how();
+    } catch (error) {
+      found[name] = { error: String(error?.message ?? error) };
+    } finally {
+      postMessage({ alive: true });
+    }
+  };
+  const flops = threads * loops * WGSL.FMA_PER_LOOP;
+  await measure("f32", null, async () => ({ GFLOPS: (await rate(WGSL.fmaCeiling(false), flops)) / 1e9 }));
+  await measure("f16", device.features.has("shader-f16") ? null : "no shader-f16 here",
+    async () => ({ GFLOPS: (await rate(WGSL.fmaCeiling(true), flops)) / 1e9 }));
+  await measure("dot4", packed ? null : "no packed int8 dot here",
+    async () => ({ GOPS: (await rate(WGSL.DOT4_CEILING, threads * loops * WGSL.DOT4_PER_LOOP)) / 1e9 }));
+  await measure("shared", null, async () => ({ GBps: (await rate(WGSL.SHARED_CEILING, threads * loops * WGSL.SHARED_PER_LOOP)) / 1e9 }));
+  await measure("global", null, async () => ({ GBps: (await rate(WGSL.GLOBAL_CEILING, globalBytes, globalThreads / WGSL.CEILING_WORKGROUP, [data])) / 1e9, MB: globalBytes / 1e6 }));
+  [out, data, uniform].forEach((b) => b.destroy());
+  return found;
+}
+
 // ---- a prompt: its tokens through the matrices of the CPU section's made-up model (two layers of Llama 3.2 1B's
 // width, no classifier: a prompt's tokens make no logits) all at once, count tokens at a time, with the small steps
 // once a layer as for one token. ms per token, for every shader of promptShaders() (T146: the tiled ones, whose rows
@@ -666,7 +732,8 @@ async function prompt(counts = [1, 16, 64]) {
     }
     try {
       const kind = await kindOf(shader);
-      for (const tokens of counts) rows.push({ shader: shader.name, ...await measure(kind, tokens) });
+      // what the row's GFLOPS are held against (T168): the dot4I8Packed ceiling, the f16 or the f32 one
+      for (const tokens of counts) rows.push({ shader: shader.name, packed: shader.packed, half: shader.half, ...await measure(kind, tokens) });
     } catch (error) {
       rows.push({ shader: shader.name, error: String(error?.message ?? error) });
     }
@@ -712,6 +779,7 @@ onmessage = async ({ data }) => {
     else if (data.step === "token") result = await token(data.model, data.kind, data);
     else if (data.step === "overhead") result = await overhead();
     else if (data.step === "prompt") result = await prompt(data.counts);
+    else if (data.step === "ceilings") result = await ceilings();
     else if (data.step === "bridge") result = await bridge(data.memory, data.rounds);
     postMessage({ step: data.step, result });
   } catch (error) {
