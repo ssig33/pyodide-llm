@@ -284,6 +284,12 @@ const bothSamplers = generateTable({ ...generateStep, result: { ...generateStep.
   chunks: { msEach: 0.812 }, flat: { msEach: 6.104, over: 128256, chunks: { error: "a | b" } } } } }, generateRight).at(-1);
 assert.ok(bothSamplers.includes("one workgroup 5.893 ms (3695 tokens over the floor), in chunks 0.812 ms; on flat logits, one workgroup 6.104 ms " +
   "(128256 tokens over the floor), in chunks failed: a \\| b."), bothSamplers);
+// T191's review: of the sampling in chunks, its last stage alone (SAMPLE's search), and a timing that failed on either
+const withLast = generateTable({ ...generateStep, result: { ...generateStep.result, sampling: { vocab: 128256, error: "c | d", over: 3695,
+  chunks: { msEach: 0.812, pick: { msEach: 0.25, unsteady: true } } } } }, generateRight).at(-1);
+assert.ok(withLast.includes("one workgroup failed: c \\| d (3695 tokens over the floor), in chunks 0.812 ms (of it the last stage, one workgroup's " +
+  "nucleus and draw: unsteady: 0.250 ms)."), withLast);
+assert.ok(withLast.includes("the same settings but no penalty"), withLast);
 const chunksWrong = generateTable(generateStep, { ...generateRight, "sampling in chunks": { ok: false } });
 assert.ok(chunksWrong.includes("| 4, read back once | 10.40 | 5.50 (WRONG in the check) | 5.20 | 1.30 | 1.4× |"), chunksWrong.join("\n"));
 assert.ok(chunksWrong[0].includes("The check found the sampling in chunks WRONG."), chunksWrong[0]);

@@ -1528,7 +1528,14 @@ async function generate() {
 // the sampling alone (paired(): T168's n and 2n) on Llama 3's vocabulary, twice: on logits as a model's (madeUpLogits:
 // a spread of 2 and 20 tokens far above it, a few percent of the vocabulary over the nucleus's floor) and on flat ones
 // (a spread of 1, none above: every token over the floor, so that SAMPLE gathers and reads all of them each round
-// of its searches: its worst case). `over` is how many tokens are over the floor
+// of its searches: its worst case). `over` is how many tokens are over the floor.
+// Without the repetition penalty (T191's review): the penalty changes the logits in place, sampling after sampling,
+// and they are written once for all the submissions, so with it each sampled peak was divided down and the logits as a
+// model's went about flat while they were timed: the count over the floor the table named was not what was timed. The
+// penalty itself is a thread a token of the window in either sampler.
+// T191: SAMPLE's one workgroup, the sampling in chunks, and of that its last stage alone (one workgroup: the nucleus
+// and the draw, the same search as SAMPLE's): each submission of the last runs one sampling in chunks, then n of its
+// last stage on what that gathered, so that 2n less n is n of the last stage alone
 async function samplingAlone() {
   const vocab = MODELS["Llama 3.2 1B"].vocab, positions = 2 * GENERATE_MOST + 2;
   return scoped(async (owned) => {
@@ -1542,16 +1549,20 @@ async function samplingAlone() {
       chosen = make(positions * 4), randoms = make(positions * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST),
       parts = make(WGSL.samplePartsBytes(vocab));
     device.queue.writeBuffer(randoms, 0, randomsOf(positions));
-    device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab, ...GENERATE_SETTINGS }));
+    device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab, ...GENERATE_SETTINGS, penalty: 1 }));
     const history = [...Array(64)].map(() => (Math.random() * vocab) | 0), start = WGSL.samplingState({ token: history[63], pos: 0, history });
     const b = { 0: logits, 1: probs, 2: order, 3: state, 4: chosen, 5: randoms, 6: settings, 7: parts };
-    // T191: SAMPLE's one workgroup and the sampling in chunks, in turn (interleaved(): T150's review)
-    const lists = SAMPLERS.map((kind) => samplerDispatches(kind, pipes, b, vocab));
+    // T191: SAMPLE's one workgroup, the sampling in chunks and its last stage alone, in turn (interleaved(): T150's
+    // review), each [the dispatches once before the n, the dispatches n times]
+    const [one, chunks] = SAMPLERS.map((kind) => samplerDispatches(kind, pipes, b, vocab));
+    const last = chunks[WGSL.SAMPLER_STAGES.findIndex((stage) => stage.name === "pick")];
+    const lists = [[[], one], [[], chunks], [chunks, [last]]];
     const timed = async (values) => {
       device.queue.writeBuffer(logits, 0, values);
-      const found = await interleaved(lists.map((list) => async (n) => {
+      const found = await interleaved(lists.map(([before, list]) => async (n) => {
         device.queue.writeBuffer(state, 0, start);
         const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+        before.forEach((d) => run(pass, d));
         for (let i = 0; i < n; i++) list.forEach((d) => run(pass, d));
         pass.end();
         const began = performance.now();
@@ -1559,8 +1570,8 @@ async function samplingAlone() {
         await device.queue.onSubmittedWorkDone();
         return performance.now() - began;
       }), GENERATE_MOST);
-      const [one, chunks] = found.map((r) => (r.error ? { error: r.error } : { msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) }));
-      return { ...one, over: overTheFloor(values, GENERATE_SETTINGS.temperature), chunks };
+      const [once, inChunks, pick] = found.map((r) => (r.error ? { error: r.error } : { msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) }));
+      return { ...once, over: overTheFloor(values, GENERATE_SETTINGS.temperature), chunks: { ...inChunks, pick } };
     };
     const peaked = await timed(madeUpLogits(vocab, 2)), flat = await timed(madeUpLogits(vocab, 1, 0));
     return { vocab, ...peaked, flat };

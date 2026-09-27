@@ -418,8 +418,9 @@ export function layerTable(step, check, ceilings, gpu = {}) {
  * T151: the GPU section's table of tokens generated on the GPU (public/shaders.js's EMBED, fusedMatVec and SAMPLE: the
  * sampling on the GPU too, the state carried from token to token there). step: {name, result: {model, layers, vocab,
  * GB, dispatches, chunkDispatches, tokens, settings, work: {ms, unsteady}, chunkWork, rows: [{perSubmission, msPerToken,
- * fixedMs, chunks}], sampling: {vocab, msEach, over, unsteady, chunks: {msEach, unsteady} or {error}, flat: {msEach,
- * over, unsteady, chunks}}}} or {name, error}; check: the shaders against JavaScript ("sampling", "sampling in chunks"
+ * fixedMs, chunks}], sampling: {vocab, msEach, over, unsteady, chunks: {msEach, unsteady, pick} (pick: its last stage
+ * alone, the same form), flat: {msEach, over, unsteady, chunks}}}} or {name, error} (a time {error} where it failed);
+ * check: the shaders against JavaScript ("sampling", "sampling in chunks"
  * and "tokens on the GPU"); gpu: { fallback, lost }. T191: each row also the ms a token with the sampling in chunks
  * (shaders.js's SAMPLER_STAGES, many workgroups) where the rest is SAMPLE's one workgroup. A row a way of submitting: one token a submission, each read back as it comes, and
  * several in one submission, read back once. "A submission besides its tokens" (F) is what a submission costs past its
@@ -457,14 +458,18 @@ export function generateTable(step, check, gpu = {}) {
       `${derived && row !== one && one ? times(one.msPerToken / row.msPerToken) : ""} |`),
     "", `A token's work: ${r.work ? `${r.work.unsteady ? "unsteady: " : ""}${number(r.work.ms, 2)} ms` : "not measured here"}` +
     `${r.chunkWork ? ` (with the sampling in chunks ${r.chunkWork.unsteady ? "unsteady: " : ""}${number(r.chunkWork.ms, 2)} ms)` : ""}; ` +
-    `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens): ${r.sampling ? samplingCell(r.sampling) : "not measured here"}` +
+    `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens, the same settings but no penalty: ` +
+    `it would change them in place, sampling after sampling): ${r.sampling ? samplingCell(r.sampling) : "not measured here"}` +
     `${r.sampling?.flat ? `; on flat logits, ${samplingCell(r.sampling.flat)}` : ""}.`];
 }
 // the ms of the sampling alone, with how many tokens were over the nucleus's floor (what SAMPLE gathers and reads each
-// round of its searches: T151), in one workgroup and (T191) in chunks
-const samplingCell = (s) => `${s.chunks ? "one workgroup " : ""}${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms` +
+// round of its searches: T151), in one workgroup and (T191) in chunks, and of those the last stage alone (T191's
+// review: one workgroup's nucleus and draw, SAMPLE's search; the rest of SAMPLE is its reading of the vocabulary)
+const samplingTime = (s) => (s.error ? `failed: ${tableCell(s.error)}` : `${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms`);
+const samplingCell = (s) => `${s.chunks ? "one workgroup " : ""}${samplingTime(s)}` +
   `${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}` +
-  `${s.chunks ? `, in chunks ${s.chunks.error ? `failed: ${tableCell(s.chunks.error)}` : `${s.chunks.unsteady ? "unsteady: " : ""}${number(s.chunks.msEach, 3)} ms`}` : ""}`;
+  `${s.chunks ? `, in chunks ${samplingTime(s.chunks)}` : ""}` +
+  `${s.chunks?.pick ? ` (of it the last stage, one workgroup's nucleus and draw: ${samplingTime(s.chunks.pick)})` : ""}`;
 
 /** T93: where the model page remembers the number of threads it found for a model on this device (localStorage).
  * T190: /benchmark/ reads the same, so that the page path is timed on the model page's count. nav: the navigator */
