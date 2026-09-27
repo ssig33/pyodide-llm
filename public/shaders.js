@@ -639,8 +639,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // int8 matrix, the same products to the bit, and every tiled shader, check and timing stays as it is.
 //
 // WIDEN_SIX: the WGSL of that widening, one dispatch a piece of a matrix (gpu.js's upload). No public implementation
-// has this packing (llama.cpp's Q6_K packs otherwise), so it is written apart (T155: Fable high); null until then, and
-// the GPU's worker leaves an int6 model on the CPU with that reason. What gpu.js gives it:
+// has this packing (llama.cpp's Q6_K packs otherwise), so it is written apart (T155: Fable high). What gpu.js gives it:
 //   @group(0) @binding(0) var<storage, read> packed: array<u32>;         the groups as llama2_numpy.pack6 writes them,
 //                                                                        24 bytes (6 words) a group, one after another,
 //                                                                        from word 0 (the piece alone, uploaded apart)
@@ -652,8 +651,46 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // maxComputeWorkgroupsPerDimension): a thread a group, group number (workgroup_id.y × num_workgroups.x +
 // workgroup_id.x) × WIDEN_SIX_WORKGROUP + local_invocation_index, those past widen.x doing nothing. gpu.js checks it
 // against sixValues() below as it starts (every group of random bytes: any 24 bytes are a group), to the bit.
-export const WIDEN_SIX = null;
+//
+// The form (T155, Fable): four values a word, as the bytes lie. A group's six words are its 24 bytes: low[0..15] in
+// words 0..3 (byte j of the group at byte j % 4 of word j / 4) and top[0..7] in words 4 and 5. An int6 value's int8 is
+// its six bits shifted up twice, so it is a byte with nothing to sign-extend: bits 2-5 from a nibble of low[j] (value
+// j its low nibble, value j + 16 its high one) and bits 6-7 from a pair of bits of top[j % 8] (values k, k + 8,
+// k + 16, k + 24 at bits 0, 2, 4, 6). Because value j sits in the same byte of its word as low[j] and top[j % 8] do
+// (word i of the output takes low from word i and top from word 4 + i % 2), each output word is two masked shifts
+// of two input words: the nibbles of four values to bits 2-5 at once (0x0f0f0f0f, or the high nibbles as word >> 4),
+// and their pairs to bits 6-7 at once (top << (6 - pair's bit), masked to 0xc0c0c0c0: what a shift carries across a
+// byte lands under the mask). Masks and shifts by constants only, as kernels/six.ts. A thread a group: it reads 6
+// words and writes 8, the 64 threads of a workgroup reading 1536 bytes in a row and writing 2048, every line of the
+// cache used whole; the traffic is the 56 bytes a group either way, and the widening runs once as a model is put on
+// the GPU (Llama 3.2 1B's layers: 0.82 GB read, 1.09 GB written). Splitting a group over two threads would read
+// the top words twice for 4 fewer stores a thread: not taken.
 export const WIDEN_SIX_WORKGROUP = 64;
+export const WIDEN_SIX = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> packed: array<u32>;
+@group(0) @binding(1) var<storage, read_write> values: array<u32>;
+@group(0) @binding(2) var<uniform> widen: vec4<u32>;
+// four int8 from the low nibbles of low's bytes and the pair of bits at bit (bits 0, 2, 4 or 6) of top's bytes
+fn widened(low: u32, top: u32, bit: u32) -> u32 {
+  return ((low & 0x0f0f0f0fu) << 2u) | ((top << (6u - bit)) & 0xc0c0c0c0u);
+}
+@compute @workgroup_size(${WIDEN_SIX_WORKGROUP})
+fn main(@builtin(workgroup_id) id: vec3u, @builtin(num_workgroups) count: vec3u, @builtin(local_invocation_index) t: u32) {
+  let g = (id.y * count.x + id.x) * ${WIDEN_SIX_WORKGROUP}u + t;
+  if (g >= widen.x) { return; }
+  let at = g * 6u;
+  let low = vec4<u32>(packed[at], packed[at + 1u], packed[at + 2u], packed[at + 3u]);
+  let top = vec2<u32>(packed[at + 4u], packed[at + 5u]);
+  let out = g * 8u;
+  values[out] = widened(low.x, top.x, 0u);            // values 0..3: low nibbles, top bits 0-1 of top[0..3]
+  values[out + 1u] = widened(low.y, top.y, 0u);       // 4..7: top[4..7]
+  values[out + 2u] = widened(low.z, top.x, 2u);       // 8..11: bits 2-3 of top[0..3]
+  values[out + 3u] = widened(low.w, top.y, 2u);       // 12..15
+  values[out + 4u] = widened(low.x >> 4u, top.x, 4u); // 16..19: high nibbles, bits 4-5
+  values[out + 5u] = widened(low.y >> 4u, top.y, 4u); // 20..23
+  values[out + 6u] = widened(low.z >> 4u, top.x, 6u); // 24..27: bits 6-7
+  values[out + 7u] = widened(low.w >> 4u, top.y, 6u); // 28..31
+}`;
 /** the workgroups [x, y] of WIDEN_SIX for groups: a second dimension past the device's most of one */
 export const sixDispatch = (groups, most) => {
   const workgroups = Math.ceil(groups / WIDEN_SIX_WORKGROUP), x = Math.min(workgroups, most);
