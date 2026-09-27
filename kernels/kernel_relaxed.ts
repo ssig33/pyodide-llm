@@ -65,6 +65,118 @@ export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
   }
 }
 
+// T159: matmul_q8r for count tokens of a prompt (T108) at once: token t's activations and their scales at xq + t * frame
+// and xs + t * frame (one frame a token), its outputs at xout + t * os. Four rows by four tokens a tile, where a group's
+// 32 bytes of a weight row are loaded once for the four tokens and a token's 32 bytes once for the four rows
+// (matmul_q8r loads both for every row and token). The form is that of the 4 x 4 GEMM of llama.cpp's CPU backend for
+// Q8_0 (ggml-cpu, MIT: int8 dot products of 4 rows by 4 tokens, each group's sums scaled once), not its lines: the
+// weights stay in the checkpoint's order (no repacking), and a row's four integer sums of a group, one a token, come
+// out of groupSums with the tokens in the lanes.
+//
+// Every (row, token) is matmul_q8r's number to the bit. A lane k of matmul_q8r adds the groups 4j + k in order and
+// the four lanes are added in order, then the groups past the last four one at a time, the corrections likewise; so
+// the tile takes the groups 4j + k in one pass for each k (its lanes are the tokens), adds the passes in that order,
+// then the groups past the fours, each with the same float32 operations (the weight scale times the activation scale,
+// times the group's exact integer sum). The rows past the last four and the tokens past the last four go through
+// matmul_q8r itself.
+// @ts-ignore: decorator
+@inline function scalesOf(xs: usize, frame: usize, g: i32): v128 {  // the four tokens' scales of group g
+  const at = xs + (<usize>g << 2);
+  let v = v128.load32_splat(at);
+  v = v128.load32_lane(at + frame, v, 1);
+  v = v128.load32_lane(at + 2 * frame, v, 2);
+  return v128.load32_lane(at + 3 * frame, v, 3);
+}
+// @ts-ignore: decorator
+@inline function sumsOf(w: usize, x0: v128, x1: v128, x2: v128, x3: v128, x4: v128, x5: v128, x6: v128, x7: v128): v128 {
+  // a row's group (32 bytes at w) with the four tokens' (x0 and x1 the first token's two halves, ...): its four
+  // exact integer sums, as float32 (at most 520192, exact)
+  const lo = v128.load(w), hi = v128.load(w, 16);
+  const d0 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x1, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x0, i32x4.splat(0)));
+  const d1 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x3, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x2, i32x4.splat(0)));
+  const d2 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x5, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x4, i32x4.splat(0)));
+  const d3 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x7, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x6, i32x4.splat(0)));
+  return f32x4.convert_i32x4_s(groupSums(d0, d1, d2, d3));
+}
+
+// the tile of rows i..i+3 and the four tokens at xq, xs (frame apart), writing xout (os apart)
+function tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize, n: i32, i: i32, os: usize, frame: usize): void {
+  const ng = n / GS;
+  const ng4 = ng & ~3;
+  const w0 = wq + <usize>i * <usize>n, w1 = w0 + <usize>n, w2 = w1 + <usize>n, w3 = w2 + <usize>n;
+  const sb = <usize>ng << 2;
+  const s0 = ws + <usize>i * sb, s1 = s0 + sb, s2 = s1 + sb, s3 = s2 + sb;
+  const c0 = wc + <usize>i * sb, c1 = c0 + sb, c2 = c1 + sb, c3 = c2 + sb;
+  const x1 = xq + frame, x2 = x1 + frame, x3 = x2 + frame;
+  // f: the rows' sums so far, k: their corrections (a lane a token)
+  let f0 = f32x4.splat(0), f1 = f0, f2 = f0, f3 = f0, k0 = f0, k1 = f0, k2 = f0, k3 = f0;
+  for (let lane = 0; lane < 4; lane++) {
+    let a0 = f32x4.splat(0), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    for (let g = lane; g < ng4; g += 4) {
+      const o = <usize>(g * GS), gs = <usize>g << 2;
+      const t0 = v128.load(xq + o), t1 = v128.load(xq + o, 16), t2 = v128.load(x1 + o), t3 = v128.load(x1 + o, 16);
+      const t4 = v128.load(x2 + o), t5 = v128.load(x2 + o, 16), t6 = v128.load(x3 + o), t7 = v128.load(x3 + o, 16);
+      const xsv = scalesOf(xs, frame, g);
+      a0 = f32x4.add(a0, f32x4.mul(sumsOf(w0 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
+      a1 = f32x4.add(a1, f32x4.mul(sumsOf(w1 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
+      a2 = f32x4.add(a2, f32x4.mul(sumsOf(w2 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
+      a3 = f32x4.add(a3, f32x4.mul(sumsOf(w3 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
+      b0 = f32x4.add(b0, f32x4.mul(v128.load32_splat(c0 + gs), xsv));
+      b1 = f32x4.add(b1, f32x4.mul(v128.load32_splat(c1 + gs), xsv));
+      b2 = f32x4.add(b2, f32x4.mul(v128.load32_splat(c2 + gs), xsv));
+      b3 = f32x4.add(b3, f32x4.mul(v128.load32_splat(c3 + gs), xsv));
+    }
+    if (lane == 0) {
+      f0 = a0; f1 = a1; f2 = a2; f3 = a3; k0 = b0; k1 = b1; k2 = b2; k3 = b3;
+    } else {
+      f0 = f32x4.add(f0, a0); f1 = f32x4.add(f1, a1); f2 = f32x4.add(f2, a2); f3 = f32x4.add(f3, a3);
+      k0 = f32x4.add(k0, b0); k1 = f32x4.add(k1, b1); k2 = f32x4.add(k2, b2); k3 = f32x4.add(k3, b3);
+    }
+  }
+  for (let g = ng4; g < ng; g++) {  // the groups past the fours, one at a time
+    const o = <usize>(g * GS), gs = <usize>g << 2;
+    const t0 = v128.load(xq + o), t1 = v128.load(xq + o, 16), t2 = v128.load(x1 + o), t3 = v128.load(x1 + o, 16);
+    const t4 = v128.load(x2 + o), t5 = v128.load(x2 + o, 16), t6 = v128.load(x3 + o), t7 = v128.load(x3 + o, 16);
+    const xsv = scalesOf(xs, frame, g);
+    f0 = f32x4.add(f0, f32x4.mul(sumsOf(w0 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
+    f1 = f32x4.add(f1, f32x4.mul(sumsOf(w1 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
+    f2 = f32x4.add(f2, f32x4.mul(sumsOf(w2 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
+    f3 = f32x4.add(f3, f32x4.mul(sumsOf(w3 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
+    k0 = f32x4.add(k0, f32x4.mul(v128.load32_splat(c0 + gs), xsv));
+    k1 = f32x4.add(k1, f32x4.mul(v128.load32_splat(c1 + gs), xsv));
+    k2 = f32x4.add(k2, f32x4.mul(v128.load32_splat(c2 + gs), xsv));
+    k3 = f32x4.add(k3, f32x4.mul(v128.load32_splat(c3 + gs), xsv));
+  }
+  const bias = f32x4.splat(64);
+  const r0 = f32x4.sub(f0, f32x4.mul(bias, k0)), r1 = f32x4.sub(f1, f32x4.mul(bias, k1));
+  const r2 = f32x4.sub(f2, f32x4.mul(bias, k2)), r3 = f32x4.sub(f3, f32x4.mul(bias, k3));
+  // token t's four rows are lane t of r0..r3: a transpose
+  const p01 = v128.shuffle<f32>(r0, r1, 0, 4, 1, 5), p23 = v128.shuffle<f32>(r2, r3, 0, 4, 1, 5);
+  const q01 = v128.shuffle<f32>(r0, r1, 2, 6, 3, 7), q23 = v128.shuffle<f32>(r2, r3, 2, 6, 3, 7);
+  const at = xout + (<usize>i << 2);
+  v128.store(at, v128.shuffle<f32>(p01, p23, 0, 1, 4, 5));
+  v128.store(at + os, v128.shuffle<f32>(p01, p23, 2, 3, 6, 7));
+  v128.store(at + 2 * os, v128.shuffle<f32>(q01, q23, 0, 1, 4, 5));
+  v128.store(at + 3 * os, v128.shuffle<f32>(q01, q23, 2, 3, 6, 7));
+}
+
+// rows r0..r1 for count tokens: the tiles row by row of four, so that a tile's four weight rows stay in the first
+// cache for every token (T108's blocks of 16 KB are not needed here)
+export function matmul_q8r_tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize, n: i32, r0: i32, r1: i32, count: i32, os: i32, frame: i32): void {
+  const rows4 = r0 + ((r1 - r0) & ~3), count4 = count & ~3;
+  const outStride = <usize>os, frameStride = <usize>frame;
+  for (let i = r0; i < rows4; i += 4) {
+    let t = 0;
+    for (; t < count4; t += 4) {
+      tile(xout + <usize>t * outStride, xq + <usize>t * frameStride, xs + <usize>t * frameStride, wq, ws, wc, n, i, outStride, frameStride);
+    }
+    for (; t < count; t++) matmul_q8r(xout + <usize>t * outStride, xq + <usize>t * frameStride, xs + <usize>t * frameStride, wq, ws, wc, n, i, i + 4);
+  }
+  if (rows4 < r1) {
+    for (let t = 0; t < count; t++) matmul_q8r(xout + <usize>t * outStride, xq + <usize>t * frameStride, xs + <usize>t * frameStride, wq, ws, wc, n, rows4, r1);
+  }
+}
+
 // T98: the same on int6 weights (six.ts: 24 bytes a group, widened straight into int8), in the same order as
 // matmul_q8r: four groups at a time, one sum a group (T167), their scales and corrections as vectors. wc as
 // for matmul_q8r (scale times the sum of the group's int8 values).

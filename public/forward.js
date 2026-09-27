@@ -11,7 +11,7 @@
 //   const outside = external({ memory, base, size, kernels }); // what Llama(external=) takes
 
 // what a job of a phase is, shared with the software threads (helper.js), from the same deployment as this file
-const { CONTROL_BYTES, GEN, QUIT, COUNTER, FINISHED, ACTIVE, TOTAL, WAKE, JOBS, JOB, JOB_TABLE, BATCH, ROWS, SIZE, FIRST,
+const { CONTROL_BYTES, GEN, QUIT, COUNTER, FINISHED, ACTIVE, TOTAL, WAKE, JOBS, JOB, JOB_TABLE, BATCH, ROWS, COUNT, SIZE, FIRST,
   GPU_DONE, GPU_FAILED, GPU_BEAT, GPU_WANTED, addressed, runner } = await import(new URL(`jobs.js${new URL(import.meta.url).search}`, import.meta.url));
 export { BATCH };
 
@@ -565,7 +565,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     ctl[JOBS] = jobs.length;
     jobs.forEach((job, i) => {
       const at = i * JOB, rows = job[ROWS];
-      const size = Math.max(1, Math.ceil(rows / (threads * CHUNKS_PER_THREAD)));
+      const quad = job[COUNT] > 1 ? 4 : 1;  // T159: a prompt's chunks in fours of rows, the tiles of matmul_q8r_tile
+      const size = quad * Math.ceil(rows / (threads * CHUNKS_PER_THREAD * quad));
       table.set(job, at);
       table[at + SIZE] = size;
       table[at + FIRST] = total;

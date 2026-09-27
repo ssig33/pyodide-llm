@@ -43,7 +43,9 @@ if (JOB_TABLE <= JOBS * 4 || JOB_TABLE % 8 || JOB_TABLE + BATCH * JOB * 8 > SCRA
 //   6 matmul_q6      as 1, on int6 weights
 // count > 1 (T108): the same rows for count tokens, whose out, a and b are that many bytes apart. The rows then go in
 // blocks small enough to stay in the cache while every token uses them: each (row, token) is the one kernel call it
-// is for a single token, so the numbers are the same as one token at a time. Attention is always one token a job.
+// is for a single token, so the numbers are the same as one token at a time. Kind 0 takes the count tokens in one
+// call instead (T159: matmul_q8r_tile, four rows by four tokens, each number matmul_q8r's to the bit; a and b are
+// then one frame apart, the same stride). Attention is always one token a job.
 export const ROWS = 9, COUNT = 10, SIZE = 14, FIRST = 15;
 const BLOCK_BYTES = 16384;
 export const blockRows = (kind, n) => Math.max(1, Math.floor(BLOCK_BYTES / (kind === 2 ? 4 * n : n)));
@@ -55,6 +57,7 @@ export const ADDRESSES = {
   matmul_q6: [0, 1, 2, 3, 4], rmsnorm: [0, 1, 2], rope: [0, 1, 2], attention: [0, 1, 2, 3, 4], attention_f16: [0, 1, 2, 3, 4],
   to_f16: [0, 1], layernorm: [0, 1, 2, 3], gelu: [0, 1, 2], swiglu: [0, 1, 2], add_columns: [0, 1, 2], add_inplace: [0, 1],
   argmax: [0], penalize: [0, 1], sample: [0, 5, 6], matmul_q8r: [0, 1, 2, 3, 4, 5], matmul_q6r: [0, 1, 2, 3, 4, 5],
+  matmul_q8r_tile: [0, 1, 2, 3, 4, 5],
 };
 /** A kernel module's exports as they are, or on a 64-bit memory (wide) with the addresses made BigInt on the way
  * in: the rest of the code keeps its addresses in Numbers (exact up to 2^53). */
@@ -88,6 +91,7 @@ export function runner(k, r) {
   return (job, r0, r1) => {
     const [kind, out, a, b, a4, a5, a6, a7, a8, rows, count, os, as, bs] = job;
     if (count === 1) return call(kind, out, a, b, a4, a5, a6, a7, a8, rows, r0, r1);
+    if (kind === 0) return r.matmul_q8r_tile(out, a, b, a4, a5, a6, a7, r0, r1, count, os, as);
     const step = blockRows(kind, a7);
     for (let r = r0; r < r1; r += step) {
       const end = Math.min(r + step, r1);
@@ -107,6 +111,7 @@ export function warmUp(k, r) {
     if (r) {
       r.matmul_q8r(out, xq, xs, w, s, c, 32, 0, 1);
       r.matmul_q6r(out, xq, xs, w, s, c, 32, 0, 1);
+      r.matmul_q8r_tile(out, xq, xs, w, s, c, 32, 0, 4, 4, 0, 0);  // one tile: four rows and four tokens, all the same
     }
     k.attention(out, xq, w, w, c, 0, 1, 1, 4, 0, 1);  // one head of 4 at position 0
     k.attention_f16(out, xq, w, w, c, 0, 1, 1, 4, 0, 1);

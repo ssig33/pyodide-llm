@@ -119,7 +119,11 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   const w8 = out + rows * 4, wc6 = w8 + rows * n, wc8 = wc6 + rows * ng * 4, out8 = wc8 + rows * ng * 4;
   for (let j = 0; j < n; j++) I[x + j] = next() % 128;
   const round = Math.fround;
-  for (const groups of [1, 2, 3, 4, 5, 6, 7, ng]) {
+  // T159's tokens: a frame each (activations, then their scales), and the outputs of the tile and of one at a time
+  const frame = 2048, frameScales = 1536, outFrame = 256;
+  const frames = 1 << 18, tiles = frames + 9 * frame, singles = tiles + 9 * outFrame;
+  if (out8 + rows * 4 > frames || singles + 9 * outFrame > memory.buffer.byteLength) throw new Error("forward-check's memory does not hold T159's frames");
+  for (const groups of [1, 2, 3, 4, 5, 6, 7, 8, 11, ng]) {
     const m = groups * 32, fours = groups & ~3;
     for (let i = 0; i < rows; i++) for (let j = 0; j < m; j++) I[w8 + i * m + j] = six(i, j, groups);
     k.six_sums(wc6, w6, ws, rows * groups);
@@ -147,6 +151,32 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
       }
       const expected = round(sum - round(64 * corr));
       if (F[out8 / 4 + i] !== expected) throw new Error(`matmul_q8r differs at row ${i} of ${groups} groups: ${F[out8 / 4 + i]} against ${expected}`);
+    }
+    // T159: matmul_q8r_tile (a prompt's count tokens, four rows by four tokens) to the bit against matmul_q8r token by
+    // token, at every count of tokens 1 to 9 (no four, one four and 1 to 3 after it, two fours) and row ranges that
+    // start and end off the fours (none, one tile, tiles with 1 to 3 rows after them), with every group count above;
+    // the rows and tokens outside are left as they were
+    for (let t = 0; t < 9; t++) {
+      for (let j = 0; j < m; j++) I[frames + t * frame + j] = next() % 128;
+      for (let g = 0; g < groups; g++) F[(frames + t * frame + frameScales) / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
+    }
+    for (const count of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+      for (const [r0, r1] of [[0, rows], [1, rows - 1], [2, 5], [3, 10], [4, 8], [5, 6], [7, 7]]) {
+        F.fill(-7, tiles / 4, (tiles + 9 * outFrame) / 4);
+        relaxed.matmul_q8r_tile(tiles, frames, frames + frameScales, w8, ws, wc8, m, r0, r1, count, outFrame, frame);
+        F.fill(-7, singles / 4, (singles + 9 * outFrame) / 4);
+        for (let t = 0; t < count; t++) {
+          relaxed.matmul_q8r(singles + t * outFrame, frames + t * frame, frames + t * frame + frameScales, w8, ws, wc8, m, r0, r1);
+        }
+        for (let t = 0; t < 9; t++) {
+          for (let i = 0; i < rows; i++) {
+            const got = F[(tiles + t * outFrame) / 4 + i], want = F[(singles + t * outFrame) / 4 + i];
+            if (!Object.is(got, want)) {
+              throw new Error(`matmul_q8r_tile differs from matmul_q8r at row ${i}, token ${t} of ${count}, rows ${r0}..${r1}, ${groups} groups: ${got} against ${want}`);
+            }
+          }
+        }
+      }
     }
   }
 }
