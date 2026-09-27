@@ -87,7 +87,11 @@ const BENCH_MODEL = "llm-jp-3-150m";
       <div class="report" hidden>
         <h2>Results</h2>
         <p><button id="copy" type="button">Copy the results</button> <a id="issue" target="_blank" rel="noopener">Report them as an issue</a>
-          <span id="long" class="about" hidden>(long: the issue gets a summary, and the whole results go to your clipboard: paste them into the issue)</span></p>
+          <span id="long" class="about" hidden>(long: the issue gets a summary, and the whole results go to your clipboard: paste them into the issue)</span>
+          <span id="longer" class="about" hidden>(too long even for a summary: the issue gets only a request for the results, and the whole results go to your clipboard: paste them into the issue)</span></p>
+        <p id="clipboard" role="status" hidden>This browser did not let the page write to your clipboard. The whole
+          results are in the box below, and the page tried to select them: copy them by hand (on a phone, a long press on
+          the text may bring up Copy) and paste them into the issue.</p>
         <pre id="markdown"></pre>
       </div>
     </main>
@@ -133,6 +137,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
   .progress .elapsed { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .state.ok { color: inherit; }
   .state.wrong, .state.error { color: var(--bad); }
+  #clipboard { color: var(--bad); font-size: 0.85rem; margin: 4px 0 8px; }
   /* a table wider than a phone scrolls inside itself: the page never does */
   .out { overflow-x: auto; }
   .out table { border-collapse: collapse; font-size: 0.8rem; font-variant-numeric: tabular-nums; margin: 6px 0; }
@@ -751,7 +756,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
     // T185: where the whole is too long for the link, the link holds the head and a line a section
     const summary = shortReport(head, shown.flatMap((name) => summaryOf(name, results[name]!)));
     ($("issue") as HTMLAnchorElement).href = reportUrl(markdown, environment, summary);
-    $("long").hidden = !reportTooLong(markdown, environment);
+    // T192: where the summary is too long as well, the link holds only the request to paste (TOO_LONG)
+    const long = reportTooLong(markdown, environment), longer = long && reportTooLong(summary, environment);
+    $("long").hidden = !long || longer;
+    $("longer").hidden = !longer;
     (document.querySelector(".report") as HTMLElement).hidden = false;
     (window as any).__benchmark.markdown = markdown;
   }
@@ -817,10 +825,29 @@ const BENCH_MODEL = "llm-jp-3-150m";
     running = false;
   }
   $("run-all").onclick = () => runSections(ALL);
-  $("copy").onclick = () => navigator.clipboard?.writeText($("markdown").textContent ?? "");
+  // T192: where the clipboard refuses (or there is none), say so and select the whole for copying by hand: on a
+  // device with a GPU the report is mostly too long for the link, and the issue then asks for it to be pasted
+  function toClipboard() {
+    const said = $("clipboard");
+    said.hidden = true;
+    const refused = () => {
+      said.hidden = false;
+      const selection = getSelection();
+      selection?.removeAllRanges();
+      selection?.selectAllChildren($("markdown"));
+      said.scrollIntoView({ block: "nearest" });
+    };
+    try {
+      if (!navigator.clipboard?.writeText) return refused();
+      navigator.clipboard.writeText($("markdown").textContent ?? "").catch(refused);
+    } catch {
+      refused();
+    }
+  }
+  $("copy").onclick = toClipboard;
   // a report too long for the link goes by the clipboard, in the click itself (Safari writes only there)
   $("issue").addEventListener("click", () => {
-    if (!$("long").hidden) navigator.clipboard?.writeText($("markdown").textContent ?? "").catch(() => {});
+    if (!$("long").hidden || !$("longer").hidden) toClipboard();
   });
   // T173: a mark of the page-memory section is a tab ended (or left) while it grew: what it held is shown, and the
   // section is not run again by the ?run= below (a ?run=memory would end the tab over and over)
