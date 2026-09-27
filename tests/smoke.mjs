@@ -199,6 +199,12 @@ for size in (fast.vocab_size - 1, fast.vocab_size - 3):
             for value in (0.0, generator.random(), 1.0 - 1e-12):
                 ours, theirs = fast.sample(logits, 0.7, topp, Fixed(value)), llama2_numpy.Llama.sample(fast, logits, 0.7, topp, Fixed(value))
                 assert ours == theirs or abs(logits[ours] - logits[theirs]) < 1e-3, (size, spread, topp, value, ours, theirs)
+# ... and the best logit (the one past the floor) in each lane of each of its four maxima, and in the tail
+for size in (fast.vocab_size, fast.vocab_size - 3):
+    for where in list(range(40)) + [size - 1 - k for k in range(20)]:
+        single = np.full(size, -100.0, dtype=np.float32)
+        single[where] = 5.0
+        assert fast.sample(single, 0.7, 0.9, generator) == where, (size, where)
 # T178: a few tokens above the floor and a low top-p (count * topp < 1): llama2.c's cutoff (1 - topp) / (count - 1)
 # was above all of them, and the kernel drew a word from outside the vocabulary, NumPy an IndexError. The nucleus is
 # the most probable token alone (the others add up to less than 1 - topp)
