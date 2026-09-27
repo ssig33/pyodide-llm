@@ -23,8 +23,9 @@
 //   - the keys and values it wrote back into the cache, against NumPy's: the worst row (a layer's keys or values of
 //     one position) no more than the line of the shader's arithmetic (GPU_LINE and the next, see there);
 //   - T147: a request forward.js gave up on (a GPU that answers late) writes nothing (the made-up model only);
-//   - the logits of the prompt's last token (the CPU's in both runs, on the GPU's keys and values in one): the same
-//     most likely token as the run on the CPU, and no farther from NumPy's than LOGITS_LINE times that run (see there).
+//   - T187: the scale of the first layer's keys and values against NumPy's (SCALE_LINE, see there);
+//   - the logits of the prompt's last token (the CPU's in both runs, on the GPU's keys and values in one): NumPy's
+//     most likely token or a near tie, and their KL divergence from NumPy's no more than KL_LINE (see there).
 // "synthetic": a made-up int8 model with grouped-query attention (4 heads, 2 of keys and values; none of the models
 // of this directory has it). T153: "synthetic-qwen2", the same with biases of q, k and v (Qwen2's) and an epsilon of
 // 1e-6; "synthetic-qwen3", the norms of every head of q and k (Qwen3's), heads of 32 where dim / heads is 16 (q and
@@ -49,7 +50,8 @@
 // for each model a table of the keys and values by layer, a column E16 and one a run (the CPU's, and the GPU's lettered
 // A, B...) against NumPy's, another against NumPy's with its cache in float16, a line a run with its form, its line and
 // the ratio to it, how many E16 it is, its logits against the CPU's and its most likely token, and the seconds of
-// every step.
+// every step. T187: Q8 (NumPy's with the inputs of the layers' matrices in 8 bits as well) beside E16, the first
+// layer's scale, the logits' KL divergence and the difference of the ten most likely.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -90,8 +92,7 @@ const COUNT = 150, KV_START = 8;
 //     positions (the made-up model 1.56e-3 at 39 tokens). The line: 8e-3.
 //   f16 (llama.cpp's f16: every weight × scale and activation rounded to 11 bits): 9.5e-4 to 6.1e-3. The line: 1.5e-2.
 //   8 bits (ORT's DP4A: the activations quantized as the CPU's matmul_q8 takes them, 8 bits where the CPU's relaxed
-//     SIMD takes 7): 0.30 to 0.56 of the CPU's. The line: 0.75 of the CPU's (a ratio to the CPU's error: measure it
-//     again where the CPU's arithmetic changes, T159, T165).
+//     SIMD takes 7): held to Q8 (T187, below).
 // T153: those lines hold for the first layer of every model and for all layers of a shallow one. Over the layers of a
 // deep one the float16 of the cache grows by itself, the more so with Qwen's large activations: E16 (NumPy's answer
 // with nothing but its cache rounded to float16, against NumPy's) is its measure. A GPU that computes as it should is a
@@ -101,20 +102,34 @@ const COUNT = 150, KV_START = 8;
 // shader's line alone. K (CI's Dawn on lavapipe, run 36308518805, 149 tokens): the float32 shaders are 0.9 to 1.6 E16
 // away (Qwen3 0.6B the most), llama.cpp's f16 0.9 to 3.2 and 5.5 (Qwen3 0.6B with the f16 attention), while a GPU that
 // reads layer 0's biases in every layer (synthetic-qwen2) is 13.9 E16 away on float32 and 14.4 on f16: K is 4 and 8.
-// The packed shaders stay on their ratio to the CPU's (their 8-bit activations are 19 to 47 E16 away: E16 is not
-// their measure; T147's weakness, TODO.md)
-const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2, PACKED_LINE = 0.75;
+const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2;
 const K = { float32: 4, f16: 8 };
-// The logits of the prompt's last token, the largest difference from NumPy's over the largest of NumPy's: the CPU's
-// own run 1.6e-2 to 5.6e-2, the one on the GPU's keys and values 0.75 to 1.04 times that (closer: its keys and values
-// are NumPy's but for the float16); broken on purpose 0.27 to 1.13, 4.8 times the CPU's and more. The line: no more
-// than 1.5 times the CPU's, and the same most likely token.
-const LOGITS_LINE = 1.5;
+// T187: none of the lines is a ratio to the CPU's error (T147 to T153 held DP4A to 0.75 of it and the logits to 1.5
+// times it: a correct DP4A went to 0.98 of its line on Qwen2.5 0.5B, one that read layer 0's biases in every layer
+// passed at 0.55, and GPT-2's logits went past 1.5 on keys and values that were NumPy's own; they moved wherever the
+// CPU's arithmetic did). Each is held to a yardstick of its own:
+//   - the packed shaders (8-bit activations) to Q8: NumPy's answer with the inputs of the layers' matrices quantized
+//     as quantize_x does it (8 bits, 32 a group, half to even) and its cache in float16, which is ORT's DP4A's
+//     arithmetic. Every layer no farther from NumPy's than K_PACKED × Q8's distance from NumPy's, the first layer the
+//     same with the first layer's.
+//   - the scale of the first layer's keys and values (T187: the norm's scale wrong by a little, as a mean or variance
+//     over n − 1 (1 + 1/2n: 7.8e-3 at dim 64, 8.7e-4 at 576) or a wrong epsilon, stays under the rows' lines, and the
+//     fused norm's quantized integers do not see it at all, T175): the least-squares factor s of the GPU's against
+//     NumPy's, sum(g·w) / sum(w·w), which the rounding of single values leaves at 1 within its noise over thousands
+//     of values. |s − 1| no more than SCALE_LINE.
+//   - the logits of the prompt's last token (on the CPU in every run, on the GPU's keys and values in the GPU's) by
+//     what sampling sees: the KL divergence of their softmax from NumPy's, no more than KL_LINE nats, and the most
+//     likely token NumPy's, or one NumPy gives at least half the probability of its most likely (a near tie: T147's
+//     stories15M at 149 tokens). Printed beside them: the largest difference of the logits of NumPy's ten most likely
+//     tokens over NumPy's largest |logit| (the old measure took all of them: GPT-2's went past on a token some 50
+//     logits below the top).
+// The numbers (CI's, TODO.md's T187): not yet measured; the lines below are provisional.
+const K_PACKED = 2, SCALE_LINE = 3e-4, KL_LINE = 1e-2, TIE = Math.LN2;
 
 // ---- Node: the plans and NumPy's answers
 const { pyodide: py } = await pyodideWithEngine();
 const PYTHON = `
-import base64, struct, numpy as np, llama2_numpy, llama2_convert
+import base64, gc, struct, numpy as np, llama2_numpy, llama2_convert
 from llama2_numpy import Llama
 
 def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0, six=False, **form):
@@ -158,11 +173,27 @@ class Half(np.ndarray):
         array = np.asarray(array).view(np.ndarray)
         return array[()] if return_scalar else array
 
-def answer(data, vocabulary, text, count, options, half=False):
+class Q8(np.ndarray):
+    """T187: a layer's matrix whose product takes its input quantized to 8 bits a group of 32, as the CPU's quantize_x
+    makes it for matmul_q8 and the GPU's QUANTIZE for ORT's DP4A: the largest |value| / 127 the group's scale, each
+    value times 1 / scale rounded half to even, in float32"""
+    def __matmul__(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        groups = x.reshape(-1, 32)
+        scale = np.abs(groups).max(axis=1, keepdims=True) / np.float32(127)
+        inverse = np.divide(np.float32(1), scale, out=np.zeros_like(scale), where=scale > 0)
+        return np.asarray(self).view(np.ndarray) @ (np.rint(groups * inverse) * scale).reshape(x.shape)
+
+def answer(data, vocabulary, text, count, options, half=False, q8=False):
     """NumPy's keys and values of the prompt's first count - 1 positions ([layers][positions][kv dim] each) and the
     logits of its last token, and the tokens. half (T153): the cache rounded to float16, and nothing else (made whole
-    at first, so that it never grows into an array of another class)"""
+    at first, so that it never grows into an array of another class). q8 (T187): the inputs of the layers' matrices
+    quantized to 8 bits (Q8)"""
     numpy = Llama(data, vocabulary, **options)
+    if q8:
+        for name in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+            if getattr(numpy, name, None) is not None:
+                setattr(numpy, name, np.asarray(getattr(numpy, name)).view(Q8))
     if half:
         numpy.key_cache = np.zeros((numpy.n_layers, numpy.n_kv_heads, numpy.seq_len, numpy.head_size), dtype=np.float32).view(Half)
         numpy.value_cache = np.zeros_like(numpy.key_cache).view(Half)
@@ -181,10 +212,18 @@ def answer(data, vocabulary, text, count, options, half=False):
             "header": list(struct.unpack_from("<7i", data, 0))}
 
 def answers(data, vocabulary, text, count, options):
-    """answer() and, T153, the keys and values of answer(half=True) beside it"""
+    """answer() and beside it: T153, the keys and values of answer(half=True); T187, its logits, and the keys, values
+    and logits of answer(half=True, q8=True) (the arithmetic of ORT's DP4A on the GPU: 8-bit inputs, the cache in
+    float16)"""
+    # (one engine at a time: Llama holds cycles, and Qwen3 0.6B widened to float32 is 2.4 GB)
     exact = answer(data, vocabulary, text, count, options)
+    gc.collect()
     rounded = answer(data, vocabulary, text, count, options, half=True)
-    return {**exact, "keys16": rounded["keys"], "values16": rounded["values"]}
+    gc.collect()
+    eight = answer(data, vocabulary, text, count, options, half=True, q8=True)
+    gc.collect()
+    return {**exact, "keys16": rounded["keys"], "values16": rounded["values"], "logits16": rounded["logits"],
+            "keys8": eight["keys"], "values8": eight["values"], "logits8": eight["logits"]}
 `;
 py.runPython(PYTHON);
 
@@ -401,7 +440,7 @@ const server = http.createServer((req, res) => {
   const found = cases.find((c) => c.checkpoint === pathname);
   if (pathname === "/") return send(types[".html"], PAGE);
   if (pathname === "/harness.js") return send(types[".js"], `const ONLY = ${JSON.stringify(only ? only.split(",") : [])};\n${HARNESS}`);
-  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, reference: { keys16, values16, ...reference }, ...c }) => ({ ...c, reference }))));
+  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, reference: { tokens, header }, ...c }) => ({ ...c, reference: { tokens, header } }))));
   if (found) return send("application/octet-stream", fs.readFileSync(found.file));
   const file = path.join(root, "public", pathname.replace(/^\/public\//, ""));
   if (!pathname.startsWith("/public/") || !fs.existsSync(file)) {
@@ -508,24 +547,60 @@ function worstRow(got, want, width) {
   return worst;
 }
 const argmax = (xs) => xs.reduce((best, x, i) => (x > xs[best] ? i : best), 0);
+// T187: the log-probabilities of logits (float64)
+function logSoftmax(logits) {
+  const top = logits.reduce((m, x) => Math.max(m, x), -Infinity);
+  let sum = 0;
+  for (const x of logits) sum += Math.exp(x - top);
+  const log = top + Math.log(sum);
+  return Float64Array.from(logits, (x) => x - log);
+}
+// the KL divergence (nats) of got's softmax from want's (want's log-probabilities given)
+function divergence(p, got) {
+  const q = logSoftmax(got);
+  let kl = 0;
+  for (let i = 0; i < p.length; i++) if (p[i] > -80) kl += Math.exp(p[i]) * (p[i] - q[i]);
+  return Math.max(kl, 0);
+}
+// the least-squares factor of got against want, less 1: a scale that is wrong by a little shows here, where the
+// rounding of every value (a noise) averages out
+function scaleOff(got, want) {
+  let gw = 0, ww = 0;
+  for (let i = 0; i < want.length; i++) { gw += got[i] * want[i]; ww += want[i] * want[i]; }
+  return gw / ww - 1;
+}
 let failed = false;
 for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;
   const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (c.headDim || dim / heads) * kvHeads;
-  const kv = (run) => Math.max(worstRow(floats(run.keys), floats(ref.keys), kvDim), worstRow(floats(run.values), floats(ref.values), kvDim));
+  const exact = { keys: ref.keys, values: ref.values };
+  const kv = (run, want = exact) => Math.max(worstRow(floats(run.keys), floats(want.keys), kvDim), worstRow(floats(run.values), floats(want.values), kvDim));
   // T153: the first layer's alone (a wrong step shows there already; the float16 of the cache grows over the layers)
   const first = (b64) => floats(b64).subarray(0, n * kvDim);
-  const firstKv = (run) => Math.max(worstRow(first(run.keys), first(ref.keys), kvDim), worstRow(first(run.values), first(ref.values), kvDim));
+  const firstKv = (run, want = exact) => Math.max(worstRow(first(run.keys), first(want.keys), kvDim), worstRow(first(run.values), first(want.values), kvDim));
+  // T187: the first layer's scale against NumPy's, the larger of the keys' and the values'
+  const scale = (run) => [scaleOff(first(run.keys), first(ref.keys)), scaleOff(first(run.values), first(ref.values))]
+    .reduce((worst, x) => (Math.abs(x) > Math.abs(worst) ? x : worst), 0);
   const cpuKv = kv(cpu);
-  // T153: E16, NumPy's answer with its cache in float16 against NumPy's
-  const e16 = Math.max(worstRow(floats(ref.keys16), floats(ref.keys), kvDim), worstRow(floats(ref.values16), floats(ref.values), kvDim));
+  // T153: E16, NumPy's answer with its cache in float16 against NumPy's. T187: Q8, with the matrices' inputs in 8 bits
+  const half = { keys: ref.keys16, values: ref.values16 }, eight = { keys: ref.keys8, values: ref.values8 };
+  const e16 = kv(half), q8 = kv(eight), q8First = firstKv(eight);
   const want = floats(ref.logits), largest = want.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
-  const logitsError = (b64) => floats(b64).reduce((m, x, i) => Math.max(m, Math.abs(x - want[i])), 0) / largest;
-  const cpuLogits = logitsError(cpu.logits), best = argmax(floats(cpu.logits));
+  const p = logSoftmax(want), top = argmax(want);
+  const tenBest = [...want.keys()].sort((i, j) => want[j] - want[i]).slice(0, 10);
+  const logits = (b64) => {
+    const got = floats(b64);
+    return { kl: divergence(p, got), ten: tenBest.reduce((m, i) => Math.max(m, Math.abs(got[i] - want[i])), 0) / largest, token: argmax(got) };
+  };
+  // the most likely token NumPy's, or one NumPy gives at least half the probability of its own (a near tie)
+  const near = (token) => token === top || p[token] >= p[top] - TIE;
+  const cpuLogits = logits(cpu.logits);
+  const measures = { e16, q8, cpuLogits, logits, scale, kl16: divergence(p, floats(ref.logits16)), kl8: divergence(p, floats(ref.logits8)) };
   console.log(`${id} (${layers} layers, ${heads} heads, ${kvHeads} of keys and values, ${n} tokens): the CPU's keys and values ` +
-    `${cpuKv.toExponential(2)} from NumPy's, logits ${cpuLogits.toExponential(2)}, most likely ${best} ` +
-    `${argmax(want) === best ? "as NumPy's" : `(NumPy's ${argmax(want)})`}, the prompt ${(cpu.promptMs / n).toFixed(2)} ms a token; ` +
-    `E16 (NumPy's cache in float16) ${e16.toExponential(2)}`);
+    `${cpuKv.toExponential(2)} from NumPy's (the first layer's scale ${scale(cpu).toExponential(1)}), logits KL ${cpuLogits.kl.toExponential(2)}, ` +
+    `most likely ${cpuLogits.token} ${cpuLogits.token === top ? "as NumPy's" : `(NumPy's ${top})`}, the prompt ${(cpu.promptMs / n).toFixed(2)} ms a token; ` +
+    `E16 (NumPy's cache in float16) ${e16.toExponential(2)} (KL ${measures.kl16.toExponential(1)}, scale ${scale(half).toExponential(1)}); ` +
+    `Q8 (and its matrices' inputs in 8 bits) ${q8.toExponential(2)}, the first layer ${q8First.toExponential(2)} (KL ${measures.kl8.toExponential(1)}, scale ${scale(eight).toExponential(1)})`);
   if (late) {
     // T147: a request forward.js gave up on is answered by nothing
     const tried = late.note === "prompts on WebGPU" && late.gpuTokens === 0;
@@ -553,40 +628,43 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const kind = /DP4A/.test(gpu.form ?? "") ? "packed" : /f16/.test(gpu.form ?? "") ? "f16" : "float32";
-    const shaderLine = kind === "packed" ? PACKED_LINE * cpuKv : kind === "f16" ? HALF_LINE : GPU_LINE;
-    const line = kind === "packed" ? shaderLine : Math.max(shaderLine, K[kind] * e16);
-    const firstLine = kind === "packed" ? PACKED_LINE * firstKv(cpu) : shaderLine;
+    const shaderLine = kind === "f16" ? HALF_LINE : GPU_LINE;
+    const line = kind === "packed" ? K_PACKED * q8 : Math.max(shaderLine, K[kind] * e16);
+    const firstLine = kind === "packed" ? K_PACKED * q8First : shaderLine;
     const gpuKv = kv(gpu), againKv = gpu.again ? kv(gpu.again) : NaN, gpuFirst = firstKv(gpu);
     gpu.line = line;
     if (!(gpuKv <= line) || !(againKv <= line)) {
       failures.push(`the keys and values of the GPU are ${gpuKv.toExponential(2)} and ${againKv.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
     }
     if (!(gpuFirst <= firstLine)) failures.push(`the first layer's keys and values are ${gpuFirst.toExponential(2)} from NumPy's (line ${firstLine.toExponential(2)})`);
-    const gpuLogits = logitsError(gpu.logits), againLogits = logitsError(gpu.again.logits);
-    if (!(gpuLogits <= LOGITS_LINE * cpuLogits) || !(againLogits <= LOGITS_LINE * cpuLogits)) {
-      failures.push(`the logits on the GPU's keys and values are ${gpuLogits.toExponential(2)} and ${againLogits.toExponential(2)} from NumPy's, the CPU's ${cpuLogits.toExponential(2)}`);
+    const gpuScale = scale(gpu), againScale = gpu.again ? scale(gpu.again) : NaN;
+    if (!(Math.abs(gpuScale) <= SCALE_LINE) || !(Math.abs(againScale) <= SCALE_LINE)) {
+      failures.push(`the first layer's keys and values are scaled by 1 + ${gpuScale.toExponential(2)} and 1 + ${againScale.toExponential(2)} of NumPy's (line ${SCALE_LINE})`);
     }
-    // the most likely token: the CPU's, or one whose logit NumPy puts no farther below its largest than the CPU's run
-    // is from NumPy's (a near tie, T147: stories15M at 149 tokens, where the GPU's logits were nearer NumPy's)
-    const near = (b64) => { const i = argmax(floats(b64)); return i === best || want[argmax(want)] - want[i] <= LOGITS_LINE * cpuLogits * largest; };
-    if (!near(gpu.logits) || !near(gpu.again.logits)) failures.push("another most likely token than on the CPU, and not a near tie");
+    const gpuLogits = logits(gpu.logits), againLogits = logits(gpu.again.logits);
+    if (!(gpuLogits.kl <= KL_LINE) || !(againLogits.kl <= KL_LINE)) {
+      failures.push(`the logits on the GPU's keys and values are KL ${gpuLogits.kl.toExponential(2)} and ${againLogits.kl.toExponential(2)} from NumPy's (line ${KL_LINE})`);
+    }
+    if (!near(gpuLogits.token) || !near(againLogits.token)) failures.push(`another most likely token (${gpuLogits.token}, ${againLogits.token}) than NumPy's ${top}, and not a near tie`);
     console.log(`  ${gpu.form ?? "no form"}, ${gpu.attention ?? "no attention"}: keys and values ${gpuKv.toExponential(2)} (all at once ${againKv.toExponential(2)}, ` +
-      `the first layer ${gpuFirst.toExponential(2)}, the CPU's ${firstKv(cpu).toExponential(2)}; ${(gpuKv / e16).toFixed(1)} E16), ` +
-      `logits ${gpuLogits.toExponential(2)} (${againLogits.toExponential(2)}), the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
+      `the first layer ${gpuFirst.toExponential(2)}, the CPU's ${firstKv(cpu).toExponential(2)}; ${(gpuKv / e16).toFixed(1)} E16, ${(gpuKv / q8).toFixed(2)} Q8), ` +
+      `the first layer's scale ${gpuScale.toExponential(1)} (${againScale.toExponential(1)}), logits KL ${gpuLogits.kl.toExponential(2)} (${againLogits.kl.toExponential(2)}), ` +
+      `the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
   }
-  layerTables(c, cpu, runs, { e16, cpuLogits, logitsError, best });
+  layerTables(c, cpu, runs, measures);
 }
 process.exit(failed ? 1 : 0);
 
 // T183: what a person reads in the log of CI to judge the numbers (Markdown: gpu-prompt.yml puts the log in the run's
 // summary too). A table of the keys and values by layer against NumPy's, with E16's column (NumPy's with its cache in
-// float16) beside the runs', where a layer that jumps shows; the same against NumPy's with its cache in float16 (what is
-// left is the arithmetic, not the cache); a line a run: its form, its line and the ratio to it, how many E16, its
-// logits against the CPU's and its most likely token; the seconds of every step. The runs are the GPU's worker's first
-// (the forms it chose), then one a form of the matrices (T147), then the attention without subgroups.
-function layerTables(c, cpu, runs, { e16, cpuLogits, logitsError, best }) {
+// float16) and T187's Q8 (and its matrices' inputs in 8 bits) beside the runs', where a layer that jumps shows; the same
+// against NumPy's with its cache in float16 (what is left is the arithmetic, not the cache); a line a run: its form, its
+// line and the ratio to it, how many E16 and Q8, the first layer's scale, its logits' KL and the largest difference of
+// NumPy's ten most likely, its most likely token; the seconds of every step. The runs are the GPU's worker's first (the
+// forms it chose), then one a form of the matrices (T147), then the attention without subgroups.
+function layerTables(c, cpu, runs, { e16, q8, cpuLogits, logits, scale }) {
   const ref = c.reference, n = ref.tokens.length - 1;
   const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (c.headDim || dim / heads) * kvHeads;
   const exact = { keys: ref.keys, values: ref.values }, half = { keys: ref.keys16, values: ref.values16 };
@@ -596,8 +674,8 @@ function layerTables(c, cpu, runs, { e16, cpuLogits, logitsError, best }) {
   });
   const e = (x) => x.toExponential(1), letter = (i) => String.fromCharCode(65 + i);
   const columns = [["CPU", cpu], ...runs.map((run, i) => [letter(i), run])];
-  const tables = [[`against NumPy's (E16: NumPy's with its cache in float16)`, exact, [["E16", half]]],
-    ["against NumPy's with its cache in float16", half, []]];
+  const tables = [[`against NumPy's (E16: NumPy's with its cache in float16; Q8: and the matrices' inputs in 8 bits)`, exact,
+    [["E16", half], ["Q8", { keys: ref.keys8, values: ref.values8 }]]], ["against NumPy's with its cache in float16", half, []]];
   for (const [title, want, more] of tables) {
     const table = [...more, ...columns].map(([, got]) => byLayer(got, want));
     console.log(`\nkeys and values of ${c.id} by layer, ${title}: the worst row, its largest difference over its largest value\n`);
@@ -608,15 +686,17 @@ function layerTables(c, cpu, runs, { e16, cpuLogits, logitsError, best }) {
   }
   console.log("");
   const all = (run) => Math.max(...byLayer(run, exact));
-  console.log(`- CPU: forward.js on the CPU: ${e(all(cpu))}, ${(all(cpu) / e16).toFixed(1)} E16, logits ${e(cpuLogits)} from NumPy's, most likely ${best}`);
+  const said = (x) => `logits KL ${e(x.kl)}, the ten most likely ${e(x.ten)}, most likely ${x.token}`;
+  console.log(`- CPU: forward.js on the CPU: ${e(all(cpu))}, ${(all(cpu) / e16).toFixed(1)} E16, ${(all(cpu) / q8).toFixed(2)} Q8, ` +
+    `the first layer's scale ${e(scale(cpu))}, ${said(cpuLogits)}`);
   runs.forEach((run, i) => {
-    const worst = Math.max(all(run), run.again ? all(run.again) : 0), token = argmax(floats(run.logits));
+    const worst = Math.max(all(run), run.again ? all(run.again) : 0);
     console.log(`- ${letter(i)}: ${run.form ?? "no form"}, ${run.attention ?? "no attention"}: ${e(all(run))} ` +
       `(all at once ${run.again ? e(all(run.again)) : "-"}), line ${e(run.line)}, ${(worst / run.line).toFixed(2)} of the line, ` +
-      `${(all(run) / e16).toFixed(1)} E16, ${e(Math.max(...byLayer(run, half)))} from NumPy's with its cache in float16, ` +
-      `logits ${(logitsError(run.logits) / cpuLogits).toFixed(2)} of the CPU's, most likely ${token}${token === best ? " as the CPU's" : ""}`);
+      `${(all(run) / e16).toFixed(1)} E16, ${(all(run) / q8).toFixed(2)} Q8, ${e(Math.max(...byLayer(run, half)))} from NumPy's with its cache in float16, ` +
+      `the first layer's scale ${e(scale(run))}, ${said(logits(run.logits))}${logits(run.logits).token === cpuLogits.token ? " as the CPU's" : ""}`);
   });
-  const seconds = { "NumPy (and with its cache in float16)": c.numpySeconds, "the plan": c.planSeconds, CPU: cpu.seconds };
+  const seconds = { "NumPy (with its cache in float16, and Q8)": c.numpySeconds, "the plan": c.planSeconds, CPU: cpu.seconds };
   runs.forEach((run, i) => { seconds[`${letter(i)} (its GPU ready in ${run.readySeconds.toFixed(1)})`] = run.seconds; });
   console.log(`\nseconds of ${c.id}: ${Object.entries(seconds).map(([step, s]) => `${step} ${s.toFixed(1)}`).join(", ")}\n`);
 }
