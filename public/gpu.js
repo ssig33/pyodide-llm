@@ -903,9 +903,13 @@ async function timeBlocks(m) {
 // long contexts), on this pass's q. Where it came from: the run of T151 (public/benchmark/gpu.js's generate()), whose
 // form is WebLLM's decode loop without its sync of every token (web-llm, src/llm_chat.ts; no line taken) and llama.cpp's
 // WebGPU graph of a token, one command encoder for all of it (ggml-webgpu.cpp, commit 2145525a, MIT; no line taken).
+// (T175's fused DP4A with the norms apart as well, RMSNORM and QUANTIZE where NORM_QUANTIZE is one: the owner's
+// Android ran a layer so in 3.36 ms against 3.67 fused, the fastest of its table, 2026-09-27; T175's condition to
+// reverse NORM_QUANTIZE, here chosen on the device)
 const TOKEN_FORMS = [{ name: "llama.cpp, fused (T150)", dp4a: false, subgroups: false },
   { name: "llama.cpp, fused (T150), subgroups", dp4a: false, subgroups: true },
-  { name: "DP4A, fused (T175)", dp4a: true, subgroups: false }];
+  { name: "DP4A, fused (T175)", dp4a: true, subgroups: false },
+  { name: "DP4A, fused (T175), the norms apart", dp4a: true, subgroups: false, normApart: true }];
 function tokenCandidates(m) {
   const features = navigator.gpu.wgslLanguageFeatures;
   const subgroups = m.device.features.has("subgroups") && Boolean(features?.has("subgroup_id"));
@@ -913,8 +917,8 @@ function tokenCandidates(m) {
   return TOKEN_FORMS.filter((form) => (!form.subgroups || subgroups) && (!form.dp4a || packed));
 }
 // a form's WGSL, [key, code] each (the pipelines every form shares are compiled apart: tokenBuffers)
-const tokenCodes = (wgsl, { dp4a, subgroups }) => (dp4a
-  ? [["normQuantize", wgsl.NORM_QUANTIZE], ["qkv", wgsl.fusedDp4aMatVec({ output: "rope" })], ["add", wgsl.fusedDp4aMatVec({ output: "add" })],
+const tokenCodes = (wgsl, { dp4a, subgroups, normApart }) => (dp4a
+  ? [...(normApart ? [] : [["normQuantize", wgsl.NORM_QUANTIZE]]), ["qkv", wgsl.fusedDp4aMatVec({ output: "rope" })], ["add", wgsl.fusedDp4aMatVec({ output: "add" })],
     ["glu", wgsl.fusedDp4aMatVec({ output: "swiglu" })], ["classifier", wgsl.fusedDp4aMatVec({ output: "write" })]]
   : [["qkv", wgsl.fusedMatVec({ input: "norm", output: "rope", subgroups })], ["add", wgsl.fusedMatVec({ input: "plain", output: "add", subgroups })],
     ["glu", wgsl.fusedMatVec({ input: "norm", output: "swiglu", subgroups })], ["classifier", wgsl.fusedMatVec({ input: "norm", output: "write", subgroups })]]);
@@ -940,7 +944,7 @@ async function tokenBuffers(m) {
     gate: buffer(m, plan.hidden * 4), logits: buffer(m, vocab * 4, out), probs: buffer(m, vocab * 4), order: buffer(m, vocab * 4),
     state: buffer(m, wgsl.STATE_BYTES, out | COPY_DST), chosen: buffer(m, most * 4, out), randoms: buffer(m, most * 4, STORAGE | COPY_DST),
     step: buffer(m, 16, UNIFORM | COPY_DST), settings: buffer(m, wgsl.SAMPLING_BYTES, UNIFORM | COPY_DST),
-    xq: buffer(m, widest), xs: buffer(m, (widest / wgsl.GROUP) * 4),
+    xq: buffer(m, widest), xs: buffer(m, (widest / wgsl.GROUP) * 4), xb: buffer(m, plan.dim * 4),
     readback: buffer(m, most * 4 + wgsl.STATE_BYTES + 2 * plan.layers * most * kvDim * 2, MAP_READ | COPY_DST) };
   // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, qRows, kvRows, headSize, turned
   const params = (rows, n, second = 0, normAt = 0) => {
@@ -964,7 +968,8 @@ async function tokenBuffers(m) {
     qkv: layers.map((at) => params(qDim + 2 * kvDim, plan.dim, 0, at)), gateUp: layers.map((at) => params(plan.hidden, plan.dim, plan.hidden, at)),
     norm: layers.map(norm), final: norm(0), classifier: params(vocab, plan.dim),
     // QUANTIZE's (n, xStride): the attention's output, SwiGLU's
-    quantizeAttention: uniform(m, new Uint32Array([qDim, qDim, 0, 0])), quantizeGate: uniform(m, new Uint32Array([plan.hidden, plan.hidden, 0, 0])) };
+    quantizeAttention: uniform(m, new Uint32Array([qDim, qDim, 0, 0])), quantizeGate: uniform(m, new Uint32Array([plan.hidden, plan.hidden, 0, 0])),
+    quantizeNormed: uniform(m, new Uint32Array([plan.dim, plan.dim, 0, 0])) };
   return g;
 }
 
@@ -982,8 +987,10 @@ function tokenPass(m, form, { from = 0, to = m.plan.layers, head = true, embed =
     [pipeline, bindAt(m, pipeline, [[0, w], [1, s], ...input, [3, params], ...output]), ...spread(m, count, rows)];
   // what a matrix reads: the stream, normed on the read (T150), or the vector as it is; on DP4A its quantizing (T175)
   const read = form.dp4a ? () => [[2, g.xq], [4, g.xs]] : (x, weights) => [[2, x], ...(weights ? [[4, weights]] : [])];
-  const normed = (weights, params) => (form.dp4a
-    ? [[P.normQuantize, bindAt(m, P.normQuantize, [[0, g.h], [1, weights], [2, g.xq], [3, g.xs], [4, params], [5, g.step]]), 1, 1]] : []);
+  // (the norms apart: the prompt's RMSNORM into xb, then its QUANTIZE, as T175's form with the norms apart)
+  const normed = (weights, params) => (!form.dp4a ? []
+    : form.normApart ? [[m.norm, bind(m, m.norm, [g.h, weights, g.xb, params, g.step]), 1, 1], ...quantized(g.xb, g.u.quantizeNormed, plan.dim)]
+      : [[P.normQuantize, bindAt(m, P.normQuantize, [[0, g.h], [1, weights], [2, g.xq], [3, g.xs], [4, params], [5, g.step]]), 1, 1]]);
   const quantized = (x, params, n) => (form.dp4a
     ? [[m.quantize, bindAt(m, m.quantize, [[0, x], [1, g.xq], [2, g.xs], [3, params], [4, g.step]]), Math.ceil(n / wgsl.GROUP / 64), 1]] : []);
   const list = embed ? [[g.embed, bindAt(m, g.embed, [[0, m.tables.embedding.values], [1, m.tables.embedding.scales], [2, g.state], [3, g.h], [4, g.u.embed]]), 1, 1]] : [];

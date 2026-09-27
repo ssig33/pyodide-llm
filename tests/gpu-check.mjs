@@ -392,7 +392,7 @@ const forms = !adapter ? [] : wgsl.promptForms({ half: adapter.features.has("sha
 const features = navigator.gpu?.wgslLanguageFeatures;
 const tokenForms = !adapter ? [] : ["llama.cpp, fused (T150)",
   ...(adapter.features.has("subgroups") && features?.has("subgroup_id") ? ["llama.cpp, fused (T150), subgroups"] : []),
-  ...(features?.has("packed_4x8_integer_dot_product") ? ["DP4A, fused (T175)"] : [])];
+  ...(features?.has("packed_4x8_integer_dot_product") ? ["DP4A, fused (T175)", "DP4A, fused (T175), the norms apart"] : [])];
 try {
   const narrow = compileKernels(await fetched("/public/simdkernel_shared.wasm"), await fetched("/public/simdkernel_relaxed_shared.wasm"));
   const results = [];
