@@ -113,7 +113,7 @@ const LINES = {
   "deploy.yml": "^suite: |^--- .*: \\d+ s$",
   // T183: gpu-check's lines of each model and run, its tables by layer (against NumPy's and E16), each run's line and
   // ratio, and the seconds of each step
-  "gpu-prompt.yml": "^suite: |^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\| (layer|all|\\d)|^\\|---|^ *- |^seconds of |FAILED",
+  "gpu-prompt.yml": "^suite: |^## |layers, .* heads|^  .*: keys and values |^  a token|^keys and values of |^\\| (layer|all|\\d)|^\\|---|^ *- |^seconds of |FAILED",
 };
 
 // T193: the workflows whose full suites run every night

@@ -2,7 +2,7 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { promptTimes } from "../public/forward.js";
+import { promptTimes, tokenTimes } from "../public/forward.js";
 
 // a GPU with a fixed cost of 40 ms a block and 0.5 ms a token (16 tokens 48 ms, 64 tokens 72 ms)
 const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
@@ -66,5 +66,25 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   times.cpu(4, 1);
   assert.equal(times.of(16, 4).gpu, 80);
   assert.equal(times.of(64, 4).gpu, 80);
+}
+
+// T152: a generation's steps (tokenTimes): nothing before the GPU has a time and the CPU TIMED ones on the threads in
+// use; the GPU where a step takes less than 0.95 of the CPU's; the lower medians of the last five
+{
+  const steps = tokenTimes();
+  assert.equal(steps.of(4), null, "nothing timed");
+  steps.gpu(10);
+  steps.cpu(4, 12);
+  assert.equal(steps.of(4), null, "one CPU step is not enough");
+  steps.cpu(4, 12);
+  assert.deepEqual(steps.of(4), { cpu: 12, gpu: 10, faster: true }, "10 < 0.95 × 12");
+  assert.equal(steps.of(2), null, "another number of threads is timed anew");
+  for (const ms of [12, 12, 12]) steps.gpu(ms);
+  assert.equal(steps.of(4).faster, false, "12 is not below 0.95 × 12");
+  for (const ms of [5, 5, 50]) steps.gpu(ms);
+  assert.equal(steps.of(4).gpu, 12, "the lower median of the last five: 12, 12, 5, 5, 50");
+  steps.gpu(5);
+  assert.equal(steps.of(4).gpu, 5, "12, 5, 5, 50, 5");
+  assert.equal(steps.of(4).faster, true);
 }
 console.log("ok");

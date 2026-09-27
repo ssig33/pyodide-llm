@@ -45,6 +45,19 @@
 // gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
 // the native Python ($PYTHON, python3 by default).
 //
+// T152: a generation's steps on the GPU (forward.js's generateMany, gpu.js's fused layer of a token and SAMPLE), after
+// the prompt of a run whose GPU took them (the first, and one a form of a token's layer this adapter can make: each
+// forced): NumPy continues the prompt greedy for GEN tokens (its logits of each step, and the keys and values of their
+// positions); the GPU is asked for 4 steps greedy from the prompt's last token, the CPU then takes one step (the
+// forward pass on the keys and values the GPU wrote back), and the GPU 3 more (the CPU's position goes up to it first).
+// Checked: the ids are NumPy's, or where one is not, a near tie (NumPy's logit of it no farther below its largest than
+// twice the CPU's own logits from NumPy's, the difference of 7-bit activations: the steps after it are not compared,
+// their inputs differ); the keys and values of those positions in forward.js's cache against NumPy's, to the line of
+// the prompt's shader of the same arithmetic (float32 T147's GPU_LINE or K × E16; DP4A PACKED_LINE of the CPU's); a
+// stop token (NumPy's second) ends the steps after it; a sampled step (temperature 0.8, top-p 0.9, penalty 1.3, a
+// random number of 0.7) is a token the CPU's walk (shaders.js's walkLikeCpu) over NumPy's penalized logits reaches
+// within 2% of the mass of the random number's share (the GPU's logits are not NumPy's: T151's 1e-4 is for the same).
+//
 // T183: what a person reads to judge it, in the log of CI (the development machine does not run WebGPU's tests): E16,
 // how far NumPy's answer moves when nothing but its cache is rounded to float16 (answer(half=True), T153's review), and
 // for each model a table of the keys and values by layer, a column E16 and one a run (the CPU's, and the GPU's lettered
@@ -60,6 +73,7 @@ import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { pyodideWithEngine } from "./engine.mjs";
 import { MODELS } from "../src/models.js";
+import * as wgsl from "../public/shaders.js";
 
 const root = new URL("../", import.meta.url).pathname;
 const args = process.argv.slice(2);
@@ -84,6 +98,8 @@ const ids = (args.length ? args : ["made-up", "stories15M", "tiny-lm", "llm-jp-3
   .flatMap((id) => (id === "made-up" ? Object.keys(SYNTHETIC) : [id]));
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
+// T152: the greedy steps NumPy takes after the prompt, and the tie and the sampled step's share of the mass
+const GEN = 8, SAMPLED_BAND = 0.02;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
 // Dawn's lavapipe and this machine's SwiftShader, 149 tokens: two blocks of 64 and a part). The CPU's forward.js: 4.1e-2
 // to 3.2e-1 (its 7-bit activations; the made-up model's random weights the most). A GPU that is wrong lands far past
@@ -242,10 +258,20 @@ def answer(data, vocabulary, text, count, options, half=False, q8=False):
         numpy.forward(token, pos, need_logits=False)
     logits = numpy.forward(tokens[-1], count - 1)
     n = count - 1
-    kv = lambda cache: np.ascontiguousarray(cache[:, :, :n, :].transpose(0, 2, 1, 3).reshape(numpy.n_layers, n, -1), dtype=np.float32)
+    kv = lambda cache, at=0, m=n: np.ascontiguousarray(cache[:, :, at:at + m, :].transpose(0, 2, 1, 3).reshape(numpy.n_layers, m, -1), dtype=np.float32)
     b64 = lambda a: base64.b64encode(np.ascontiguousarray(a, dtype=np.float32).tobytes()).decode()
-    return {"tokens": tokens, "logits": b64(logits), "keys": b64(kv(numpy.key_cache)), "values": b64(kv(numpy.value_cache)),
-            "header": list(struct.unpack_from("<7i", data, 0))}
+    out = {"tokens": tokens, "logits": b64(logits), "keys": b64(kv(numpy.key_cache)), "values": b64(kv(numpy.value_cache)),
+           "header": list(struct.unpack_from("<7i", data, 0))}
+    if half:
+        return out
+    # T152: GEN greedy steps after the prompt: the ids, the logits of each step, the keys and values of their positions
+    greedy, rows = [], [np.array(logits, dtype=np.float32)]
+    for step in range(${GEN}):
+        greedy.append(int(np.argmax(rows[-1])))
+        if step < ${GEN} - 1:
+            rows.append(np.array(numpy.forward(greedy[-1], count + step), dtype=np.float32))
+    return {**out, "greedy": greedy, "greedyLogits": b64(np.stack(rows)), "greedyKeys": b64(kv(numpy.key_cache, n, ${GEN})),
+            "greedyValues": b64(kv(numpy.value_cache, n, ${GEN}))}
 
 def answers(data, vocabulary, text, count, options):
     """answer() and beside it: T153, the keys and values of answer(half=True); T187, its logits, and the keys, values
@@ -358,6 +384,11 @@ const forms = !adapter ? [] : wgsl.promptForms({ half: adapter.features.has("sha
   packed: navigator.gpu.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product"),
   memory: adapter.limits.maxComputeWorkgroupStorageSize, threads: adapter.limits.maxComputeInvocationsPerWorkgroup })
   .filter((form) => !form.none).map((form) => form.name).filter((name) => !ONLY.length || ONLY.some((part) => name.includes(part)));
+// T152: the forms of a token's layer this adapter can make (gpu.js's TOKEN_FORMS), each forced in a run of its own
+const features = navigator.gpu?.wgslLanguageFeatures;
+const tokenForms = !adapter ? [] : ["llama.cpp, fused (T150)",
+  ...(adapter.features.has("subgroups") && features?.has("subgroup_id") ? ["llama.cpp, fused (T150), subgroups"] : []),
+  ...(features?.has("packed_4x8_integer_dot_product") ? ["DP4A, fused (T175)"] : [])];
 try {
   const narrow = compileKernels(await fetched("/public/simdkernel_shared.wasm"), await fetched("/public/simdkernel_relaxed_shared.wasm"));
   const results = [];
@@ -376,7 +407,28 @@ try {
     // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU). T155: the
     // case's own (the pieces of its matrices)
     const TESTS = { fallback: true, always: true, ...c.force };
-    const run = async (gpu, gpuForce, gpuRemembered) => {
+    // T152: the steps of a generation (see the head of this file), where the GPU took them
+    const generation = (engine) => {
+      if (!engine.tokenBlock) return { why: engine.gpuTokensWhyNot ?? "the GPU took no steps", planned: engine.gpuTokensPlanned };
+      const greedy = c.reference.greedy, history = (ids) => [...tokens, ...ids];
+      const ask = (token, pos, before, count, settings = [0, 0.9, 1], randoms = [], stops = []) => {
+        const h = history(before);
+        return engine.generateMany(token, pos, h.slice(-64), h.length, count, ...settings, randoms, stops);
+      };
+      const out = { form: engine.gpuReady?.tokens, first: ask(tokens[n], n, [], 4) };
+      if (out.first && out.first.every((id, i) => id === greedy[i])) {
+        // the CPU's step, on the keys and values the GPU wrote back; then the GPU's, from the CPU's position up
+        engine.forward(greedy[3], n + 4);
+        out.cpuStep = Array.from(engine.logits()).reduce((best, x, i, xs) => (x > xs[best] ? i : best), 0);
+        out.second = ask(greedy[4], n + 5, greedy.slice(0, 5), 3);
+      }
+      const rows = engine.keysAndValues(n, 8);
+      Object.assign(out, { keys: b64(rows.keys), values: b64(rows.values) });
+      out.stopped = ask(tokens[n], n, [], 4, [0, 0.9, 1], [], [greedy[1]]);
+      out.sampled = ask(tokens[n], n, [], 1, [0.8, 0.9, 1.3], [0.7]);
+      return out;
+    };
+    const run = async (gpu, gpuForce, gpuRemembered, steps = false) => {
       const started = performance.now();
       const engine = createForward({ memory, base, size, kernels, plan, gpu, gpuForce: { ...TESTS, ...gpuForce }, gpuRemembered });
       const note = gpu ? await engine.gpu : undefined;
@@ -390,6 +442,8 @@ try {
       engine.forward(tokens[n], n);
       const logits = engine.logits().slice(), { keys, values } = engine.keysAndValues(0, n);
       const out = { note, ready, form: engine.gpuForm, attention: engine.gpuAttention, promptMs, gpuTokens, logits: b64(logits), keys: b64(keys), values: b64(values) };
+      // T152: a generation's steps on the GPU, where this run takes them (steps)
+      if (gpu && steps) out.steps = { ...generation(engine), forced: gpuForce.tokens };
       if (gpu) {
         // the same prompt again from position 0, all of it at once (one block of the GPU's): the GPU's keys and values
         // of the first run are written over
@@ -437,7 +491,13 @@ try {
     };
     const gpu = [];
     // (the forced ones untimed, T153: a block of 64 tokens of Qwen3 0.6B took more than the 180 s of a step on lavapipe)
-    for (const form of [undefined, ...forms]) gpu.push(await run(openGpu, form ? { matrices: form, quick: true } : {}));
+    for (const form of [undefined, ...forms]) gpu.push(await run(openGpu, form ? { matrices: form, quick: true } : {}, undefined, !form));
+    // T152: every form of a token's layer, forced, where the model's steps go to the GPU (not Qwen's, GPT-2's, GPT-NeoX's
+    // yet); in one piece each (a token's layer reads a matrix whole: the first run's pieces, T155, left the steps on
+    // the CPU)
+    if (gpu[0].steps?.planned !== false) {
+      for (const form of tokenForms) gpu.push(await run(openGpu, { matrices: forms[0], quick: true, tokens: form, pieceBytes: Infinity }, undefined, true));
+    }
     // the attention without subgroups or f16 (the lanes of the workgroup stand for a subgroup), where the adapter
     // has them and so chose the other
     if (forms.length) gpu.push(await run(openGpu, { matrices: forms[0], attention: "llama.cpp flash attention tiles", quick: true }));
@@ -476,7 +536,8 @@ const server = http.createServer((req, res) => {
   const found = cases.find((c) => c.checkpoint === pathname);
   if (pathname === "/") return send(types[".html"], PAGE);
   if (pathname === "/harness.js") return send(types[".js"], `const ONLY = ${JSON.stringify(only ? only.split(",") : [])};\n${HARNESS}`);
-  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, reference: { tokens, header }, ...c }) => ({ ...c, reference: { tokens, header } }))));
+  // (T152: and NumPy's greedy ids after the prompt, which the harness feeds the GPU's steps)
+  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, reference: { tokens, header, greedy }, ...c }) => ({ ...c, reference: { tokens, header, greedy } }))));
   if (found) return send("application/octet-stream", fs.readFileSync(found.file));
   const file = path.join(root, "public", pathname.replace(/^\/public\//, ""));
   if (!pathname.startsWith("/public/") || !fs.existsSync(file)) {
@@ -699,10 +760,62 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       `the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
+    if (gpu.steps) failed ||= !stepsRight(c, gpu.steps, { cpuKv, e16, cpuLogits, kvDim });
   }
   layerTables(c, cpu, runs, measures);
 }
 process.exit(failed ? 1 : 0);
+
+// T152: the steps of a generation on the GPU against NumPy's greedy continuation (see the head of this file): a line
+// "  a token by <form>: ..." and whether it is right
+function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
+  const ref = c.reference, greedy = ref.greedy, vocab = floats(ref.logits).length;
+  const rows = floats(ref.greedyLogits), logitsOf = (i) => rows.subarray(i * vocab, (i + 1) * vocab);
+  const failures = [], said = [];
+  // a model whose steps stay on the CPU (not asked of the GPU), or the run in pieces (T155: a token's layer reads a
+  // matrix whole): said, and right
+  if (steps.why) {
+    const right = steps.planned === false || (c.force?.pieceBytes && !steps.forced && /past a buffer/.test(steps.why));
+    console.log(`  a token: on the CPU (${steps.why})${right ? "" : " — FAILED"}`);
+    return right;
+  }
+  // the ids against NumPy's, up to the first that is not NumPy's (a near tie: no farther below NumPy's largest logit
+  // than TIE times the CPU's own logits from NumPy's)
+  const tie = (i, id) => {
+    const logits = logitsOf(i), largest = logits.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+    return logits[greedy[i]] - logits[id] <= TIE * cpuLogits * largest;
+  };
+  const ids = [...(steps.first ?? []), ...(steps.second ? [steps.cpuStep, ...steps.second] : [])];
+  let same = 0;
+  for (; same < ids.length && ids[same] === greedy[same]; same++);
+  if (!steps.first || steps.first.length !== 4) failures.push(`the GPU's first 4 steps came back as ${JSON.stringify(steps.first)}`);
+  else if (same < ids.length && !tie(same, ids[same])) failures.push(`step ${same} is ${ids[same]}, NumPy's ${greedy[same]}, and not a near tie`);
+  else if (steps.first.every((id, i) => id === greedy[i]) && (!steps.second || steps.second.length !== 3)) failures.push(`the GPU's steps after the CPU's came back as ${JSON.stringify(steps.second)}`);
+  said.push(same === GEN ? `${GEN} of ${GEN} greedy ids as NumPy's` : `${same} greedy ids as NumPy's, then a near tie`);
+  // the keys and values of the positions whose inputs were NumPy's (the prompt's last token, then NumPy's ids)
+  const compared = Math.min(same + 1, GEN) * kvDim, layers = ref.header[2];
+  const byLayer = (b64) => Array.from({ length: layers }, (_, l) => floats(b64).subarray(l * GEN * kvDim, l * GEN * kvDim + compared));
+  const worst = (got, want) => Math.max(...byLayer(got).map((layer, l) => worstRow(layer, byLayer(want)[l], kvDim)));
+  const kvOff = Math.max(worst(steps.keys, ref.greedyKeys), worst(steps.values, ref.greedyValues));
+  const packed = /DP4A/.test(steps.form ?? "");
+  const line = packed ? PACKED_LINE * cpuKv : Math.max(GPU_LINE, K.float32 * e16);
+  if (!(kvOff <= line)) failures.push(`the keys and values of the steps are ${kvOff.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
+  said.push(`keys and values ${kvOff.toExponential(2)} (line ${line.toExponential(2)})`);
+  // a stop token: NumPy's second id ends the steps after it
+  const until = greedy.indexOf(greedy[1]) + 1, wanted = greedy.slice(0, until);
+  if (same >= until && JSON.stringify(steps.stopped) !== JSON.stringify(wanted)) failures.push(`with ${greedy[1]} a stop token the steps were ${JSON.stringify(steps.stopped)}, not ${JSON.stringify(wanted)}`);
+  said.push(`a stop token after ${steps.stopped?.length} steps`);
+  // a sampled step against the CPU's walk over NumPy's logits, penalized as the CPU penalizes them
+  const logits = logitsOf(0).slice();
+  wgsl.penalizeLikeCpu(logits, ref.tokens, 1.3);
+  const walk = wgsl.walkLikeCpu(logits, 0.8, 0.9), goal = 0.7 * walk.mass, band = SAMPLED_BAND * walk.mass;
+  const reached = walk.tokens.filter((_, k) => walk.cumulative[k] > goal - band && (k ? walk.cumulative[k - 1] : 0) <= goal + band);
+  const drawn = steps.sampled?.[0];
+  if (!reached.includes(drawn)) failures.push(`the sampled step is ${drawn}, the CPU's walk reaches ${reached.join(" or ")}`);
+  said.push(`sampled ${drawn} (the CPU's walk: ${reached.join(" or ")})`);
+  console.log(`  a token by ${steps.form}: ${said.join(", ")}${failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""}`);
+  return !failures.length;
+}
 
 // T183: what a person reads in the log of CI to judge the numbers (Markdown: gpu-prompt.yml puts the log in the run's
 // summary too). A table of the keys and values by layer against NumPy's, with E16's column (NumPy's with its cache in

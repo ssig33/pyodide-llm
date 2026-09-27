@@ -23,6 +23,14 @@
 //                                    { type: "failed", reason }. Nothing is written where words.wanted is no longer
 //                                    serial: forward.js gave the request up (T147: a worker that went on late must not
 //                                    write into a memory that may hold the next model by then)
+//   { type: "tokens", serial, count, pos, from, token, history, length, cache, settings, randoms }
+//                                    T152: count steps of a generation from token at pos (the forward pass and the
+//                                    sampling of each, SAMPLE's), after the keys and values of positions from to pos - 1
+//                                    went up from forward.js's cache; the ids into plan.tokens.ids and the keys and
+//                                    values of their positions into that cache (see generate() below). The answer is
+//                                    in the control area as a prompt's. Where plan.tokens asks for it, "ready" says
+//                                    tokens ({ form, ms, forms, remembered }: the layer of a token chosen here and its
+//                                    ms a step) or tokensWhy (why they stay on the CPU)
 //   { type: "stop" }                 every buffer and the device let go, and the worker ends
 //
 // A block goes as one submission: per layer the RMSNorm, the matrices of q, k and v (each weight read once for the
@@ -65,6 +73,7 @@ let starting = false, stopping = false, lost = null;
 onmessage = ({ data }) => {
   if (data.type === "start") start(data.memory, data.plan);
   else if (data.type === "prompt") prompt(data);
+  else if (data.type === "tokens") generate(data);
   else if (data.type === "stop") stop();
 };
 
@@ -138,9 +147,23 @@ async function start(memory, plan) {
     // (not for the page's tests: SwiftShader took more than STEP_MS to time Llama 3.2 1B's shaders, T147 in CI)
     const blocks = plan.force.quick ? [] : await within(timeBlocks(model), "timing a block");
     if (stopping) return end();
+    // T152: a token and the ones after it, where the model's layers were put up for them (tokensLayout). What fails
+    // here leaves the tokens on the CPU and the prompts on the GPU
+    if (plan.tokens && !model.tokensWhy) {
+      try {
+        await chooseTokens(model);
+      } catch (error) {
+        model.tokensWhy = String(error?.message ?? error);
+        model.gen = null;
+      }
+      if (stopping) return end();
+    }
     if (lost) return unusable(lost);
+    const g = model.gen;
     postMessage({ type: "ready", adapter: describe(adapter), key, bytes, seconds: (performance.now() - began) / 1000,
-      form: model.form.name, attention: model.attention.name, forms: model.forms, remembered: Boolean(model.form.remembered), blocks });
+      form: model.form.name, attention: model.attention.name, forms: model.forms, remembered: Boolean(model.form.remembered), blocks,
+      tokens: g?.form ? { form: g.form.name, ms: g.ms, forms: g.forms, remembered: g.forms.some((f) => f.remembered) } : null,
+      tokensWhy: plan.tokens ? model.tokensWhy ?? null : undefined });
   } catch (error) {
     unusable(String(error?.message ?? error));
   } finally {
@@ -162,8 +185,10 @@ const adapterKey = (adapter) => {
 // the shaders' own text (the tiled ones this device can make, and the small steps'), as a short hash (FNV-1a)
 function shadersKey(wgsl, forms) {
   let hash = 0x811c9dc5;
+  // (T152: and a token's)
   for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
-    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile), wgsl.LAYER_NORM, wgsl.GELU]) {
+    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile), wgsl.LAYER_NORM, wgsl.GELU, wgsl.EMBED, wgsl.SAMPLE, wgsl.NORM_QUANTIZE,
+    String(wgsl.fusedMatVec), String(wgsl.fusedDp4aMatVec)]) {
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
   }
   return (hash >>> 0).toString(16);
@@ -203,14 +228,14 @@ function uniform(m, data, owned = m.owned) {
   m.device.queue.writeBuffer(made, 0, data);
   return made;
 }
-// bytes of the shared memory at address onto the GPU, a CHUNK at a time through a copy
+// bytes of the shared memory at address onto the GPU (at offset of target), a CHUNK at a time through a copy
 let scratch;
-function copyIn(m, target, address, bytes) {
+function copyIn(m, target, address, bytes, offset = 0) {
   scratch ??= new Uint8Array(CHUNK);
   for (let done = 0; done < bytes; done += CHUNK) {
     const n = Math.min(CHUNK, bytes - done);
     scratch.set(new Uint8Array(m.memory.buffer, address + done, n));
-    m.device.queue.writeBuffer(target, done, scratch, 0, n);
+    m.device.queue.writeBuffer(target, offset + done, scratch, 0, n);
   }
 }
 async function readBack(m, source, bytes) {
@@ -257,23 +282,38 @@ function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
 // one of scales each; int6 (plan.matrices' six) widened to int8 on the way (widener), its scales as they are (the
 // quarter of an int6 group's is already the int8 values' scale, T98). The addresses are Numbers in a 64-bit memory too
 // (exact to 2^53; the views and copies take them as they are)
+// T152: where a token goes on the GPU too (plan.tokens), q, k and v are one matrix a layer, and gate and up one (the
+// layer of a token reads them so: shaders.js's fusedMatVec and fusedDp4aMatVec, T150 and T175), each a range of it for
+// the prompt's tiled shaders (tokensLayout), and the classifier, the embedding, the final norm and RoPE's table go up
+// as well (uploadTokens)
 async function upload(m) {
   const { plan } = m, group = m.wgsl.GROUP;
   let bytes = 0;
   m.matrices = Object.fromEntries(Object.entries(plan.matrices).map(([name, { rows, n }]) =>
     [name, { rows, n, pieces: piecesOf(m, rows, n).map(([first, count]) => ({ first, rows: count, layers: [] })) }]));
-  const widen = Object.values(plan.matrices).some((matrix) => matrix.six) ? await widener(m) : null;
+  const together = plan.tokens ? tokensLayout(m) : null;
+  const tables = together ? Object.values(tablesOf(plan)) : [];
+  const six = [...Object.values(plan.matrices), ...tables].some((matrix) => matrix.six);
+  const widen = six ? await widener(m, tables) : null;
   try {
     for (let l = 0; l < plan.layers; l++) {
+      // a layer's matrices that are one (T152): a buffer of values and one of scales for all of them
+      const joined = together && Object.fromEntries(Object.entries(together.sizes).map(([name, [valueBytes, scaleBytes]]) =>
+        [name, [buffer(m, valueBytes, STORAGE | COPY_DST), buffer(m, scaleBytes, STORAGE | COPY_DST)]]));
+      if (joined) (m.joined ??= []).push(joined);
       for (const [name, matrix] of Object.entries(plan.matrices)) {
         const [valuesAt, scalesAt] = matrix.layers[l];
+        const home = together?.homes[name];
         for (const piece of m.matrices[name].pieces) {
           const valueBytes = piece.rows * matrix.n, scaleBytes = (valueBytes / group) * 4;
-          const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
+          // its own buffers, or its range of the layer's joined ones
+          const [values, scales] = home
+            ? joined[home.joined].map((b, i) => ({ buffer: b, offset: home.at[i], size: i ? scaleBytes : valueBytes }))
+            : [buffer(m, valueBytes, STORAGE | COPY_DST), buffer(m, scaleBytes, STORAGE | COPY_DST)];
           // an int6 row is 3/4 of an int8 one (24 bytes a group of 32)
           if (matrix.six) widen.into(values, valuesAt + (piece.first * matrix.n * 3) / 4, valueBytes / group);
-          else copyIn(m, values, valuesAt + piece.first * matrix.n, valueBytes);
-          copyIn(m, scales, scalesAt + (piece.first * matrix.n / group) * 4, scaleBytes);
+          else copyIn(m, values.buffer ?? values, valuesAt + piece.first * matrix.n, valueBytes, values.offset ?? 0);
+          copyIn(m, scales.buffer ?? scales, scalesAt + (piece.first * matrix.n / group) * 4, scaleBytes, scales.offset ?? 0);
           piece.layers.push([values, scales]);
           bytes += valueBytes + scaleBytes;
         }
@@ -282,6 +322,7 @@ async function upload(m) {
       await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
       if (stopping) return bytes;
     }
+    if (together) bytes += await uploadTokens(m, widen);
   } finally {
     widen?.done();
   }
@@ -310,16 +351,91 @@ function piecesOf(m, rows, n) {
   return Array.from({ length: Math.ceil(rows / step) }, (_, i) => [i * step, Math.min(step, rows - i * step)]);
 }
 
+// T152: the tables a token needs besides the layers (plan.tokens): the classifier, and the embedding where it is
+// another table (else the classifier is the embedding too)
+const tablesOf = (plan) => ({ classifier: plan.tokens.classifier, ...(plan.tokens.embedding ? { embedding: plan.tokens.embedding } : {}) });
+// T152: how a token's layer holds its matrices (shaders.js's fusedMatVec and fusedDp4aMatVec read q, k and v as one
+// matrix, gate and up as one, up's rows after gate's): a buffer of values and one of scales a layer for each (sizes),
+// and each matrix's range of them (homes: its offsets in bytes), which the prompt's tiled shaders bind as a matrix of
+// its own. A range must start where the device binds a buffer (minStorageBufferOffsetAlignment: a matrix of a
+// multiple of 2048 weights, the values and the scales alike at 256; stories15M's k starts at 82944 weights, T150's
+// (b)), and a matrix a token reads must be one piece (T155), as must the tables. null where it cannot, and why in
+// m.tokensWhy: the prompts go on the GPU as before, the tokens stay on the CPU
+function tokensLayout(m) {
+  const { plan } = m, align = m.device.limits.minStorageBufferOffsetAlignment, group = m.wgsl.GROUP;
+  const why = (reason) => {
+    m.tokensWhy = reason;
+    return null;
+  };
+  for (const name of ["wo", "w2"]) if (m.matrices[name].pieces.length > 1) return why(`${name} is past a buffer of this GPU`);
+  const homes = {}, sizes = {};
+  for (const [joined, names] of Object.entries({ qkv: ["wq", "wk", "wv"], gateUp: ["w1", "w3"] })) {
+    let values = 0, scales = 0;
+    for (const name of names) {
+      const matrix = m.matrices[name];
+      if (matrix.pieces.length > 1) return why(`${name} is past a buffer of this GPU`);
+      if (values % align || scales % align) {
+        return why(`${names.join(", ")} as one matrix would not start ${name} where this GPU binds a buffer (every ${align} bytes)`);
+      }
+      homes[name] = { joined, at: [values, scales] };
+      values += matrix.rows * matrix.n;
+      scales += (matrix.rows * matrix.n / group) * 4;
+    }
+    if (values > m.limit) return why(`${names.join(", ")} as one matrix are past a buffer of this GPU`);
+    sizes[joined] = [values, scales];
+  }
+  for (const [name, { rows, n }] of Object.entries(tablesOf(plan))) {
+    if (rows * n > m.limit) return why(`the ${name} is past a buffer of this GPU`);
+  }
+  return { homes, sizes };
+}
+// T152: the tables onto the GPU (int6 widened as a layer's matrices are), the final norm's weights, and RoPE's table
+// of every position, a row a position: the cos of its headSize / 2 angles, then their sin (shaders.js's fusedMatVec
+// reads it so, T151; from the CPU's two tables, Llama 3's scaling in them)
+async function uploadTokens(m, widen) {
+  const { plan } = m, group = m.wgsl.GROUP, half = plan.headSize / 2;
+  let bytes = 0;
+  const table = ({ rows, n, six, at: [valuesAt, scalesAt] }) => {
+    const valueBytes = rows * n, scaleBytes = (valueBytes / group) * 4;
+    const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
+    if (six) widen.into(values, valuesAt, valueBytes / group);
+    else copyIn(m, values, valuesAt, valueBytes);
+    copyIn(m, scales, scalesAt, scaleBytes);
+    bytes += valueBytes + scaleBytes;
+    return { values, scales };
+  };
+  const classifier = table(plan.tokens.classifier);
+  m.tables = { classifier, embedding: plan.tokens.embedding ? table(plan.tokens.embedding) : classifier };
+  m.finalNorm = buffer(m, plan.dim * 4, STORAGE | COPY_DST);
+  copyIn(m, m.finalNorm, plan.tokens.final, plan.dim * 4);
+  m.angleTable = buffer(m, plan.seqLen * plan.headSize * 4, STORAGE | COPY_DST);
+  const rows = Math.max(1, Math.floor(CHUNK / (plan.headSize * 4))), chunk = new Float32Array(rows * plan.headSize);
+  for (let p = 0; p < plan.seqLen; p += rows) {
+    const count = Math.min(rows, plan.seqLen - p);
+    for (let r = 0; r < count; r++) {
+      chunk.set(new Float32Array(m.memory.buffer, plan.cos + (p + r) * half * 4, half), r * plan.headSize);
+      chunk.set(new Float32Array(m.memory.buffer, plan.sin + (p + r) * half * 4, half), r * plan.headSize + half);
+    }
+    m.device.queue.writeBuffer(m.angleTable, p * plan.headSize * 4, chunk, 0, count * plan.headSize);
+  }
+  bytes += plan.dim * 4 + plan.seqLen * plan.headSize * 4;
+  await within(m.device.queue.onSubmittedWorkDone(), "the classifier's weights");
+  return bytes;
+}
+
 // T155: shaders.js's WIDEN_SIX compiled and checked against JavaScript (sixValues), and into(values, address, groups):
-// groups of int6 at address in the shared memory widened into values (a buffer of int8) on the GPU. The packed bytes go
+// groups of int6 at address in the shared memory widened into values (a buffer of int8, or T152 a range of one) on
+// the GPU. The packed bytes go
 // through one buffer of their own, written again for every piece (the queue runs a write after the submissions before
 // it); done() lets it go.
-async function widener(m) {
+async function widener(m, tables = []) {
   const { device, wgsl } = m;
   const pipeline = await within(validated(m, () => pipelineOf(m, wgsl.WIDEN_SIX)), "compiling the widening of int6");
   const owned = [];
+  // (T152: and the classifier's and the embedding's, one piece each)
   const largest = Math.max(CHECK_GROUPS * 24, ...Object.entries(m.plan.matrices).filter(([, matrix]) => matrix.six)
-    .flatMap(([name, { n }]) => m.matrices[name].pieces.map((piece) => (piece.rows * n * 3) / 4)));
+    .flatMap(([name, { n }]) => m.matrices[name].pieces.map((piece) => (piece.rows * n * 3) / 4)),
+  ...tables.filter((table) => table.six).map(({ rows, n }) => (rows * n * 3) / 4));
   const packed = buffer(m, largest, STORAGE | COPY_DST, owned);
   const run = (values, groups, most = device.limits.maxComputeWorkgroupsPerDimension) => {
     const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
@@ -766,18 +882,436 @@ async function timeBlocks(m) {
   return counts.map((count, i) => ({ count, ms: times[i].sort((a, b) => a - b)[times[i].length >> 1] }));
 }
 
+// ---- T152: tokens on the GPU. A step of the engine's generate() (the forward pass of the token fed, the sampling of
+// the next) as one compute pass of shaders.js's T151 run: EMBED of the state's token, every layer in a fused form, the
+// final norm and the classifier, SAMPLE (the penalty, softmax, top-p and the draw, with the random number the CPU drew
+// for the step), after which the state's first four words go to the Step uniform for the next pass (a uniform is not a
+// shader's to write). plan.tokens.most steps a submission, their ids read back once (T151: the wait of a submission,
+// 3 to 8.6 ms on the owner's Android, T134, is paid once for them), with the keys and values of their positions, which
+// go into forward.js's cache as the CPU would have written them: the CPU may take the next step, or the next
+// generation, at any position. The keys and values the GPU does not hold (positions the CPU computed since) go up from
+// forward.js's cache first: float16 there as here (T110, T147).
+//
+// The form of a layer, from those this device can make: T150's fusedMatVec (llama.cpp's mul_mat_vec, with the norm on
+// its read and RoPE, the residual's add or SwiGLU on its write) with the workgroup's reduction, the same with
+// subgroupAdd where there are subgroups, and T175's fusedDp4aMatVec (ORT's DP4A for small M, the vector quantized
+// before each matrix, NORM_QUANTIZE where a norm is) where there is the packed int8 dot. Each is checked against
+// JavaScript on the model's own weights (checkTokens), and the right ones are timed, a run of plan.tokens.most steps
+// each in turn: the fastest is taken (T150's and T175's tables left which is fastest to the device: the owner's
+// Android read a layer at 18.5% of its buffer's reads with mul_mat_vec and a matrix at 96.8% with DP4A). The attention
+// is the prompt's (llama.cpp's flash attention with tiles, T147, for one token: T150's (a), a KV-split form is left for
+// long contexts), on this pass's q. Where it came from: the run of T151 (public/benchmark/gpu.js's generate()), whose
+// form is WebLLM's decode loop without its sync of every token (web-llm, src/llm_chat.ts; no line taken) and llama.cpp's
+// WebGPU graph of a token, one command encoder for all of it (ggml-webgpu.cpp, commit 2145525a, MIT; no line taken).
+const TOKEN_FORMS = [{ name: "llama.cpp, fused (T150)", dp4a: false, subgroups: false },
+  { name: "llama.cpp, fused (T150), subgroups", dp4a: false, subgroups: true },
+  { name: "DP4A, fused (T175)", dp4a: true, subgroups: false }];
+function tokenCandidates(m) {
+  const features = navigator.gpu.wgslLanguageFeatures;
+  const subgroups = m.device.features.has("subgroups") && Boolean(features?.has("subgroup_id"));
+  const packed = Boolean(features?.has("packed_4x8_integer_dot_product"));
+  return TOKEN_FORMS.filter((form) => (!form.subgroups || subgroups) && (!form.dp4a || packed));
+}
+// a form's WGSL, [key, code] each (the pipelines every form shares are compiled apart: tokenBuffers)
+const tokenCodes = (wgsl, { dp4a, subgroups }) => (dp4a
+  ? [["normQuantize", wgsl.NORM_QUANTIZE], ["qkv", wgsl.fusedDp4aMatVec({ output: "rope" })], ["add", wgsl.fusedDp4aMatVec({ output: "add" })],
+    ["glu", wgsl.fusedDp4aMatVec({ output: "swiglu" })], ["classifier", wgsl.fusedDp4aMatVec({ output: "write" })]]
+  : [["qkv", wgsl.fusedMatVec({ input: "norm", output: "rope", subgroups })], ["add", wgsl.fusedMatVec({ input: "plain", output: "add", subgroups })],
+    ["glu", wgsl.fusedMatVec({ input: "norm", output: "swiglu", subgroups })], ["classifier", wgsl.fusedMatVec({ input: "norm", output: "write", subgroups })]]);
+
+// a bind group of the bindings given ([binding, a buffer or a range of one] each: the fused shaders skip binding 4
+// where the norm is not on their read)
+const bindAt = (m, pipeline, entries) => m.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+  entries: entries.map(([binding, buffer]) => ({ binding, resource: buffer.buffer ? buffer : { buffer } })) });
+
+// The buffers and uniforms of a token, and the pipelines every form shares (EMBED, SAMPLE; QUANTIZE and the attention
+// are the prompt's). A token's vectors: the stream h, q, the attention's output, SwiGLU's; the logits and SAMPLE's two
+// scratch arrays of the vocabulary; the state, the ids, the random numbers, the Step and the settings; the quantized
+// vector (DP4A: one serves every quantization of a token, each read before the next is made: T175's (l)); what a
+// submission reads back (the ids, the state, and the keys and values of its positions, [keys, values][layer][step])
+async function tokenBuffers(m) {
+  const { plan, wgsl } = m, most = plan.tokens.most, vocab = plan.tokens.classifier.rows;
+  const qDim = plan.heads * plan.headSize, kvDim = plan.kvHeads * plan.headSize, widest = Math.max(plan.dim, qDim, plan.hidden);
+  // (one at a time: each in an error scope of its own)
+  const embed = await within(validated(m, () => pipelineOf(m, wgsl.EMBED)), "compiling the embedding's row");
+  const sample = await within(validated(m, () => pipelineOf(m, wgsl.SAMPLE)), "compiling the sampling");
+  const out = STORAGE | COPY_SRC;
+  const g = { embed, sample, most, vocab, h: buffer(m, plan.dim * 4, out | COPY_DST), q: buffer(m, qDim * 4), att: buffer(m, qDim * 4),
+    gate: buffer(m, plan.hidden * 4), logits: buffer(m, vocab * 4, out), probs: buffer(m, vocab * 4), order: buffer(m, vocab * 4),
+    state: buffer(m, wgsl.STATE_BYTES, out | COPY_DST), chosen: buffer(m, most * 4, out), randoms: buffer(m, most * 4, STORAGE | COPY_DST),
+    step: buffer(m, 16, UNIFORM | COPY_DST), settings: buffer(m, wgsl.SAMPLING_BYTES, UNIFORM | COPY_DST),
+    xq: buffer(m, widest), xs: buffer(m, (widest / wgsl.GROUP) * 4),
+    readback: buffer(m, most * 4 + wgsl.STATE_BYTES + 2 * plan.layers * most * kvDim * 2, MAP_READ | COPY_DST) };
+  // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, qRows, kvRows, headSize, turned
+  const params = (rows, n, second = 0, normAt = 0) => {
+    const bytes = new ArrayBuffer(48);
+    new Uint32Array(bytes).set([rows, n / 4, n / wgsl.GROUP, second, 0, normAt, qDim, kvDim, plan.headSize, plan.turned, 0, 0]);
+    new Float32Array(bytes, 16, 1)[0] = plan.eps;
+    return uniform(m, bytes);
+  };
+  // RMSNORM's and NORM_QUANTIZE's Norm: size, at, eps
+  const norm = (at) => {
+    const bytes = new ArrayBuffer(16);
+    new Uint32Array(bytes, 0, 2).set([plan.dim, at]);
+    new Float32Array(bytes, 8, 1)[0] = plan.eps;
+    return uniform(m, bytes);
+  };
+  const flash = new ArrayBuffer(16);
+  new Uint32Array(flash, 0, 2).set([plan.heads, plan.kvHeads]);
+  new Float32Array(flash, 8, 1)[0] = 1 / Math.sqrt(plan.headSize);
+  const layers = [...Array(plan.layers)].map((_, l) => l * plan.dim);
+  g.u = { embed: uniform(m, new Uint32Array([plan.dim, 0, 0, 0])), flash: uniform(m, flash), o: params(plan.dim, qDim), down: params(plan.dim, plan.hidden),
+    qkv: layers.map((at) => params(qDim + 2 * kvDim, plan.dim, 0, at)), gateUp: layers.map((at) => params(plan.hidden, plan.dim, plan.hidden, at)),
+    norm: layers.map(norm), final: norm(0), classifier: params(vocab, plan.dim),
+    // QUANTIZE's (n, xStride): the attention's output, SwiGLU's
+    quantizeAttention: uniform(m, new Uint32Array([qDim, qDim, 0, 0])), quantizeGate: uniform(m, new Uint32Array([plan.hidden, plan.hidden, 0, 0])) };
+  return g;
+}
+
+// the workgroups of rows by the fused shaders' rows a workgroup, over x and then y (they number them so)
+function spread(m, rows, perGroup) {
+  const groups = Math.ceil(rows / perGroup), across = Math.min(groups, m.device.limits.maxComputeWorkgroupsPerDimension);
+  return [across, Math.ceil(groups / across)];
+}
+// The dispatches of one step in a form: EMBED, the layers (from, to: those of a check), the head (the final norm and
+// the classifier) and SAMPLE, [pipeline, bind group, x, y] each
+function tokenPass(m, form, { from = 0, to = m.plan.layers, head = true, embed = true } = {}) {
+  const { plan, wgsl, gen: g } = m, V = m.vectors, P = form.pipes, cache = m.cache, qDim = plan.heads * plan.headSize;
+  const rows = form.dp4a ? wgsl.ORT_DP4A_MATVEC_ROWS : wgsl.MUL_MAT_VEC_ROWS;
+  const matrix = (pipeline, [w, s], input, params, count, output) =>
+    [pipeline, bindAt(m, pipeline, [[0, w], [1, s], ...input, [3, params], ...output]), ...spread(m, count, rows)];
+  // what a matrix reads: the stream, normed on the read (T150), or the vector as it is; on DP4A its quantizing (T175)
+  const read = form.dp4a ? () => [[2, g.xq], [4, g.xs]] : (x, weights) => [[2, x], ...(weights ? [[4, weights]] : [])];
+  const normed = (weights, params) => (form.dp4a
+    ? [[P.normQuantize, bindAt(m, P.normQuantize, [[0, g.h], [1, weights], [2, g.xq], [3, g.xs], [4, params], [5, g.step]]), 1, 1]] : []);
+  const quantized = (x, params, n) => (form.dp4a
+    ? [[m.quantize, bindAt(m, m.quantize, [[0, x], [1, g.xq], [2, g.xs], [3, params], [4, g.step]]), Math.ceil(n / wgsl.GROUP / 64), 1]] : []);
+  const list = embed ? [[g.embed, bindAt(m, g.embed, [[0, m.tables.embedding.values], [1, m.tables.embedding.scales], [2, g.state], [3, g.h], [4, g.u.embed]]), 1, 1]] : [];
+  for (let l = from; l < to; l++) {
+    const { qkv, gateUp } = m.joined[l], [o] = m.matrices.wo.pieces, [down] = m.matrices.w2.pieces;
+    list.push(...normed(V.attention, g.u.norm[l]),
+      matrix(P.qkv, qkv, read(g.h, V.attention), g.u.qkv[l], qDim + 2 * plan.kvHeads * plan.headSize,
+        [[5, g.q], [6, cache.keys[l]], [7, cache.values[l]], [8, m.angleTable], [9, g.step]]),
+      [m.attention.pipeline, bind(m, m.attention.pipeline, [g.q, cache.keys[l], cache.values[l], g.att, g.u.flash, g.step]), plan.heads, 1],
+      ...quantized(g.att, g.u.quantizeAttention, qDim), matrix(P.add, o.layers[l], read(g.att), g.u.o, plan.dim, [[5, g.h]]),
+      ...normed(V.ffn, g.u.norm[l]), matrix(P.glu, gateUp, read(g.h, V.ffn), g.u.gateUp[l], plan.hidden, [[5, g.gate]]),
+      ...quantized(g.gate, g.u.quantizeGate, plan.hidden), matrix(P.add, down.layers[l], read(g.gate), g.u.down, plan.dim, [[5, g.h]]));
+  }
+  if (head) {
+    list.push(...normed(m.finalNorm, g.u.final),
+      matrix(P.classifier, [m.tables.classifier.values, m.tables.classifier.scales], read(g.h, m.finalNorm), g.u.classifier, g.vocab, [[5, g.logits]]),
+      [g.sample, bindAt(m, g.sample, [[0, g.logits], [1, g.probs], [2, g.order], [3, g.state], [4, g.chosen], [5, g.randoms], [6, g.settings]]), 1, 1]);
+  }
+  return list;
+}
+// a form's whole step, made again when the cache has grown (its buffers are others then)
+function tokenStep(m, form) {
+  if (form.step?.cache !== m.cache) form.step = { cache: m.cache, list: tokenPass(m, form) };
+  return form.step.list;
+}
+// count steps of the dispatches from the state given (with the settings and a random number a step), in one
+// submission, and read back: the ids and the state's words, and (keep) the keys and values of the positions pos to
+// pos + count - 1. extra(encoder): what a check copies out besides. Returns { ids, sampled, stopped, kv: [keys,
+// values][layer], the positions' rows of float16 as bytes }
+async function runTokens(m, dispatches, { count, pos, state, settings, randoms, keep = false, extra }) {
+  const { device, plan, wgsl, gen: g } = m, kvRow = plan.kvHeads * plan.headSize * 2, idsBytes = g.most * 4;
+  if (pos + count > m.cache.capacity) throw new Error(`positions to ${pos + count} are past the GPU's cache`);
+  device.pushErrorScope("out-of-memory");
+  device.pushErrorScope("validation");
+  device.queue.writeBuffer(g.state, 0, state);
+  device.queue.writeBuffer(g.step, 0, state, 0, 4);
+  if (settings) device.queue.writeBuffer(g.settings, 0, settings);
+  device.queue.writeBuffer(g.randoms, 0, randoms ?? new Float32Array(count));
+  const encoder = device.createCommandEncoder();
+  for (let i = 0; i < count; i++) {
+    const pass = encoder.beginComputePass();
+    for (const [pipeline, group, x, y] of dispatches) dispatch(pass, pipeline, group, x, y);
+    pass.end();
+    // the Step of the next pass: the state's first four words
+    encoder.copyBufferToBuffer(g.state, 0, g.step, 0, 16);
+  }
+  encoder.copyBufferToBuffer(g.chosen, 0, g.readback, 0, count * 4);
+  encoder.copyBufferToBuffer(g.state, 0, g.readback, idsBytes, wgsl.STATE_BYTES);
+  const kvAt = idsBytes + wgsl.STATE_BYTES;
+  if (keep) {
+    for (let l = 0; l < plan.layers; l++) {
+      encoder.copyBufferToBuffer(m.cache.keys[l], pos * kvRow, g.readback, kvAt + l * g.most * kvRow, count * kvRow);
+      encoder.copyBufferToBuffer(m.cache.values[l], pos * kvRow, g.readback, kvAt + (plan.layers + l) * g.most * kvRow, count * kvRow);
+    }
+  }
+  extra?.(encoder);
+  device.queue.submit([encoder.finish()]);
+  const invalid = await device.popErrorScope(), full = await device.popErrorScope();
+  if (invalid || full) throw new Error(`the GPU refused a token (${(invalid ?? full).message})`);
+  await g.readback.mapAsync(MAP_READ);
+  try {
+    const words = new Uint32Array(g.readback.getMappedRange(0, idsBytes + wgsl.STATE_BYTES).slice(0));
+    const after = words.subarray(g.most);
+    const out = { ids: words.slice(0, count), sampled: after[5], stopped: after[7] };
+    if (keep) {
+      const bytes = new Uint8Array(g.readback.getMappedRange(kvAt, 2 * plan.layers * g.most * kvRow).slice(0));
+      out.kv = [0, 1].map((side) => [...Array(plan.layers)].map((_, l) => {
+        const at = (side * plan.layers + l) * g.most * kvRow;
+        return bytes.subarray(at, at + count * kvRow);
+      }));
+    }
+    return out;
+  } finally {
+    g.readback.unmap();
+  }
+}
+
+// The forms of a token this device can make, compiled, checked and (where more than one is right) timed; the fastest
+// taken (m.gen.form), with what each came to (m.gen.forms) and its ms a step (m.gen.ms). plan.remembered.tokens: the
+// one the page kept for this adapter, alone where it is still right here. plan.force.tokens (tests): that form alone;
+// plan.force.quick: the first right one, untimed. Throws where none is right (the tokens then stay on the CPU)
+async function chooseTokens(m) {
+  const { plan, wgsl } = m;
+  m.gen = await tokenBuffers(m);
+  let forms = tokenCandidates(m);
+  if (plan.force.tokens) forms = forms.filter((form) => form.name === plan.force.tokens);
+  const kept = !plan.force.tokens && forms.find((form) => form.name === m.remembered?.tokens);
+  if (kept) forms = [kept, ...forms.filter((form) => form !== kept)];
+  const right = [], tried = [];
+  for (const candidate of forms) {
+    // the remembered one right: no other is compiled or timed (as the matrices, T148)
+    if ((plan.force.quick || (kept && right[0]?.name === kept.name)) && right.length) break;
+    const form = { ...candidate, pipes: {} };
+    try {
+      for (const [key, code] of tokenCodes(wgsl, form)) {
+        form.pipes[key] = await within(validated(m, () => pipelineOf(m, code)), `compiling ${form.name}`);
+      }
+      const wrong = await within(checkTokens(m, form), `checking ${form.name}`);
+      if (wrong) tried.push({ name: form.name, none: `wrong: ${wrong}` });
+      else right.push(form);
+    } catch (error) {
+      if (error?.late) throw error;
+      tried.push({ name: form.name, none: String(error?.message ?? error) });
+    }
+    if (stopping) return;
+  }
+  if (!right.length) {
+    throw new Error(`no layer of a token is right on this GPU (${tried.map((f) => `${f.name}: ${f.none}`).join("; ") || `none named ${plan.force.tokens}`})`);
+  }
+  const ms = plan.force.quick ? right.map(() => undefined) : await within(timeTokens(m, right), "timing a token");
+  const best = ms.reduce((b, t, i) => (t !== undefined && (ms[b] === undefined || t < ms[b]) ? i : b), 0);
+  m.gen.form = right[best];
+  m.gen.ms = ms[best];
+  m.gen.forms = [...tried, ...right.map((form, i) => ({ name: form.name, ms: ms[i], ...(kept && form.name === kept.name ? { remembered: true } : {}) }))];
+}
+
+// ms a step of each form: runs of plan.tokens.most steps a submission from position 0 (a made-up state, the settings
+// of the list's sampled models, T151's), the forms in turn after one run each to warm up, BLOCK_ROUNDS rounds (one on
+// a fallback adapter: its times are no GPU's), the median of each over its steps. The runs write the GPU's own keys
+// and values of those positions, which hold nothing of forward.js's yet (as timeBlocks)
+async function timeTokens(m, forms) {
+  const { wgsl, gen: g } = m, most = g.most;
+  const state = wgsl.samplingState({ token: 1, pos: 0, history: [1] });
+  const settings = wgsl.samplingSettings({ vocab: g.vocab, temperature: 0.7, topp: 0.9, penalty: 1.1 });
+  const randoms = new Float32Array(most).map(() => Math.fround(Math.random()) % 1);
+  if (most > m.cache.capacity) grow(m, most);
+  const timed = async (form) => {
+    const began = performance.now();
+    await runTokens(m, tokenStep(m, form), { count: most, pos: 0, state, settings, randoms });
+    return performance.now() - began;
+  };
+  for (const form of forms) await timed(form);
+  const times = forms.map(() => []);
+  for (let round = 0; round < (m.fallback ? 1 : BLOCK_ROUNDS); round++) {
+    for (let i = 0; i < forms.length; i++) times[i].push(await timed(forms[i]));
+    if (stopping) break;
+  }
+  return times.map((list) => list.sort((a, b) => a - b)[list.length >> 1] / most);
+}
+
+// ---- T152's check of a form on the model's own weights, against JavaScript (the drivers, the subgroups and the
+// packed dot differ from device to device, and only the device can say):
+//   1. EMBED of the last token of the vocabulary and the first layer at position 1 (the cache's row 0 of random
+//      float16), the stream h and the keys and values of position 1 read back: against JavaScript's layer in float64
+//      (the weights read from the shared memory as forward.js holds them: int6 widened by shaders.js's sixValues; RoPE
+//      from the CPU's tables; the keys and values rounded to float16 where the attention reads them; on DP4A each
+//      matrix's input quantized as quantize_x quantizes it, in float32). The stream: no farther than LAYER_LINE of the
+//      largest change the layer made; the keys and values no farther than it of their largest. A wrong row, group,
+//      head, angle or scale is a tenth and more off; on DP4A a value quantized to the other side of a rounding moves
+//      the layer by about 1e-3 (T175), and so its lines are DP4A_LINE.
+//   2. the head on a made-up stream (±2), greedy: the logits of every 256th row (and the last) against JavaScript's,
+//      no farther than LOGITS_LINE of their largest (DP4A: DP4A_LINE), and the id SAMPLE chose the first largest of the
+//      GPU's own logits; then sampled (temperature 0.8, top-p 0.9, penalty 1.3 on a history that holds that id, a
+//      random number of 0.7): the logits SAMPLE penalized in place as penalizeLikeCpu penalizes the greedy ones
+//      (within 1e-6), and the id one that the CPU's walk (walkLikeCpu) over those logits reaches within 1e-4 of the
+//      random number's share of the mass (T151's line: the GPU's exp and its float32 sums).
+// The reason it is wrong, or null.
+const LAYER_LINE = 2e-3, LOGITS_LINE = 1e-3, DP4A_LINE = 2e-2;
+async function checkTokens(m, form) {
+  const { plan, wgsl, gen: g, device } = m, vocab = g.vocab, dim = plan.dim, headSize = plan.headSize, half = headSize / 2;
+  const qDim = plan.heads * headSize, kvDim = plan.kvHeads * headSize, line = form.dp4a ? DP4A_LINE : LAYER_LINE;
+  const floats = (address, n) => Float64Array.from(new Float32Array(m.memory.buffer, address, n));
+  const round16 = Math.f16round ?? ((x) => x);
+  // a matrix's rows ({ n, six }, its values and scales at [valuesAt, scalesAt]) times x, the rows given
+  const product = ({ n, six }, [valuesAt, scalesAt], x, rows) => {
+    const q = form.dp4a ? wgsl.quantizedLikeCpu(Float32Array.from(x)) : null, perRow = n / wgsl.GROUP;
+    return Float64Array.from(rows, (r) => {
+      const w = six ? wgsl.sixValues(new Uint8Array(m.memory.buffer, valuesAt + (r * n * 3) / 4, (n * 3) / 4))
+        : new Int8Array(m.memory.buffer, valuesAt + r * n, n);
+      const s = new Float32Array(m.memory.buffer, scalesAt + r * perRow * 4, perRow);
+      let sum = 0;
+      for (let b = 0; b < perRow; b++) {
+        let part = 0;
+        for (let i = b * wgsl.GROUP; i < (b + 1) * wgsl.GROUP; i++) part += w[i] * (q ? q.xq[i] : x[i]);
+        sum += part * s[b] * (q ? q.xs[b] : 1);
+      }
+      return sum;
+    });
+  };
+  const all = (n) => [...Array(n).keys()];
+  const matmul = (name, x) => product(plan.matrices[name], plan.matrices[name].layers[0], x, all(plan.matrices[name].rows));
+  const rms = (x, weights) => {
+    const s = 1 / Math.sqrt(x.reduce((sum, v) => sum + v * v, 0) / x.length + plan.eps);
+    return x.map((v, i) => weights[i] * (s * v));
+  };
+  const largest = (xs) => xs.reduce((a, v) => Math.max(a, Math.abs(v)), 0);
+  const off = (got, want) => largest(want.map((v, i) => got[i] - v));
+  const owned = [];
+  try {
+    // 1. the first layer at position 1
+    const token = vocab - 1, pos = 1;
+    const halfBits = () => (Math.random() < 0.5 ? 0x8000 : 0) | ((13 + ((Math.random() * 3) | 0)) << 10) | ((Math.random() * 1024) | 0);
+    const row0 = [0, 1].map(() => new Uint16Array(kvDim).map(halfBits));
+    if (m.cache.capacity < 2) grow(m, 2);
+    device.queue.writeBuffer(m.cache.keys[0], 0, row0[0]);
+    device.queue.writeBuffer(m.cache.values[0], 0, row0[1]);
+    const readH = buffer(m, dim * 4, MAP_READ | COPY_DST, owned);
+    const { kv } = await runTokens(m, tokenPass(m, form, { to: 1, head: false }), { count: 1, pos, keep: true,
+      state: wgsl.samplingState({ token, pos, history: [token] }), extra: (encoder) => encoder.copyBufferToBuffer(g.h, 0, readH, 0, dim * 4) });
+    await readH.mapAsync(MAP_READ);
+    const h = new Float32Array(readH.getMappedRange().slice(0));
+    readH.unmap();
+    const [gotK, gotV] = kv.map((layers) => Float64Array.from(new Uint16Array(layers[0].buffer, layers[0].byteOffset, kvDim), halfToFloat));
+    // JavaScript's layer
+    const embedding = plan.tokens.embedding ?? plan.tokens.classifier, perRow = dim / wgsl.GROUP;
+    const eRow = embedding.six ? wgsl.sixValues(new Uint8Array(m.memory.buffer, embedding.at[0] + (token * dim * 3) / 4, (dim * 3) / 4))
+      : new Int8Array(m.memory.buffer, embedding.at[0] + token * dim, dim);
+    const eScales = new Float32Array(m.memory.buffer, embedding.at[1] + token * perRow * 4, perRow);
+    const x0 = Float64Array.from(eRow, (v, i) => v * eScales[(i / wgsl.GROUP) | 0]);
+    const xn = rms(x0, floats(plan.vectors.attention.at, dim));
+    const [q, k, v] = ["wq", "wk", "wv"].map((name) => matmul(name, xn));
+    const cos = floats(plan.cos + pos * half * 4, half), sin = floats(plan.sin + pos * half * 4, half);
+    const turn = (vector) => {
+      for (let at = 0; at < vector.length; at += 2) {
+        const i = (at % headSize) / 2;
+        if (at % headSize >= plan.turned) continue;
+        const [a, b] = [vector[at], vector[at + 1]];
+        vector[at] = a * cos[i] - b * sin[i];
+        vector[at + 1] = a * sin[i] + b * cos[i];
+      }
+    };
+    turn(q);
+    turn(k);
+    const keys = [Float64Array.from(row0[0], halfToFloat), k.map(round16)], values = [Float64Array.from(row0[1], halfToFloat), v.map(round16)];
+    const att = new Float64Array(qDim), group = plan.heads / plan.kvHeads;
+    for (let head = 0; head < plan.heads; head++) {
+      const kvAt = Math.floor(head / group) * headSize, at = head * headSize;
+      const scores = keys.map((key) => {
+        let sum = 0;
+        for (let d = 0; d < headSize; d++) sum += q[at + d] * key[kvAt + d];
+        return sum / Math.sqrt(headSize);
+      });
+      const top = Math.max(...scores), weights = scores.map((score) => Math.exp(score - top)), total = weights[0] + weights[1];
+      for (let d = 0; d < headSize; d++) att[at + d] = (weights[0] * values[0][kvAt + d] + weights[1] * values[1][kvAt + d]) / total;
+    }
+    const o = matmul("wo", att), h1 = x0.map((value, i) => value + o[i]);
+    const xn2 = rms(h1, floats(plan.vectors.ffn.at, dim));
+    const gate = matmul("w1", xn2), up = matmul("w3", xn2);
+    const down = matmul("w2", gate.map((value, i) => (value / (1 + Math.exp(-value))) * up[i])), h2 = h1.map((value, i) => value + down[i]);
+    const stream = off(h, h2) / largest(h2.map((value, i) => value - x0[i]));
+    const keyOff = off(gotK, k) / largest(k), valueOff = off(gotV, v) / largest(v);
+    if (!(stream <= line)) return `the first layer's stream is ${stream.toExponential(2)} of its change from JavaScript's (line ${line})`;
+    if (!(keyOff <= line && valueOff <= line)) {
+      return `the first layer's keys are ${keyOff.toExponential(2)} and its values ${valueOff.toExponential(2)} from JavaScript's (line ${line})`;
+    }
+    // 2. the head: greedy, then sampled
+    const stream2 = new Float32Array(dim).map(() => (Math.random() - 0.5) * 4);
+    const rows = [...new Set([...all(Math.ceil(vocab / 256)).map((i) => i * 256), vocab - 1])];
+    const readLogits = buffer(m, vocab * 4, MAP_READ | COPY_DST, owned);
+    const head = tokenPass(m, form, { to: 0, embed: false });
+    const run = async (settings, history, random) => {
+      device.queue.writeBuffer(g.h, 0, stream2);
+      const { ids } = await runTokens(m, head, { count: 1, pos, state: wgsl.samplingState({ token, pos, history }), settings,
+        randoms: new Float32Array([random]), extra: (encoder) => encoder.copyBufferToBuffer(g.logits, 0, readLogits, 0, vocab * 4) });
+      await readLogits.mapAsync(MAP_READ);
+      const logits = new Float32Array(readLogits.getMappedRange().slice(0));
+      readLogits.unmap();
+      return { id: ids[0], logits };
+    };
+    const greedy = await run(wgsl.samplingSettings({ vocab, temperature: 0, topp: 0.9 }), [token], 0);
+    const classifier = plan.tokens.classifier;
+    const want = product(classifier, classifier.at, rms(Float64Array.from(stream2), floats(plan.tokens.final, dim)), rows);
+    const logitsOff = off(rows.map((r) => greedy.logits[r]), want) / largest(want), logitsLine = form.dp4a ? DP4A_LINE : LOGITS_LINE;
+    if (!(logitsOff <= logitsLine)) return `the logits are ${logitsOff.toExponential(2)} of their largest from JavaScript's (line ${logitsLine})`;
+    if (greedy.id !== wgsl.argmaxLikeCpu(greedy.logits)) return `the greedy token is ${greedy.id}, the largest logit's ${wgsl.argmaxLikeCpu(greedy.logits)}`;
+    const sampled = { temperature: 0.8, topp: 0.9, penalty: 1.3 }, history = [token, greedy.id, 0, 1];
+    const drawn = await run(wgsl.samplingSettings({ vocab, ...sampled }), history, 0.7);
+    const penalized = greedy.logits.slice();
+    wgsl.penalizeLikeCpu(penalized, history, sampled.penalty);
+    const penaltyOff = off(history.map((t) => drawn.logits[t]), history.map((t) => penalized[t])) / Math.max(largest(history.map((t) => penalized[t])), 1e-30);
+    if (!(penaltyOff <= 1e-6)) return `the penalized logits are ${penaltyOff.toExponential(2)} from JavaScript's`;
+    const walk = wgsl.walkLikeCpu(drawn.logits, sampled.temperature, sampled.topp), goal = 0.7 * walk.mass, band = 1e-4 * walk.mass;
+    const reached = walk.tokens.filter((_, j) => walk.cumulative[j] > goal - band && (j ? walk.cumulative[j - 1] : 0) <= goal + band);
+    if (!reached.includes(drawn.id)) return `the sampled token is ${drawn.id}, the CPU's walk reaches ${reached.join(" or ")}`;
+    return null;
+  } finally {
+    owned.forEach((b) => b.destroy());
+  }
+}
+
+// A request for count steps from token at pos (forward.js's generateMany): the keys and values of positions from to
+// pos - 1 up from forward.js's cache first (cache: its addresses of the keys and the values, its capacity and the
+// bytes of a position, float16 as here), the state (token, pos, the end of the history and its length), the settings
+// and a random number a step; the ids into plan.tokens.ids ([sampled, id, id, ...], a stop token last where one came),
+// and the keys and values of the positions sampled into forward.js's cache, where it still wants the answer
+function generate({ serial, count, pos, from, token, history, length, cache, settings, randoms }) {
+  serve(serial, async (wanted) => {
+    const m = model, { plan, wgsl, gen: g } = m, kvRow = plan.kvHeads * plan.headSize * 2;
+    if (!g?.form) throw new Error("no tokens on this GPU");
+    if (pos + count > m.cache.capacity) grow(m, pos + count);
+    const at = (block, l, p) => block + l * cache.capacity * cache.row + p * cache.row;
+    for (let l = 0; l < plan.layers; l++) {
+      copyIn(m, m.cache.keys[l], at(cache.keys, l, from), (pos - from) * kvRow, from * kvRow);
+      copyIn(m, m.cache.values[l], at(cache.values, l, from), (pos - from) * kvRow, from * kvRow);
+    }
+    const out = await runTokens(m, tokenStep(m, g.form), { count, pos, keep: true,
+      state: wgsl.samplingState({ token, pos, history, length }), settings: wgsl.samplingSettings({ vocab: g.vocab, ...settings }),
+      randoms: Float32Array.from({ length: count }, (_, i) => randoms[i] ?? 0) });
+    if (!wanted()) return;
+    // (views of just those bytes: T155, not one of the whole of a 64-bit memory)
+    const into = (address) => new Uint8Array(m.memory.buffer, address, out.sampled * kvRow);
+    for (let l = 0; l < plan.layers; l++) {
+      into(at(cache.keys, l, pos)).set(out.kv[0][l].subarray(0, out.sampled * kvRow));
+      into(at(cache.values, l, pos)).set(out.kv[1][l].subarray(0, out.sampled * kvRow));
+    }
+    const ids = new Int32Array(m.memory.buffer, plan.tokens.ids, 1 + count);
+    ids[0] = out.sampled;
+    ids.set(out.ids.subarray(0, out.sampled), 1);
+  });
+}
+
 // ---- a block of a prompt
-async function prompt({ serial, count, pos }) {
+function prompt({ serial, count, pos }) {
+  serve(serial, (wanted) => block(model, count, pos, wanted));
+}
+// The answer to a request (a block of a prompt, T152: the steps of a generation), in the control area: work(wanted)
+// runs while words.beat counts up, then words.failed and words.done = serial, where forward.js still waits for this
+// request (wanted: T147, it gave up, and the memory may soon be another model's)
+async function serve(serial, work) {
   const { memory, plan } = model;
   const words = new Int32Array(memory.buffer, 0, Math.max(...Object.values(plan.words)) + 1);
   // the model's worker waits: this says that the work goes on, however long the GPU takes (a software adapter)
   const beat = setInterval(() => Atomics.add(words, plan.words.beat, 1), 250);
-  // whether forward.js still waits for this request (T147): it gave up, and the memory may soon be another model's
   const wanted = () => Atomics.load(words, plan.words.wanted) === serial;
   let failed = 1;
   try {
     if (lost) throw new Error(lost);
-    await block(model, count, pos, wanted);
+    await work(wanted);
     if (lost) throw new Error(lost);
     failed = 0;
   } catch (error) {

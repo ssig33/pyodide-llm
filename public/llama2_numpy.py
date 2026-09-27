@@ -689,6 +689,12 @@ PROMPT_BLOCK = 16
 class Llama:
     forward_many = None  # T108: forward.js's forwardMany(tokens, pos) for a prompt, where there is one
     prompt_block = staticmethod(lambda: PROMPT_BLOCK)  # T147: how many tokens forward_many() takes at once, now
+    # T152: forward.js's generateMany(token, pos, history, count, temperature, topp, penalty, randoms, stops), which
+    # runs count steps of generate() on the GPU (the forward pass and the sampling, with the random numbers drawn here)
+    # and returns the tokens it sampled (a stop token last), or None where it did not (the CPU then takes the step);
+    # token_block(): how many steps it takes at once now, 0 where the CPU is faster (or there is no GPU)
+    generate_many = None
+    token_block = staticmethod(lambda: 0)
 
     def __init__(self, checkpoint, tokenizer, dtype="float32", rope_theta=10000.0,
                  tokenizer_kind="bpe", nfkc=False, nfc=False, pretokenizer="gpt2", bias=False, arch="llama",
@@ -952,6 +958,16 @@ class Llama:
             self.forward_many = lambda tokens, pos: many(list(tokens), pos)
             if getattr(engine, "promptBlock", None) is not None:
                 self.prompt_block = lambda: int(engine.promptBlock)
+        # T152: the steps of generate() on the GPU, where forward.js offers that
+        on_gpu = getattr(engine, "generateMany", None)
+        if on_gpu is not None:
+            def generate_many(token, pos, history, count, temperature, topp, penalty, randoms, stops):
+                ids = on_gpu(token, pos, list(history[-REPETITION_WINDOW:]), len(history), count, temperature, topp,
+                            penalty, list(randoms), list(stops))
+                return None if ids is None else [int(i) for i in ids]
+
+            self.generate_many = generate_many
+            self.token_block = lambda: int(engine.tokenBlock)
 
         def forward(token, pos, need_logits=True):
             run(token, pos, need_logits)
@@ -1181,30 +1197,50 @@ class Llama:
                     at += len(block)
                 first = len(fed)
                 sampling_start = time.perf_counter()
-            for pos in range(first, steps):
+            # T152: a step on the GPU (generate_many) samples there with the random numbers drawn here, several at
+            # once (token_block()); a step on the CPU is the forward pass and the sampling here
+            stops = sorted(self.stop_tokens)
+            pos = first
+            while pos < steps:
                 if pos < len(prompt_tokens):
                     # Still processing the prompt: force the next token, and the logits are not needed
                     self.forward(token, pos, need_logits=False)
-                    next_token = prompt_tokens[pos]
+                    chosen = [prompt_tokens[pos]]
                     forced += 1
                     sampling_start = time.perf_counter()
                 else:
-                    logits = self.forward(token, pos)
-                    if repetition_penalty != 1.0:
-                        self.penalize(logits, history, repetition_penalty)
-                    next_token = self.sample(logits, temperature, topp, rng)
-                    sampled += 1
-                    if first_token is None:
-                        first_token = time.perf_counter()
-                    # The BOS token delimits sequences: the story is over
-                    if next_token in self.stop_tokens:
-                        break
-                text = utf8.decode(self.tokenizer.decode(token, next_token, self.bos))
-                token = next_token
-                history.append(token)
-                count += 1
-                if text and (echo or pos >= len(prompt_tokens)):
-                    yield text
+                    chosen = None
+                    many = min(self.token_block(), steps - pos)
+                    if many > 0:
+                        # a number for every step, drawn in the order the CPU draws them (none where greedy);
+                        # those of the steps after a stop token go unused
+                        randoms = [rng.random() for _ in range(many)] if temperature != 0.0 else []
+                        chosen = self.generate_many(token, pos, history, many, temperature, topp, repetition_penalty,
+                                                    randoms, stops)
+                    if chosen is None:
+                        logits = self.forward(token, pos)
+                        if repetition_penalty != 1.0:
+                            self.penalize(logits, history, repetition_penalty)
+                        chosen = [self.sample(logits, temperature, topp, rng)]
+                ended = False
+                for next_token in chosen:
+                    if pos >= len(prompt_tokens):
+                        sampled += 1
+                        if first_token is None:
+                            first_token = time.perf_counter()
+                        # The BOS token delimits sequences: the story is over
+                        if next_token in self.stop_tokens:
+                            ended = True
+                            break
+                    text = utf8.decode(self.tokenizer.decode(token, next_token, self.bos))
+                    token = next_token
+                    history.append(token)
+                    count += 1
+                    if text and (echo or pos >= len(prompt_tokens)):
+                        yield text
+                    pos += 1
+                if ended:
+                    break
             text = utf8.decode(b"", final=True)
             if text:
                 yield text

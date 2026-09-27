@@ -1337,7 +1337,8 @@ function warmUp(prompt) {
 // /benchmark/ passes as the model page does, or else the search run to its end: forward.js's endSearch()), and every
 // side is timed on it (the CPU's times, and so the choice, are per number of threads). The prompts:
 // forward.js's timePrompts(). The writing: sampled tokens after the prompt at the tok/s the page's status line says
-// (the engine's stats), on the CPU alone until T152 puts a token on the GPU (its cell then is the GPU's).
+// (the engine's stats); T152: where the GPU takes a generation's steps, as the page chooses, on the CPU only and on the
+// GPU only (engine.gpuSide), the sides in turn, a run each after the warm-up.
 const GPU_WAIT_S = 240, WRITING_RUNS = 3;
 async function timedPaths({ prompt, counts, sampled }) {
   const engine = outsideNow?.engine;
@@ -1373,20 +1374,38 @@ async function timedPaths({ prompt, counts, sampled }) {
   postMessage({ type: "status", text: `writing ${writes} tokens` });
   warmUp(prompt);
   let fewest = writes;  // a stop token may end a run first: its tok/s stands, and the row says the fewest
-  const written = () => {
-    const pieces = llama.generate.callKwargs(prompt, { steps: words.length + writes, temperature: 0, echo: false });
+  // a run of the writing on side ("cpu", "gpu", or null: as the page chooses, T152); whether the GPU took every step
+  const written = (side = null) => {
+    engine.gpuSide = side;
+    const before = engine.gpuSampled;
     try {
-      while (!pieces.next().done);
+      const pieces = llama.generate.callKwargs(prompt, { steps: words.length + writes, temperature: 0, echo: false });
+      try {
+        while (!pieces.next().done);
+      } finally {
+        pieces.destroy();
+      }
+      const stats = llama.stats.toJs({ dict_converter: Object.fromEntries });
+      fewest = Math.min(fewest, stats.sampled);
+      const whole = engine.gpuSampled - before >= stats.sampled;
+      // as if each had written them all, at its tok/s
+      return { ms: (1000 * writes) / stats.tokens_per_second, gpuTokens: whole ? writes : engine.gpuSampled - before };
     } finally {
-      pieces.destroy();
+      engine.gpuSide = null;
     }
-    const stats = llama.stats.toJs({ dict_converter: Object.fromEntries });
-    fewest = Math.min(fewest, stats.sampled);
-    return { ms: (1000 * writes) / stats.tokens_per_second };  // as if each had written them all, at its tok/s
   };
-  const runs = Array.from({ length: WRITING_RUNS }, written);
-  rows.push({ what: "generation", tokens: fewest, chosen: { same: "cpu" }, cpu: forwardModule.timedCell(runs, writes),
-              gpu: { skip: chosen ? "not on the GPU yet" : gpu.why } });
+  // T152: the sides, where the GPU takes a generation's steps (else the CPU's alone), in turn
+  const tokens = Boolean(chosen?.tokens);
+  const sides = tokens ? { chosen: null, cpu: "cpu", gpu: "gpu" } : { cpu: "cpu" };
+  const runs = Object.fromEntries(Object.keys(sides).map((name) => [name, []]));
+  for (let run = 0; run < WRITING_RUNS; run++) {
+    for (const [name, side] of Object.entries(sides)) runs[name].push(written(side));
+  }
+  const row = { what: "generation", tokens: fewest, chosen: tokens ? forwardModule.timedCell(runs.chosen, writes) : { same: "cpu" },
+    cpu: forwardModule.timedCell(runs.cpu, writes), gpu: tokens ? forwardModule.timedCell(runs.gpu, writes) : { skip: chosen ? engine.gpuTokensWhyNot ?? "not on the GPU" : gpu.why } };
+  // a GPU side the GPU did not take whole (it failed, or was lost, on the way: its time is the CPU's)
+  if (tokens && runs.gpu.some((run) => run.gpuTokens < writes)) row.gpu = { skip: engine.gpuTokensWhyNot ?? "the GPU did not take every step" };
+  rows.push(row);
   // T190's review: the writing on each number of threads the search goes through (1, 2, 4, ... up to the logical cores,
   // and the page's), in turn: the page's count against the others on this very model. A count the model page remembers
   // is not searched here, and the CPU section's made-up model (2 layers: 11 waits between phases a token) says little
@@ -1404,7 +1423,7 @@ async function timedPaths({ prompt, counts, sampled }) {
           continue;
         }
         warmUp(prompt);  // the helpers a switch wakes, out of the time
-        byCount.get(n).push(written());
+        byCount.get(n).push(written("cpu"));  // (T152: the CPU's steps, whichever side the page chooses)
       }
     }
     await engine.setThreads(threads);
@@ -1458,7 +1477,8 @@ async function generate({ type, prompt, ...options }) {
   } finally {
     pieces.destroy();
   }
-  postMessage({ type: "done", threads: threadsNow(), gpuTokens: outsideNow?.engine?.gpuTokens ?? 0, gpu: outsideNow?.engine?.gpuStatus,
+  postMessage({ type: "done", threads: threadsNow(), gpuTokens: outsideNow?.engine?.gpuTokens ?? 0, gpuSampled: outsideNow?.engine?.gpuSampled ?? 0,
+                gpu: outsideNow?.engine?.gpuStatus,
                 ...llama.stats.toJs({ dict_converter: Object.fromEntries }) });
 }
 

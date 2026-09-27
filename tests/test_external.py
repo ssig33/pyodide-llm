@@ -136,3 +136,65 @@ def test_a_prompt_goes_through_forward_many_and_writes_the_same():
     assert [t for block, _ in blocks[:len(blocks) // 2] for t in block] == fed
     for key in ("tokens", "sampled", "prompt_tokens"):
         assert batched.stats[key] == expected_stats[key], key
+
+
+def test_steps_on_the_gpu_write_what_the_cpu_writes():
+    """T152: with generate_many, generate() hands token_block() steps at a time over (the forward pass and the
+    sampling, with the random numbers drawn in the CPU's order), and the text, the counts and what follows are what
+    they are one step at a time; a stop token in the middle of a block ends the run there, and a block the GPU gives
+    back (None) goes to the CPU (tried greedy: a sampled one would have drawn its numbers already, and the seed's text
+    then goes on otherwise). generate_many here is NumPy's forward and sample, so any difference is generate()'s
+    bookkeeping."""
+    config, weights = synthetic_weights()
+    tensors, published = hugging_face(config, weights, True)
+    checkpoint = converted(Safetensors(reader(safetensors_file(tensors))), published, "float32")
+    tokenizer = pack_tokenizer(tiny_vocab(config["vocab_size"]))
+    plain = Llama(checkpoint, tokenizer)
+    prompt = "abcabcabcabc"
+    settings = dict(steps=40, temperature=0.8, topp=0.9, repetition_penalty=1.2, seed=5)
+    expected = "".join(plain.generate(prompt, **settings))
+    expected_stats = dict(plain.stats)
+    calls = []
+    stepped = Llama(checkpoint, tokenizer)
+
+    class Numbers:
+        """the random numbers generate() drew for a block, handed out in order as the CPU's generator would"""
+
+        def __init__(self, values):
+            self.values = list(values)
+
+        def random(self):
+            return self.values.pop(0)
+
+    def many(token, pos, history, count, temperature, topp, penalty, randoms, stops):
+        calls.append((pos, count, len(randoms)))
+        if not randoms and len(calls) % 3 == 0:
+            return None  # the GPU gave the block back: the CPU takes the step (greedy: its numbers are unused then)
+        numbers, ids, history = Numbers(randoms), [], list(history)
+        for step in range(count):
+            logits = stepped.forward(token, pos + step)
+            if penalty != 1.0:
+                stepped.penalize(logits, history, penalty)
+            token = stepped.sample(logits, temperature, topp, numbers)
+            ids.append(token)
+            if token in stops:
+                break
+            history.append(token)
+        return ids
+
+    stepped.generate_many = many
+    stepped.token_block = lambda: 3
+    assert "".join(stepped.generate(prompt, **settings)) == expected
+    for key in ("tokens", "sampled", "prompt_tokens"):
+        assert stepped.stats[key] == expected_stats[key], key
+    # blocks of 3 but at the end of the steps, a number for every step
+    assert all(count == min(3, 40 - pos) and randoms == count for pos, count, randoms in calls)
+    # greedy: no numbers drawn; a stop token in the middle of a block ends the run
+    stop = plain.tokenizer.encode(prompt, plain.specials)[-1]
+    for model in (plain, stepped):
+        model.stop_tokens = {model.bos, stop}
+    calls.clear()
+    greedy = dict(steps=40, temperature=0.0)
+    assert "".join(stepped.generate(prompt, **greedy)) == "".join(plain.generate(prompt, **greedy))
+    assert stepped.stats["sampled"] == plain.stats["sampled"] and stepped.stats["tokens"] == plain.stats["tokens"]
+    assert all(randoms == 0 for _, _, randoms in calls)

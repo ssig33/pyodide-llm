@@ -716,6 +716,9 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
   // makes the first logits, on the CPU)
   const onGpu = (data: any) => (!data.gpuTokens ? "" : data.gpuTokens >= data.prompt_tokens ? " on WebGPU"
     : ` (${data.gpuTokens} on WebGPU)`);
+  // T152: how many of the tokens it wrote the GPU sampled (the sampled steps: a stop token among them)
+  const onGpuSampled = (data: any) => (!data.gpuSampled ? "" : data.gpuSampled >= data.sampled ? " on WebGPU"
+    : ` (${data.gpuSampled} on WebGPU)`);
 
   // ?v=<commit>: a new page must never run with the cached worker or Python code of the previous deployment
   // T93 stage 3: cross-origin isolation, for the software threads of forward.js. GitHub Pages cannot send the headers,
@@ -835,10 +838,12 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       showStatus(data.note);
       if (data.matrices) {
         $("load-stats").append(Object.assign(document.createElement("div"), {
-          textContent: `WebGPU ${seconds(data.seconds)} · ${data.matrices}${data.remembered ? " (remembered)" : ""} · ${data.attention}`,
+          textContent: `WebGPU ${seconds(data.seconds)} · ${data.matrices}${data.remembered ? " (remembered)" : ""} · ${data.attention}` +
+            (data.tokens ? ` · a token by ${data.tokens}` : ""),
         }));
         try {
-          localStorage.setItem(gpuKey(model), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention }));
+          // (T152: and the layer of a token)
+          localStorage.setItem(gpuKey(model), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention, tokens: data.tokens }));
         } catch {
           // no storage here: the next visit times them again
         }
@@ -872,7 +877,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       meta(answer!, `${model.name} · ${data.tokens} tokens · ${data.tokens_per_second.toFixed(1)} tok/s${data.threads > 1 ? ` · ${data.threads} threads` : ""} · ${how}`, [
         `first token ${seconds(data.first_token_seconds)}`,
         `prompt ${data.prompt_tokens} tokens${onGpu(data)} · ${data.prompt_tokens_per_second.toFixed(1)} tok/s`,
-        `generated ${data.tokens - data.prompt_tokens} tokens · ${data.tokens_per_second.toFixed(1)} tok/s · ${seconds(data.seconds)} in all`,
+        `generated ${data.tokens - data.prompt_tokens} tokens${onGpuSampled(data)} · ${data.tokens_per_second.toFixed(1)} tok/s · ${seconds(data.seconds)} in all`,
       ], used.temperature ? used.seed : undefined);
     } else if (data.type === "error") {
       // the console keeps where it happened, for a failed run's record (T82's artifacts, T96)

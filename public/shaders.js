@@ -2444,12 +2444,13 @@ const STATE = /* wgsl */ `struct State {
 }`;
 export const STATE_BYTES = 32 + 4 * REPETITION_WINDOW;
 /** The state a run starts from: the token it feeds first, at pos, and the history before it (BOS, the prompt and
- * the tokens sampled before, the fed token last: the penalty's window is its latest REPETITION_WINDOW). */
-export function samplingState({ token, pos, history }) {
-  const words = new Uint32Array(STATE_BYTES / 4);
-  words.set([1, pos, 0, 0, token, 0, history.length, 0]);
-  for (let at = Math.max(0, history.length - REPETITION_WINDOW); at < history.length; at++) {
-    words[8 + (at % REPETITION_WINDOW)] = history[at];
+ * the tokens sampled before, the fed token last: the penalty's window is its latest REPETITION_WINDOW). length (T152:
+ * the engine hands the latest of a longer history over): how long the history is, of which history is the end. */
+export function samplingState({ token, pos, history, length = history.length }) {
+  const words = new Uint32Array(STATE_BYTES / 4), first = length - history.length;
+  words.set([1, pos, 0, 0, token, 0, length, 0]);
+  for (let at = Math.max(first, length - REPETITION_WINDOW); at < length; at++) {
+    words[8 + (at % REPETITION_WINDOW)] = history[at - first];
   }
   return words;
 }
