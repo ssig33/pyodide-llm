@@ -68,18 +68,20 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
 // 32 products are exact integers in four int32 lanes (lane k holds products 2k, 2k + 1, 2k + 8, 2k + 9 of each half of
 // 16), scaled and added lane by lane in float32, the four lanes added last. The weights take every int8 (-128 too) and
 // the activations every value quantize_x gives (-127..127), with groups at the ends: 127 × 127 and -128 × -127 on
-// every lane (sums of two products that int16 still holds)
+// every lane (sums of two products that int16 still holds). T196: at 1 to 8, 11 and 41 groups, as T167's check of
+// matmul_q8r below: matmul_q8 takes four groups a turn and the rest one by one, and at 41 alone one group comes after
+// the fours (a kernel that scaled the groups after the fours with the scale of the four before them passed there)
 {
   const memory = new WebAssembly.Memory({ initial: 8 });
   const k = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_plain.wasm`)), { env: { memory } }).exports;
   const I = new Int8Array(memory.buffer), U = new Uint8Array(memory.buffer), F = new Float32Array(memory.buffer);
-  const rows = 24, n = 32 * 41, ng = n / 32;  // 41 groups: matmul_q8 takes four a turn, and one on its own
+  const rows = 24, n = 32 * 41, ng = n / 32;  // the most groups tried: 41
   const w = 4096, w6 = w + rows * n, ws = w6 + rows * ng * 24, x = ws + rows * ng * 4, xs = x + n, out = xs + ng * 4;
   let seed = 7;
   const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8;
-  for (let i = 0; i < rows * n; i++) I[w + i] = (next() & 255) - 128;
+  const pool = Int8Array.from({ length: rows * n }, () => (next() & 255) - 128);  // weight j of row i: pool[i * n + j]
   for (let j = 0; j < n; j++) I[x + j] = (next() % 255) - 127;
-  for (let j = 0; j < 32; j++) { I[w + j] = 127; I[x + j] = 127; I[w + n + 32 + j] = -128; I[x + 32 + j] = -127; }
+  for (let j = 0; j < 32; j++) { I[x + j] = 127; I[x + 32 + j] = -127; }
   for (let i = 0; i < rows * ng; i++) F[ws / 4 + i] = Math.fround(1e-3 * (1 + (next() % 1000)));
   for (let g = 0; g < ng; g++) F[xs / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
   for (let i = 0; i < rows * ng * 24; i++) U[w6 + i] = next() & 255;
@@ -88,10 +90,11 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
     const low = m < 16 ? U[at + m] & 15 : U[at + m - 16] >> 4, top = (U[at + 16 + (m % 8)] >> (2 * ((m / 8) | 0))) & 3;
     return (((low | (top << 4)) << 2) << 24) >> 24;
   };
-  const reference = (weight) => Array.from({ length: rows }, (_, i) => {
+  // rows of groups groups: the weights (row stride groups × 32) and the scales (groups a row) packed for that count
+  const reference = (weight, groups) => Array.from({ length: rows }, (_, i) => {
     const lanes = [0, 0, 0, 0];
-    for (let g = 0; g < ng; g++) {
-      const s = Math.fround(F[ws / 4 + i * ng + g] * F[xs / 4 + g]);
+    for (let g = 0; g < groups; g++) {
+      const s = Math.fround(F[ws / 4 + i * groups + g] * F[xs / 4 + g]);
       for (let lane = 0; lane < 4; lane++) {
         let sum = 0;
         for (const j of [2 * lane, 2 * lane + 1, 2 * lane + 8, 2 * lane + 9, 2 * lane + 16, 2 * lane + 17, 2 * lane + 24, 2 * lane + 25]) {
@@ -102,10 +105,19 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
     }
     return Math.fround(Math.fround(Math.fround(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
   });
-  for (const [name, weights, weight] of [["matmul_q8", w, (i, j) => I[w + i * n + j]], ["matmul_q6", w6, six]]) {
-    k[name](out, x, xs, weights, ws, n, 0, rows);
-    const expected = reference(weight);
-    for (let i = 0; i < rows; i++) if (F[out / 4 + i] !== expected[i]) throw new Error(`${name} differs at row ${i}: ${F[out / 4 + i]} against ${expected[i]}`);
+  for (const groups of [1, 2, 3, 4, 5, 6, 7, 8, 11, ng]) {
+    const m = groups * 32;
+    for (let i = 0; i < rows; i++) for (let j = 0; j < m; j++) I[w + i * m + j] = pool[i * n + j];
+    // the ends: 127 × 127 in row 0's first group, -128 × -127 in row 1's second (-128 × 127 in its first, of one group)
+    for (let j = 0; j < 32; j++) { I[w + j] = 127; I[w + m + (groups > 1 ? 32 : 0) + j] = -128; }
+    for (const [name, weights, weight] of [["matmul_q8", w, (i, j) => I[w + i * m + j]], ["matmul_q6", w6, (i, j) => six(i, j, groups)]]) {
+      F.fill(-7, out / 4, out / 4 + rows);
+      k[name](out, x, xs, weights, ws, m, 0, rows);
+      const expected = reference(weight, groups);
+      for (let i = 0; i < rows; i++) {
+        if (F[out / 4 + i] !== expected[i]) throw new Error(`${name} differs at row ${i} of ${groups} groups: ${F[out / 4 + i]} against ${expected[i]}`);
+      }
+    }
   }
   // T166: matmul_q6r (relaxed SIMD) to the bit against matmul_q8r on the int8 values six() takes apart here (the two
   // add their products in the same order), the activations 0..127 as quantize_x(bias = 64) gives them, and the
