@@ -294,11 +294,18 @@ assert.ok(stepsText.includes("what the chain costs beyond each step alone: −0.
 // without it a word, never "undefined"
 assert.ok(layerStepsTable({ ...stepsStep, result: { ...stepsStep.result, cycleMB: 75.5 } }, layerRight, layerCeilings)[0].includes("(none read again before 76 MB of other weights: not from the GPU's caches)"));
 assert.ok(stepsLines[0].includes("(none read again soon: not from the GPU's caches)"), stepsLines[0]);
+// the two DP4A forms share their matrices and attention: their layers less their norms and quantizing (3.25 − 0.375
+// and 3.5 − 0.25) are how far the run's times move; a form that failed, or forms of other matrices, have no such line
+assert.ok(stepsLines.includes("The two forms run the same matrices and attention and differ only in their norms and quantizing, so their layers less those should be the same: " +
+  "2.88 and 3.25 ms, 0.38 apart. That is about how far this run's times move: read the chain, and any part, only where it is larger."), stepsText);
 // every row as wide as the head, nothing undefined, NaN or empty: right, a lost device, a fallback adapter, no check,
 // a step that failed, one unsteady, and a form that failed
 const stepsFailed = { ...stepsStep, result: { ...stepsStep.result, steps: stepsStep.result.steps.map((one) => (one.step === ATT ? { step: ATT, kind: "attention", error: "a | b\nc" } : one)) } };
 const stepsUnsteady = { ...stepsStep, result: { ...stepsStep.result, steps: stepsStep.result.steps.map((one) => (one.step === GLU ? { ...one, unsteady: true } : one)) } };
 const stepsFailedForm = { ...stepsStep, result: { ...stepsStep.result, forms: [stepsStep.result.forms[0], { form: "DP4A, fused (T175)", check: "a layer, DP4A, fused (T175)", error: "refused" }] } };
+assert.ok(!layerStepsTable(stepsFailedForm, layerRight, layerCeilings).some((line) => line.startsWith("The two forms")));
+const otherMatrices = { ...stepsStep, result: { ...stepsStep.result, forms: stepsStep.result.forms.map((form, i) => (i ? form : { ...form, steps: form.steps.map((s) => (s.step === QKV ? { ...s, step: O } : s)) })) } };
+assert.ok(!layerStepsTable(otherMatrices, layerRight, layerCeilings).some((line) => line.startsWith("The two forms")));
 for (const [label, lines] of [["right", stepsLines], ["lost", layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" })],
   ["fallback", layerStepsTable(stepsStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true })], ["no check", layerStepsTable(stepsStep)],
   ["a step failed", layerStepsTable(stepsFailed, layerRight, layerCeilings)], ["unsteady", layerStepsTable(stepsUnsteady, layerRight, layerCeilings)],

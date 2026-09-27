@@ -485,6 +485,18 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
       `what fusing adds to the matrices ${signed(less(matrices, aloneMs))} + the attention ${signed(attention)} + the norms and quantizing ${signed(small)} + the chain ${signed(chain)}. ` +
       `A dispatch of one workgroup takes ${microseconds(floor)} µs: ${form.dispatches} of them ${stepMs(floor) === undefined ? "?" : number(form.dispatches * floor.ms, 2)} ms.`);
   }
+  // T202's review: how far this run's times move. Two forms of the same matrices and attention (DP4A's) differ only in
+  // their norms and quantizing, so their layers less those should come out the same; on lavapipe in CI (steady by the
+  // pairs) they came out 0.4 and 4.2 ms apart in 48, where the chain was −2.4 to 2.7
+  const bigSteps = (form) => form.steps.filter(({ step }) => ["matrix", "attention"].includes(r.steps.find((one) => one.step === step)?.kind))
+    .map(({ step, count }) => `${step} ${count}`).sort().join("\n");
+  if (forms.length === 2 && bigSteps(forms[0]) === bigSteps(forms[1])) {
+    const [a, b] = forms.map((form) => { const s = layerSplit(r, form); return less(s.layer, s.small); });
+    if (a !== undefined && b !== undefined) {
+      lines.push("", `The two forms run the same matrices and attention and differ only in their norms and quantizing, so their layers less those should be the same: ` +
+        `${number(a, 2)} and ${number(b, 2)} ms, ${number(Math.abs(a - b), 2)} apart. That is about how far this run's times move: read the chain, and any part, only where it is larger.`);
+    }
+  }
   if (r.steps.some((one) => one.unsteady) || r.forms.some((form) => form.unsteady)) lines.push("", "Unsteady: the pairs of a submission of n and of 2n were not about twice each other, so those times are rough.");
   return lines;
 }
