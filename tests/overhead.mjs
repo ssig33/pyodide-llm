@@ -10,14 +10,17 @@
 //                  posted on a MessageChannel as worker.js does (not its breath every 50 ms, a turn of the event loop,
 //                  which runPython does not give back): 1000 / tok/s, the number of the status line
 //   outside        generate() less the JS forward of the same round; the median of the rounds and their range
-// and what makes the outside up, each timed alone with Python's garbage collector off, µs a call:
-//   crossing       a call from Python of a JavaScript function that does nothing, with forward()'s arguments
-//   ctypes         a call of a kernel that has nothing to do (add_inplace of 0 numbers)
+// and what makes the outside up, each timed alone with Python's garbage collector off, µs a call. The kernels are
+// timed right after a forward pass, as generate() runs them (the pass has just streamed the weights through the
+// caches: "again" shows what that costs):
 //   penalize, sample   the page's kernels on the real logits of each position; C is how many tokens pass the floor
 //                  (the best's 1e-7) that sample() keeps, the median of the positions
+//   again          sample() once more on the same logits at once: the caches warm again
 //   1 past         sample() on logits of which the best alone passes the floor: its walks over the whole vocabulary
 //   T158's         sample() on T158's artificial logits (uniform in ±10: most of the vocabulary passes the floor)
 //   argmax         sample() at temperature 0: the greedy models' choice (not in the sampled models' outside)
+//   crossing       a call from Python of a JavaScript function that does nothing, with forward()'s arguments
+//   ctypes         a call of a kernel that has nothing to do (add_inplace of 0 numbers)
 //   GC             Python's garbage collector during generate() (gc.callbacks), µs a token
 //   the rest       the outside less crossing, penalize, sample and GC: forward()'s closure, the decoding of the
 //                  text, the generator, next() and the message
@@ -136,22 +139,37 @@ def generated(prompt, steps):
     return llama.stats, collecting[0] * 1000
 
 def sampling():
-    """the kernels on the real logits of each position, timed apart from the forward pass: µs a call, and C"""
-    rng, token, history = np.random.default_rng(1), llama.bos, [llama.bos]
-    penalized = sampled = 0.0
+    """generate()'s steps after each forward pass, timed apart from it: penalize() and sample() on the real logits
+    (the same text as generate(): the same random numbers), sample() once more on them with the caches warm again
+    (another generator), µs a call, and C"""
+    rng, again, token, history = np.random.default_rng(1), np.random.default_rng(2), llama.bos, [llama.bos]
+    spent = {"penalize": 0.0, "sample": 0.0, "again": 0.0}
     past = []
     for pos in range(N):
         out = llama.forward(token, pos)
         began = clock()
         if penalty != 1.0:
             llama.penalize(out, history, penalty)
-        middle = clock()
+        penalized = clock()
         token = llama.sample(out, temperature, topp, rng)
-        sampled += clock() - middle
-        penalized += middle - began
+        sampled = clock()
+        llama.sample(out, temperature, topp, again)
+        spent["again"] += clock() - sampled
+        spent["sample"] += sampled - penalized
+        spent["penalize"] += penalized - began
         past.append(past_floor(out))
         history.append(token)
-    return penalized / N * 1e6, sampled / N * 1e6, statistics.median(past)
+    return {k: v / N * 1e6 for k, v in spent.items()}, statistics.median(past)
+
+def after_forward(step):
+    """step(logits) timed right after each forward pass, as generate() runs it: µs a call"""
+    spent = 0.0
+    for pos in range(N):
+        out = llama.forward(llama.bos, pos)
+        began = clock()
+        step(out)
+        spent += clock() - began
+    return spent / N * 1e6
 
 prompt = PROMPT
 while len(llama.tokenizer.encode(prompt, llama.specials)) < 64:
@@ -167,13 +185,14 @@ for r in range(ROUNDS + 1):  # the first round warms up and is left out
     got["copy"] = js_copy(logits, N) * 1000
     gc.disable()
     try:
-        got["penalize"], got["sample"], got["past"] = sampling()
-        rng = np.random.default_rng(2)
+        spent, got["past"] = sampling()
+        got.update(spent)
+        rng = np.random.default_rng(3)
+        got["alone"] = after_forward(lambda out: llama.sample(alone, temperature, topp, rng))
+        got["artificial"] = after_forward(lambda out: llama.sample(artificial, temperature, topp, rng))
+        got["argmax"] = after_forward(lambda out: llama.sample(out, 0.0, topp, rng))
         got["crossing"] = per_call(lambda i: js_nothing(1, i, True))
         got["ctypes"] = per_call(lambda i: add(address, address, 0))
-        got["alone"] = per_call(lambda i: llama.sample(alone, temperature, topp, rng))
-        got["artificial"] = per_call(lambda i: llama.sample(artificial, temperature, topp, rng))
-        got["argmax"] = per_call(lambda i: llama.sample(logits, 0.0, topp, rng))
         got["encode"] = per_call(lambda i: llama.tokenizer.encode(prompt, llama.specials), 5) / 1000
     finally:
         gc.enable()
@@ -189,7 +208,7 @@ rest = outside * 1000 - m["crossing"] - m["penalize"] - m["sample"] - m["gc"]
 llama.release(); del llama, engine, logits; gc.collect()
 [f"(vocabulary {V}) | {m['js']:.3f} | {m['copy']:.1f} | {m['generate']:.3f} "
  f"| {outside:.3f} ({outside / m['generate'] * 100:.1f}%; {min(cells['outside']):.3f} to {max(cells['outside']):.3f}) "
- f"| {m['crossing']:.1f} | {m['ctypes']:.1f} | {m['penalize']:.1f} | {m['sample']:.1f} ({m['past']:.0f}) | {m['alone']:.1f} "
+ f"| {m['crossing']:.1f} | {m['ctypes']:.1f} | {m['penalize']:.1f} | {m['sample']:.1f} ({m['past']:.0f}) | {m['again']:.1f} | {m['alone']:.1f} "
  f"| {m['artificial']:.1f} ({past_floor(artificial)}) | {m['argmax']:.1f} | {m['gc']:.1f} | {rest:.1f} |",
  f"| {P} | {m['encode']:.3f} | {m['many']:.3f} | {m['prompt']:.3f} ({m['prompt'] / m['many']:.2f}×) |"]
 `);
@@ -199,8 +218,8 @@ llama.release(); del llama, engine, logits; gc.collect()
   promptRows.push(`| ${entry.name} ${prompt}`);
 }
 console.log("A generated token: ms, and µs a call");
-console.log("| model | JS forward (ms) | copy (µs) | generate() (ms) | outside (ms, share; range) | crossing (µs) | ctypes (µs) | penalize (µs) | sample (µs; C) | 1 past (µs) | T158's (µs; C) | argmax (µs) | GC (µs) | the rest (µs) |");
-console.log("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+console.log("| model | JS forward (ms) | copy (µs) | generate() (ms) | outside (ms, share; range) | crossing (µs) | ctypes (µs) | penalize (µs) | sample (µs; C) | again (µs) | 1 past (µs) | T158's (µs; C) | argmax (µs) | GC (µs) | the rest (µs) |");
+console.log("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 for (const row of tokenRows) console.log(row);
 console.log("A prompt: the tokenizer's ms for the whole of it, and ms a token");
 console.log("| model | tokens | encode() (ms) | forwardMany from JS | through generate() |");
