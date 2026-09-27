@@ -104,7 +104,9 @@ const watchdog = setTimeout(async () => {
 }, limit);
 const kind = playwright[channel ? "chromium" : engine], viewport = { width: 390, height: 844 };
 // T135, T148: a runner has no GPU; SwiftShader stands in (its speed means nothing), taken with ?gpuTest=on, refused without
-const gpuTest = /(^|&)gpuTest=on(&|$)/.test(process.env.E2E_QUERY ?? "");
+// (T156's review: gpuTest=only too, a model the GPU can take on the GPU alone: the page's path of a model too large to
+// hold twice, its weights to the GPU as they come and a conversion kept as it came)
+const gpuTest = /(^|&)gpuTest=(on|only)(&|$)/.test(process.env.E2E_QUERY ?? "");
 const swiftShader = gpuTest || process.env.E2E_GPU === "swiftshader";
 const args = swiftShader && kind === playwright.chromium ? ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-webgpu-adapter=swiftshader"] : [];
 if (process.env.E2E_TWICE) {
