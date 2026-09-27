@@ -210,29 +210,50 @@ export function int8_sums(out: usize, w: usize, ws: usize, groups: i32): void {
   }
 }
 
+// T165: the 32 products of one group (a0 b0, a1 b1: 16 int8 each), summed into four int32 lanes. Two products are
+// added in int16 before the widening: 9 instructions, not 11 (V8 on arm64 folds the add into smlal: 6, not 9).
+// int8 times int8 is 16384 at most (-128 times -128), and two such sums are within int16 unless both factors are
+// -128 twice over. The weights and the activations reach -128 only in a group whose scale is below 2.9e-39
+// (quantize_x where 1/scale overflows, T136), so the scale of that product (the two scales multiplied) is 0 in
+// float32 and the lane is multiplied by 0 either way (at most the sign of a zero changes). The lanes hold the same
+// products as before (lane k: products 2k, 2k + 1, 2k + 8, 2k + 9 of each half), so the sums are the same integers.
+// @ts-ignore: decorator
+@inline function dot32(a0: v128, b0: v128, a1: v128, b1: v128): v128 {
+  return i32x4.add(
+    i32x4.extadd_pairwise_i16x8_s(i16x8.add(i16x8.extmul_low_i8x16_s(a0, b0), i16x8.extmul_high_i8x16_s(a0, b0))),
+    i32x4.extadd_pairwise_i16x8_s(i16x8.add(i16x8.extmul_low_i8x16_s(a1, b1), i16x8.extmul_high_i8x16_s(a1, b1))));
+}
+
 // int8 weights (wq) with one float32 scale per group (ws), int8 activations from quantize_x(bias = 0)
+// T165: four groups a turn share one load of their scales (ws times xs, four at a time: the same products as one by
+// one) and one step of the loop, and add into facc in the same order, so the result is the same to the bit
 export function matmul_q8(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, n: i32, r0: i32, r1: i32): void {
   const ng = n / GS;
   for (let i = r0; i < r1; i++) {
     const row = wq + <usize>i * <usize>n;
     const srow = ws + ((<usize>i * <usize>ng) << 2);
     let facc = f32x4.splat(0);
-    for (let g = 0; g < ng; g++) {
-      const o = <usize>(g * GS);
-      const a0 = v128.load(row + o), b0 = v128.load(xq + o);
-      const a1 = v128.load(row + o + 16), b1 = v128.load(xq + o + 16);
-      const acc = i32x4.add(
-        i32x4.add(
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_low_i8x16_s(a0, b0)),
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_high_i8x16_s(a0, b0))),
-        i32x4.add(
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_low_i8x16_s(a1, b1)),
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_high_i8x16_s(a1, b1))));
+    let g = 0;
+    for (; g + 4 <= ng; g += 4) {
+      const sv = f32x4.mul(v128.load(srow + (<usize>g << 2)), v128.load(xs + (<usize>g << 2)));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupQ8(row, xq, g)), f32x4.splat(f32x4.extract_lane(sv, 0))));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupQ8(row, xq, g + 1)), f32x4.splat(f32x4.extract_lane(sv, 1))));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupQ8(row, xq, g + 2)), f32x4.splat(f32x4.extract_lane(sv, 2))));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupQ8(row, xq, g + 3)), f32x4.splat(f32x4.extract_lane(sv, 3))));
+    }
+    for (; g < ng; g++) {
       const s = load<f32>(srow + (<usize>g << 2)) * load<f32>(xs + (<usize>g << 2));
-      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(acc), f32x4.splat(s)));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupQ8(row, xq, g)), f32x4.splat(s)));
     }
     store<f32>(xout + (<usize>i << 2), hsum(facc));
   }
+}
+
+// the four int32 lanes of group g of an int8 row (row) against the int8 activations (xq)
+// @ts-ignore: decorator
+@inline function groupQ8(row: usize, xq: usize, g: i32): v128 {
+  const o = <usize>(g * GS);
+  return dot32(v128.load(row + o), v128.load(xq + o), v128.load(row + o + 16), v128.load(xq + o + 16));
 }
 
 // T98: int6 weights (24 bytes a group, six.ts) with one float32 scale per group: matmul_q8 on the widened groups
@@ -247,13 +268,7 @@ export function matmul_q6(xout: usize, xq: usize, xs: usize, wq: usize, ws: usiz
       const low = v128.load(p), t = sixTops(p);
       const a0 = sixFirst(low, t), b0 = v128.load(xq + o);
       const a1 = sixSecond(low, t), b1 = v128.load(xq + o + 16);
-      const acc = i32x4.add(
-        i32x4.add(
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_low_i8x16_s(a0, b0)),
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_high_i8x16_s(a0, b0))),
-        i32x4.add(
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_low_i8x16_s(a1, b1)),
-          i32x4.extadd_pairwise_i16x8_s(i16x8.extmul_high_i8x16_s(a1, b1))));
+      const acc = dot32(a0, b0, a1, b1);
       const s = load<f32>(srow + (<usize>g << 2)) * load<f32>(xs + (<usize>g << 2));
       facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(acc), f32x4.splat(s)));
     }
