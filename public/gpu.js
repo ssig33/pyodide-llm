@@ -27,7 +27,7 @@
 //                                    T152: count steps of a generation from token at pos (the forward pass and the
 //                                    sampling of each, SAMPLE's), after the keys and values of positions from to pos - 1
 //                                    went up from forward.js's cache; the ids into plan.tokens.ids and the keys and
-//                                    values of their positions into that cache (see generate() below). The answer is
+//                                    values of their positions into plan.staging (see generate() below). The answer is
 //                                    in the control area as a prompt's. Where plan.tokens asks for it, "ready" says
 //                                    tokens ({ form, ms, forms, remembered }: the layer of a token chosen here and its
 //                                    ms a step) or tokensWhy (why they stay on the CPU)
@@ -236,6 +236,17 @@ function copyIn(m, target, address, bytes, offset = 0) {
     const n = Math.min(CHUNK, bytes - done);
     scratch.set(new Uint8Array(m.memory.buffer, address + done, n));
     m.device.queue.writeBuffer(target, offset + done, scratch, 0, n);
+  }
+}
+// T152's review (T160): values float32 of the shared memory at address narrowed to float16 onto the GPU (at offset
+// of target, in bytes of float16), a CHUNK of them at a time: a float32 cache's keys and values going up
+let narrowed;
+function narrowIn(m, target, address, values, offset = 0) {
+  narrowed ??= new Uint16Array(CHUNK / 2);
+  for (let done = 0; done < values; done += narrowed.length) {
+    const n = Math.min(narrowed.length, values - done);
+    m.wgsl.halvesOf(new Float32Array(m.memory.buffer, address + done * 4, n), narrowed);
+    m.device.queue.writeBuffer(target, offset + done * 2, narrowed, 0, n);
   }
 }
 async function readBack(m, source, bytes) {
@@ -1278,28 +1289,32 @@ async function checkTokens(m, form) {
 
 // A request for count steps from token at pos (forward.js's generateMany): the keys and values of positions from to
 // pos - 1 up from forward.js's cache first (cache: its addresses of the keys and the values, its capacity and the
-// bytes of a position, float16 as here), the state (token, pos, the end of the history and its length), the settings
-// and a random number a step; the ids into plan.tokens.ids ([sampled, id, id, ...], a stop token last where one came),
-// and the keys and values of the positions sampled into forward.js's cache, where it still wants the answer
+// bytes of a position; half: float16 as here, else float32, narrowed on the way up: T160, a grouped-query model's),
+// the state (token, pos, the end of the history and its length), the settings and a random number a step; the ids into
+// plan.tokens.ids ([sampled, id, id, ...], a stop token last where one came), and the keys and values of the positions
+// sampled in float16 into plan.staging as a prompt's block's ([keys, values][layer][plan.batch positions]), which
+// forward.js puts into its cache (widened where it is float32), where it still wants the answer
 function generate({ serial, count, pos, from, token, history, length, cache, settings, randoms }) {
   serve(serial, async (wanted) => {
-    const m = model, { plan, wgsl, gen: g } = m, kvRow = plan.kvHeads * plan.headSize * 2;
+    const m = model, { plan, wgsl, gen: g } = m, kvDim = plan.kvHeads * plan.headSize, kvRow = kvDim * 2;
     if (!g?.form) throw new Error("no tokens on this GPU");
     if (pos + count > m.cache.capacity) grow(m, pos + count);
     const at = (block, l, p) => block + l * cache.capacity * cache.row + p * cache.row;
     for (let l = 0; l < plan.layers; l++) {
-      copyIn(m, m.cache.keys[l], at(cache.keys, l, from), (pos - from) * kvRow, from * kvRow);
-      copyIn(m, m.cache.values[l], at(cache.values, l, from), (pos - from) * kvRow, from * kvRow);
+      for (const [block, target] of [[cache.keys, m.cache.keys[l]], [cache.values, m.cache.values[l]]]) {
+        if (cache.half) copyIn(m, target, at(block, l, from), (pos - from) * kvRow, from * kvRow);
+        else narrowIn(m, target, at(block, l, from), (pos - from) * kvDim, from * kvRow);
+      }
     }
     const out = await runTokens(m, tokenStep(m, g.form), { count, pos, keep: true,
       state: wgsl.samplingState({ token, pos, history, length }), settings: wgsl.samplingSettings({ vocab: g.vocab, ...settings }),
       randoms: Float32Array.from({ length: count }, (_, i) => randoms[i] ?? 0) });
     if (!wanted()) return;
-    // (views of just those bytes: T155, not one of the whole of a 64-bit memory)
-    const into = (address) => new Uint8Array(m.memory.buffer, address, out.sampled * kvRow);
-    for (let l = 0; l < plan.layers; l++) {
-      into(at(cache.keys, l, pos)).set(out.kv[0][l].subarray(0, out.sampled * kvRow));
-      into(at(cache.values, l, pos)).set(out.kv[1][l].subarray(0, out.sampled * kvRow));
+    for (let side = 0; side < 2; side++) {
+      for (let l = 0; l < plan.layers; l++) {
+        new Uint8Array(m.memory.buffer, plan.staging + (side * plan.layers + l) * plan.batch * kvRow, out.sampled * kvRow)
+          .set(out.kv[side][l].subarray(0, out.sampled * kvRow));
+      }
     }
     const ids = new Int32Array(m.memory.buffer, plan.tokens.ids, 1 + count);
     ids[0] = out.sampled;

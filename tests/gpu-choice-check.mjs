@@ -3,6 +3,7 @@
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
 import { promptTimes, tokenTimes } from "../public/forward.js";
+import { halvesOf } from "../public/shaders.js";
 
 // a GPU with a fixed cost of 40 ms a block and 0.5 ms a token (16 tokens 48 ms, 64 tokens 72 ms)
 const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
@@ -86,5 +87,35 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   steps.gpu(5);
   assert.equal(steps.of(4).gpu, 5, "12, 5, 5, 50, 5");
   assert.equal(steps.of(4).faster, true);
+}
+// T152's review (T160): halvesOf, a float32 cache's keys and values narrowed on the way up to the GPU. Every float16
+// back to itself (NaN to a NaN), the float32 half way between two neighbours to the even one, and a step of float32
+// either side of it to the nearer one; past the largest to the infinity, and below half the least subnormal to 0
+{
+  const toFloat = (h) => {
+    const sign = h & 0x8000 ? -1 : 1, exponent = (h >> 10) & 0x1f, fraction = h & 0x3ff;
+    if (exponent === 0x1f) return fraction ? NaN : sign * Infinity;
+    return exponent ? sign * 2 ** (exponent - 15) * (1 + fraction / 1024) : sign * 2 ** -24 * fraction;
+  };
+  const one = (x) => halvesOf(Float32Array.of(x), new Uint16Array(1))[0];
+  const nan = (h) => (h & 0x7c00) === 0x7c00 && (h & 0x3ff) !== 0;
+  for (let h = 0; h < 0x10000; h++) {
+    if (nan(h)) assert.ok(nan(one(toFloat(h))), `NaN ${h.toString(16)}`);
+    else assert.equal(one(toFloat(h)), h, `float16 ${h.toString(16)} back to itself`);
+  }
+  const f32 = new Float32Array(1), bits = new Uint32Array(f32.buffer);
+  const beside = (x, step) => { f32[0] = x; bits[0] += step; return f32[0]; };
+  for (const sign of [0, 0x8000]) {
+    // (h and h + 1 finite; a float32 one step nearer 0 than the middle goes to h, one step farther to h + 1)
+    for (let h = sign; h < sign + 0x7bff; h++) {
+      const middle = (toFloat(h) + toFloat(h + 1)) / 2;  // exact in float32
+      assert.equal(one(middle), h & 1 ? h + 1 : h, `half way above ${h.toString(16)} to the even one`);
+      assert.equal(one(beside(middle, -1)), h, `just short of half way above ${h.toString(16)}`);
+      assert.equal(one(beside(middle, 1)), h + 1, `just past half way above ${h.toString(16)}`);
+    }
+  }
+  assert.equal(one(65520), 0x7c00, "past the largest: the infinity");
+  assert.equal(one(2 ** -25), 0, "half the least subnormal: 0 (the even one)");
+  assert.equal(one(-(2 ** -26)), 0x8000, "below it: -0");
 }
 console.log("ok");

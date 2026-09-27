@@ -955,8 +955,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       Object.values(gpuVectors()).reduce((bytes, { size }) => bytes + layers * size * 4, 0) + 2 * layers * seqLen * kvDim * 2;
   }
   // T152: why a generation's steps stay on the CPU, or null. A step on the GPU is T150's and T175's fused layer (gpu.js):
-  // Llama's (RMSNorm, RoPE on whole heads, SwiGLU) and no more yet, its keys and values in float16 as the GPU's (T110:
-  // an int8 model on a shared memory), no outlier channels (T92: the classifier's input with them apart), a classifier
+  // Llama's (RMSNorm, RoPE on whole heads, SwiGLU) and no more yet (the keys and values in float16 as the GPU's, or in
+  // float32 where the CPU keeps them so: T160, widened on the way back and narrowed on the way up), no outlier
+  // channels (T92: the classifier's input with them apart), a classifier
   // and an embedding of int8 or int6 in groups of 32; and the memory for the classifier, the embedding where it is
   // another table, RoPE's table and the vocabulary's three arrays of the sampling, besides the layers
   function tokensUnfit() {
@@ -964,7 +965,6 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (bq) return "Qwen2's biases are not on the GPU's tokens yet";
     if (qNorm) return "Qwen3's norms of the heads are not on the GPU's tokens yet";
     if (rotary > 0 && rotary < headSize) return "RoPE on a part of the heads is not on the GPU's tokens yet";
-    if (!halfKV) return "keys and values in float32 are not on the GPU's tokens";
     if (channels.length) return "the classifier's outlier channels are not on the GPU's tokens";
     const embedding = T.token_embedding_table;
     if (!wcls?.int8 || wcls.group !== 32 || !["int8", "int6"].includes(embedding.kind) || embedding.group !== 32) {
@@ -1337,7 +1337,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuSerial = ++gpuRequests;
       Atomics.store(ctl, GPU_WANTED, gpuSerial);
       gpuWorker.postMessage({ type: "tokens", serial: gpuSerial, count, pos, from: Math.min(gpuEnd, pos), token, history: list(history), length,
-        cache: { keys, values, capacity, row: KV }, settings: { temperature, topp, penalty, stops: stopList }, randoms: list(randoms) });
+        cache: { keys, values, capacity, row: KV, half: halfKV }, settings: { temperature, topp, penalty, stops: stopList }, randoms: list(randoms) });
       if (!waitUntil(GPU_DONE, (seen) => seen === gpuSerial, GPU_BEAT)) {
         stopGpu(`the GPU's worker stopped answering for ${stalledMs / 1000} s`);
         return undefined;
@@ -1351,6 +1351,15 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (!(sampled >= 1 && sampled <= count)) {
         stopGpu(`the GPU sampled ${sampled} of ${count} tokens`);
         return undefined;
+      }
+      // the keys and values of the positions sampled, float16 in the staging place as a prompt's block's (T147), into the
+      // cache (T160's review of T152: a float32 cache, a grouped-query model's, widens them as a prompt's)
+      for (let l = 0; l < layers; l++) {
+        const layerKeys = keys + l * capacity * KV, layerValues = values + l * capacity * KV;
+        for (let t = 0; t < sampled; t++) {
+          cacheHalves(layerKeys + (pos + t) * KV, layerValues + (pos + t) * KV,
+            staging + (l * GPU_BLOCK + t) * kvDim * 2, staging + ((layers + l) * GPU_BLOCK + t) * kvDim * 2);
+        }
       }
       gpuEnd = pos + sampled;
       gpuSampled += sampled;

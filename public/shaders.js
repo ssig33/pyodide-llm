@@ -2443,6 +2443,40 @@ const STATE = /* wgsl */ `struct State {
   recent: array<u32, ${REPETITION_WINDOW}>,
 }`;
 export const STATE_BYTES = 32 + 4 * REPETITION_WINDOW;
+/** T152's review (T160): float32 values into float16 bits, rounded to the nearest (ties to even), as the GPU's own keys
+ * and values are (pack2x16float) where it rounds so: a float32 cache's keys and values going up to the GPU. out: a
+ * Uint16Array as long as floats. Infinities and NaN stay so, what is past float16's largest becomes an infinity, and
+ * what is below half its least subnormal 0. */
+const floatWord = new Float32Array(1), floatBits = new Uint32Array(floatWord.buffer);
+export function halvesOf(floats, out) {
+  for (let i = 0; i < floats.length; i++) {
+    floatWord[0] = floats[i];
+    const bits = floatBits[0], sign = (bits >>> 16) & 0x8000, exponent = (bits >>> 23) & 0xff, fraction = bits & 0x7fffff;
+    let half;
+    if (exponent === 0xff) half = 0x7c00 | (fraction ? 0x200 : 0);
+    else {
+      const e = exponent - 112;  // float16's biased exponent
+      if (e >= 0x1f) half = 0x7c00;
+      else if (e <= 0) {
+        // a subnormal (or 0): the fraction with its leading 1, shifted to units of 2^-24
+        const shift = 14 - e;
+        if (shift > 24) half = 0;
+        else {
+          const whole = fraction | 0x800000, rest = whole & ((1 << shift) - 1), middle = 1 << (shift - 1);
+          half = whole >>> shift;
+          if (rest > middle || (rest === middle && (half & 1))) half += 1;
+        }
+      } else {
+        const rest = fraction & 0x1fff;
+        half = (e << 10) | (fraction >>> 13);
+        // (a carry into the exponent is right: to the next power of two, or to the infinity at the top)
+        if (rest > 0x1000 || (rest === 0x1000 && (half & 1))) half += 1;
+      }
+    }
+    out[i] = sign | half;
+  }
+  return out;
+}
 /** The state a run starts from: the token it feeds first, at pos, and the history before it (BOS, the prompt and
  * the tokens sampled before, the fed token last: the penalty's window is its latest REPETITION_WINDOW). length (T152:
  * the engine hands the latest of a longer history over): how long the history is, of which history is the end. */
