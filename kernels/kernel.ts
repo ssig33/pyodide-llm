@@ -518,6 +518,15 @@ export function to_f16(out: usize, x: usize, n: i32): void {
   }
 }
 
+// T160 (the review of (4)): float16 to float32, n values: the keys and values the GPU writes back (float16) into a
+// float32 cache (a grouped-query model's), widened as attention_f16 widens them. In JavaScript one at a time this took
+// 27 to 33 ns a value on CI's runners, 1.7 ms a token of Qwen3 0.6B's prompt.
+export function from_f16(out: usize, x: usize, n: i32): void {
+  let i = 0;
+  for (; i + 4 <= n; i += 4) v128.store(out + (<usize>i << 2), halves4(x + (<usize>i << 1)));
+  for (; i < n; i++) store<f32>(out + (<usize>i << 2), half(x + (<usize>i << 1)));
+}
+
 export function layernorm(out: usize, x: usize, w: usize, b: usize, n: i32): void {
   // GPT-2 normalizes by the mean and the variance, and adds a bias after the scale
   let sum = f32x4.splat(0);

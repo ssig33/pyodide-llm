@@ -635,16 +635,16 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (positions) k.add_inplace(rows + t * stride, positions + (pos0 + t) * D, dim);
     }
   }
-  // T147: a token's key and value in float16 (the GPU's) into the cache at keyAt and valueAt
+  // T147: a token's key and value in float16 (the GPU's) into the cache at keyAt and valueAt. T160: a float32 cache
+  // (a grouped-query model's) widens them with a kernel, as attention_f16 reads them (halfToFloat one at a time took
+  // 27 to 33 ns a value on CI's runners: 1.7 ms a token of Qwen3 0.6B's prompt)
   function cacheHalves(keyAt, valueAt, key, value) {
     if (halfKV) {
       U.copyWithin(keyAt, key, key + kvDim * 2);
       U.copyWithin(valueAt, value, value + kvDim * 2);
     } else {
-      for (let i = 0; i < kvDim; i++) {
-        F[keyAt / 4 + i] = halfToFloat(H[key / 2 + i]);
-        F[valueAt / 4 + i] = halfToFloat(H[value / 2 + i]);
-      }
+      k.from_f16(keyAt, key, kvDim);
+      k.from_f16(valueAt, value, kvDim);
     }
   }
   // a token's key and value (float32, at key and value) into the cache at keyAt and valueAt

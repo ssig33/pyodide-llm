@@ -377,6 +377,14 @@ for heads, head_size in ((1, 65536), (65536, 1)):
     kernel["attention_f16"](out16.ctypes.data, query.ctypes.data, every.ctypes.data, every.ctypes.data, scores.ctypes.data,
                             0, heads, heads, head_size, 0, heads)
     assert np.array_equal(out32.view(np.uint32), out16.view(np.uint32)), f"attention_f16 widens a half wrong ({heads} heads of {head_size})"
+# T160 (the review of (4)): from_f16, the GPU's float16 keys and values into a float32 cache, widens every half as
+# attention_f16 does (to the bit, -0 included), four at a time and the remainders, and writes nothing past n
+widened = np.empty(65536 + 3, dtype=np.float32)
+for count in (65536, 65535, 65534, 65533, 3, 0):
+    widened[:] = np.nan
+    kernel["from_f16"](widened.ctypes.data, every.ctypes.data, count)
+    assert np.array_equal(widened[:count].view(np.uint32), stand[:count].view(np.uint32)), f"from_f16 widens a half wrong (n {count})"
+    assert np.isnan(widened[count:]).all(), f"from_f16 wrote past n {count}"
 # NumPy takes over when the kernels cannot be loaded
 assert llama2_numpy.Llama(read("stories15M.f32"), read("tokenizer.bin"), kernels="missing.so").backend == "NumPy"
 

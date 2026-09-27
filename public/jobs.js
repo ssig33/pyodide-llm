@@ -55,7 +55,7 @@ export const blockRows = (kind, n) => Math.max(1, Math.floor(BLOCK_BYTES / (kind
 export const ADDRESSES = {
   matmul_f32: [0, 1, 2], quantize_x: [0, 1, 2], quantize6_x: [0, 1, 2], six_sums: [0, 1, 2], int8_sums: [0, 1, 2], widen_bf16: [0, 1], widen_q8_0: [0, 1], matmul_q8: [0, 1, 2, 3, 4],
   matmul_q6: [0, 1, 2, 3, 4], rmsnorm: [0, 1, 2], rope: [0, 1, 2], attention: [0, 1, 2, 3, 4], attention_f16: [0, 1, 2, 3, 4],
-  to_f16: [0, 1], layernorm: [0, 1, 2, 3], gelu: [0, 1, 2], swiglu: [0, 1, 2], add_columns: [0, 1, 2], add_inplace: [0, 1],
+  to_f16: [0, 1], from_f16: [0, 1], layernorm: [0, 1, 2, 3], gelu: [0, 1, 2], swiglu: [0, 1, 2], add_columns: [0, 1, 2], add_inplace: [0, 1],
   argmax: [0], penalize: [0, 1], sample: [0, 5, 6], matmul_q8r: [0, 1, 2, 3, 4, 5], matmul_q6r: [0, 1, 2, 3, 4, 5],
   matmul_q8r_tile: [0, 1, 2, 3, 4, 5],
 };
