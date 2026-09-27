@@ -8,7 +8,7 @@
 // and hid that the tile was up to 1.6 times as slow on the EPYC 9V74 and 9V45 at 4 to 8 tokens (--megabytes 0 times
 // that way). Compiles this tree's kernel_relaxed.ts with AssemblyScript into .tmp/tile-bench/ (needs `npm ci`).
 //
-//   node tests/tile-bench.mjs [--rounds 2] [--turns 5] [--megabytes 512]
+//   node tests/tile-bench.mjs [--rounds 2] [--turns 5] [--megabytes 512] [--shapes 2048x2048,4096x4096]
 //
 // The shapes of llm-jp-3 150M's layers (512, hidden 2048), Qwen2.5 0.5B's (896, 4864), Llama 3.2 1B's (2048, its k
 // and v 512, hidden 8192) and the widths of the 3B to 8B models (2560 to 4096). G MAC/s is rows x n x tokens a second.
@@ -80,7 +80,8 @@ fs.mkdirSync(work, { recursive: true });
 execFileSync("npx", ["asc", "-O3", "--noAssert", "--runtime", "stub", "--importMemory", "--noExportMemory", "--initialMemory", "1",
   "--sharedMemory", "--maximumMemory", "32768", root + "kernels/kernel_relaxed.ts", "-o", work + "relaxed-shared.wasm",
   "--enable", "simd,relaxed-simd,threads"], { cwd: root, stdio: "inherit" });
-const shapes = [[512, 512], [2048, 512], [512, 2048], [896, 896], [4864, 896], [896, 4864], [2048, 2048], [8192, 2048],
+const listed = args.includes("--shapes") ? args[args.indexOf("--shapes") + 1].split(",").map((shape) => shape.split("x").map(Number)) : null;
+const shapes = listed ?? [[512, 512], [2048, 512], [512, 2048], [896, 896], [4864, 896], [896, 4864], [2048, 2048], [8192, 2048],
   [2048, 8192], [2560, 2560], [3072, 3072], [3584, 3584], [4096, 4096]];
 const most = Math.max(...shapes.map(([rows, n]) => rows * n * 1.25));
 const pages = Math.ceil((Math.max(megabytes * 2 ** 20, 2 * most) + 8 * 2 ** 20) / 65536);
