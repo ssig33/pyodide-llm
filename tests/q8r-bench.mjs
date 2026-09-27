@@ -14,6 +14,7 @@
 // loads in L1. A form at the read's GB/s is held by the memory there, not by its own instructions.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..") + "/";
@@ -46,6 +47,9 @@ execFileSync("npx", [...asc, root + "kernels/ceilings.ts", "-o", work + "ceiling
 execFileSync("npx", [...asc, root + "kernels/ceilings_relaxed.ts", "-o", work + "ceilings_relaxed.wasm", "--enable", "simd,relaxed-simd"], { cwd: root, stdio: "inherit" });
 const ceilings = { ...instance(work + "ceilings.wasm"), ...instance(work + "ceilings_relaxed.wasm") };
 
+// the runner's CPU by name: GitHub's ubuntu-latest hands out different ones (T167's review: EPYC 7763, 9V74 and 9V45
+// and one more, with speed-ups from 0.93 to 1.12 on the same code)
+console.log(`cpu: ${os.cpus()[0]?.model ?? "unknown"}, ${os.cpus().length} logical cores, ${process.arch}`);
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
 {  // relaxed_dot with its two loads, on 8 KB at 4096 (below the matrices), the second 4 KB 0..127 as the loop wants
   const I = new Int8Array(memory.buffer);
@@ -102,13 +106,15 @@ for (const [rows, n, calls] of [[8192, 8192, 1], [2048, 2048, 12], [256, 1024, 2
       + `tree against main ${error(outputs.tree, outputs.main).toExponential(2)}, ${same} of ${rows} rows the same to the bit`);
   }
   const time = (run, k) => { const t0 = performance.now(); for (let c = 0; c < calls; c++) run(k); return (performance.now() - t0) / calls; };
-  const readBytes = rows * ng * 40, read = () => ceilings.read(w8, readBytes, 1);  // as many bytes as q8r's, from w8 on
+  // the read: as many bytes as q8r's, from w8 on, after the turns of the kernels and not between them (between them
+  // it read w8 just before main's q8r and not before the tree's)
+  const readBytes = rows * ng * 40, read = () => ceilings.read(w8, readBytes, 1);
   for (let r = 0; r < rounds; r++) {
     const ms = { read: [] };
     for (let t = 0; t < turns; t++) {
       for (const [name, k] of Object.entries(kernels)) for (const [kernel, { run }] of Object.entries(runs)) (ms[`${kernel} ${name}`] ??= []).push(time(run, k));
-      ms.read.push(time(read));
     }
+    for (let t = 0; t < turns; t++) ms.read.push(time(read));
     const readSpeed = readBytes / median(ms.read) / 1e6;
     const line = [`read ${readSpeed.toFixed(2)} GB/s`];
     for (const [kernel, { bytes }] of Object.entries(runs)) {
