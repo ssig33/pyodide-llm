@@ -189,6 +189,20 @@ for spread in (0.5, 2.0, 6.0, 12.0):
 lonely = np.full(fast.vocab_size, -100.0, dtype=np.float32)
 lonely[123] = 50.0
 assert fast.sample(lonely, 0.7, 0.9, generator) == 123 and 0 <= fast.sample(np.zeros_like(lonely), 0.7, 0.9, generator) < lonely.size
+# T178: a few tokens above the floor and a low top-p (count * topp < 1): llama2.c's cutoff (1 - topp) / (count - 1)
+# was above all of them, and the kernel drew a word from outside the vocabulary, NumPy an IndexError. The nucleus is
+# the most probable token alone (the others add up to less than 1 - topp)
+def few(above):
+    logits = np.full(fast.vocab_size, -100.0, dtype=np.float32)
+    logits[:above] = [5.0 + 0.1 * k for k in range(above)]
+    return logits
+for above in (2, 3, 5):
+    for topp in (0.05, 0.1, 0.2):
+        for temperature in (0.1, 1.0):
+            for value in (0.0, 0.5, 1.0 - 1e-12):
+                picks = (fast.sample(few(above), temperature, topp, Fixed(value)),
+                         llama2_numpy.Llama.sample(fast, few(above), temperature, topp, Fixed(value)))
+                assert picks == (above - 1, above - 1), (above, topp, temperature, value, picks)
 history = [int(token) for token in generator.integers(0, fast.vocab_size, 100)] + [5, 5, 5]
 ours, theirs = logits.copy(), logits.copy()
 fast.penalize(ours, history, 1.3)
@@ -366,9 +380,48 @@ def kernel_pick(buffer, temperature, topp, value, history, penalty):
       }
     }
   }
+  // T178: the few tokens above the floor under a low top-p, as the kernel's check above: the most probable one alone
+  for (const above of [2, 3, 5]) {
+    const logits = new Float32Array(vocab).fill(-100);
+    for (let k = 0; k < above; k++) logits[k] = 5 + 0.1 * k;
+    for (const topp of [0.05, 0.1, 0.2]) {
+      for (const temperature of [0.1, 1]) {
+        for (const value of [0, 0.5, 1 - 1e-12]) {
+          const result = pick(new Uint8Array(logits.buffer), temperature, topp, value, [], 1);
+          const [theirs] = result.toJs();
+          result.destroy();
+          const token = sampleLikeCpu(logits, temperature, topp, value);
+          if (token !== above - 1 || theirs !== above - 1) {
+            throw new Error(`T178: sampleLikeCpu picked ${token}, the kernel ${theirs} of ${above} (top-p ${topp}, T ${temperature}, r ${value})`);
+          }
+        }
+      }
+    }
+  }
   pick.destroy();
   if (same < 0.95 * cases) throw new Error(`sampleLikeCpu picked the kernel's token in ${same} of ${cases} cases only`);
   console.log(`T151: sampleLikeCpu picked the kernel's token in ${same} of ${cases} cases (the rest a neighbour of the same logit)`);
+}
+// T178: llm-jp-3 150M under a low temperature and top-p, as a visitor may set them (the page takes top-p from 0.05):
+// before, all 8 runs of 160 tokens here ended in an IndexError (the kernel drew a word outside the vocabulary; none
+// did in 64 tokens: it comes when the penalty has flattened the few likely tokens of a loop)
+if (fs.existsSync(root + "llm-jp-3-150m.bin")) {
+  const { MODELS } = await import("../src/models.js");
+  const entry = MODELS.find((m) => m.id === "llm-jp-3-150m");
+  pyodide.FS.writeFile("llm-jp.bin", fs.readFileSync(root + entry.checkpoint));
+  pyodide.FS.writeFile("llm-jp.tokenizer.bin", fs.readFileSync(root + entry.tokenizer));
+  pyodide.globals.set("OPTIONS", pyodide.toPy(entry.options));
+  console.log(pyodide.runPython(`
+import gc
+llmjp = kernel_llama(read("llm-jp.bin"), read("llm-jp.tokenizer.bin"), **OPTIONS)
+written = []
+for temperature, topp in ((0.1, 0.1), (0.1, 0.05)):
+    for seed in range(4):
+        written.append("".join(llmjp.generate(${JSON.stringify(entry.prompt)}, steps=160, temperature=temperature, topp=topp,
+                                              repetition_penalty=${entry.generation.repetition_penalty}, seed=seed)))
+llmjp.release(); del llmjp; gc.collect()
+f"T178: llm-jp-3 150M wrote {len(written)} texts at a low temperature and top-p, the first: {written[0]!r}"
+`));
 }
 console.log(`Pyodide ${version}, ${report} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
 console.log("ok");

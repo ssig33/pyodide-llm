@@ -82,3 +82,19 @@ def test_penalize_looks_only_at_the_last_tokens(llama):
     history = [3] + [0] * REPETITION_WINDOW
     llama.penalize(logits, history, 2.0)
     assert logits == pytest.approx([0.5, 1.0, 1.0, 1.0])  # token 3 fell out of the window
+
+
+@pytest.mark.parametrize("topp", [0.05, 0.1, 0.2, 0.45])
+@pytest.mark.parametrize("above", [1, 2, 3, 5])
+def test_a_low_top_p_over_few_likely_tokens(llama, topp, above):
+    """T178: with a few tokens above the floor and n * topp < 1, llama2.c's cutoff (1 - topp) / (n - 1) was above all
+    of them, nothing was left and sample() read past the end (IndexError). The nucleus is still the top-p set."""
+    rng = np.random.default_rng(above)
+    for spread in (0.0, 0.05, 0.5):
+        logits = np.full(200, -100.0, dtype=np.float32)
+        logits[rng.choice(200, above, replace=False)] = (5.0 + rng.standard_normal(above) * spread).astype(np.float32)
+        for temperature in (0.1, 0.2, 1.0):
+            drawn = {llama.sample(logits, temperature, topp, FixedRng([u])) for u in np.linspace(0.0, 1.0, 101)[:-1]}
+            nucleus = reference_nucleus(logits, temperature, topp)
+            # equal logits: any of them is the most probable one (the sort decides which)
+            assert drawn <= set(np.flatnonzero(logits == logits.max()).tolist()) if spread == 0.0 else drawn == nucleus

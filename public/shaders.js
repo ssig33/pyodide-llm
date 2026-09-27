@@ -2466,11 +2466,12 @@ export function walkLikeCpu(logits, temperature, topp) {
   // it. Only a random number of 0 draws such a token (tests/smoke.mjs found one: T151's review round)
   const simd = probs.length - (probs.length % 4);
   probs.forEach((x, k) => (probs[k] = x < -87 ? (k < simd ? f(Math.exp(-87)) : 0) : f(Math.exp(x))));
-  let total = 0;
-  for (const p of probs) total += p;
+  let total = 0, top = 0;
+  for (const p of probs) (total += p), (top = Math.max(top, p));
   let order = probs.map((_, k) => k), last = probs.length - 1;
   if (nucleus) {
-    const cutoff = ((1 - f(topp)) / (probs.length > 1 ? probs.length - 1 : 1)) * total;
+    // the most probable token always stays (kernel.ts, T178)
+    const cutoff = Math.min(((1 - f(topp)) / (probs.length > 1 ? probs.length - 1 : 1)) * total, top);
     order = order.filter((k) => probs[k] >= cutoff).sort((a, b) => probs[b] - probs[a] || index[a] - index[b]);
     const limit = f(topp) * total;
     let sum = 0;

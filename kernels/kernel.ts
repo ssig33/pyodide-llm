@@ -651,12 +651,19 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
     store<f32>(address, fexp(load<f32>(address) / temperature));
   }
   let total: f64 = 0;
-  for (i = 0; i < count; i++) total += load<f32>(probs + (<usize>i << 2));
+  let top: f32 = 0;
+  for (i = 0; i < count; i++) {
+    const p = load<f32>(probs + (<usize>i << 2));
+    total += p;
+    top = max(top, p);
+  }
   let last = count - 1;
   let mass = total;
   if (nucleus) {
-    // Tokens below (1 - topp) / (n - 1) cannot be part of the nucleus (llama2.c), so they need not be sorted
-    const cutoff: f64 = (1.0 - <f64>topp) / <f64>(count > 1 ? count - 1 : 1) * total;
+    // Tokens below (1 - topp) / (n - 1) cannot be part of the nucleus (llama2.c), so they need not be sorted. That
+    // holds while one token at least stays: when all are below it (n * topp < 1, which the floor above makes possible,
+    // T178), the others add up to less than (1 - topp), so the nucleus is the most probable token alone. It always stays
+    const cutoff: f64 = min((1.0 - <f64>topp) / <f64>(count > 1 ? count - 1 : 1) * total, <f64>top);
     let likely = 0;
     for (let k = 0; k < count; k++) {
       const p = load<f32>(probs + (<usize>k << 2));

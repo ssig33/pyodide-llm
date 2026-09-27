@@ -1106,7 +1106,11 @@ class Llama:
         if nucleus:
             # Top-p (nucleus) sampling: only the most probable tokens whose probabilities add up to topp.
             # Tokens below (1 - topp) / (n - 1) cannot be part of that set (llama2.c), so they need not be sorted.
-            likely = np.flatnonzero(probabilities >= (1.0 - topp) / max(probabilities.size - 1, 1))
+            # That holds while one token at least stays: when all are below it (n * topp < 1, which the floor above
+            # makes possible, T178), the others add up to less than (1 - topp), so the set is the most probable token
+            # alone. It always stays
+            cutoff = min((1.0 - topp) / max(probabilities.size - 1, 1), probabilities.max())
+            likely = np.flatnonzero(probabilities >= cutoff)
             likely = likely[np.argsort(-probabilities[likely])]
             candidates, probabilities = candidates[likely], probabilities[likely]
             cumulative = np.cumsum(probabilities)
