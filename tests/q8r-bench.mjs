@@ -47,8 +47,8 @@ execFileSync("npx", [...asc, root + "kernels/ceilings.ts", "-o", work + "ceiling
 execFileSync("npx", [...asc, root + "kernels/ceilings_relaxed.ts", "-o", work + "ceilings_relaxed.wasm", "--enable", "simd,relaxed-simd"], { cwd: root, stdio: "inherit" });
 const ceilings = { ...instance(work + "ceilings.wasm"), ...instance(work + "ceilings_relaxed.wasm") };
 
-// the runner's CPU by name: GitHub's ubuntu-latest hands out different ones (T167's review: EPYC 7763, 9V74 and 9V45
-// and one more, with speed-ups from 0.93 to 1.12 on the same code)
+// the runner's CPU by name: GitHub's ubuntu-latest hands out different ones (T167's review: EPYC 7763, 9V74 and 9V45,
+// Xeon 6973P-C, 8573C and 8370C, where the same change was 0.88 to 1.18 times main)
 console.log(`cpu: ${os.cpus()[0]?.model ?? "unknown"}, ${os.cpus().length} logical cores, ${process.arch}`);
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
 {  // relaxed_dot with its two loads, on 8 KB at 4096 (below the matrices), the second 4 KB 0..127 as the loop wants
