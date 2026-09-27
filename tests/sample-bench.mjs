@@ -27,7 +27,8 @@ const args = process.argv.slice(2);
 const option = (name, value) => (args.includes(name) ? args[args.indexOf(name) + 1] : value);
 const rounds = Number(option("--rounds", 5)), tokens = Number(option("--tokens", 128));
 const commits = option("--commits", "").split(",").filter(Boolean);
-const ids = args.filter((a, i) => !a.startsWith("--") && !(args[i - 1] ?? "").startsWith("--"));
+const staged = args.includes("--stages");
+const ids = args.filter((a, i) => !a.startsWith("--") && !["--rounds", "--tokens", "--commits"].includes(args[i - 1]));
 const work = root + ".tmp/sample-bench/";
 
 // main's kernels (CI checks out one commit: fetch main's, and the commits asked for)
@@ -37,6 +38,21 @@ for (const sha of commits) { try { execFileSync("git", ["fetch", "--depth=1", "o
 const forms = { main: (file) => git("show", `origin/main:kernels/${file}`) };
 for (const sha of commits) forms[sha.slice(0, 7)] = (file) => git("show", `${sha}:kernels/${file}`);
 forms.tree = (file) => fs.readFileSync(`${root}kernels/${file}`, "utf8");
+// --stages: the tree's sample() made to return after each of its steps (stop_at(s)), to see what each step costs
+const STAGES = ["the best", "the floor", "exp()", "the total", "the cutoff", "the sort"];
+const ANCHORS = ["  const nucleus = topp > 0 && topp < 1;", "  const inverse = f32x4.splat(<f32>1.0 / temperature);", "  let total: f64 = 0;",
+  "  let last = count - 1;", "    // the most probable tokens whose probabilities add up to topp", "  const target: f64 = random * mass;"];
+if (staged) {
+  forms.stages = (file) => {
+    let text = forms.tree(file);
+    if (file !== "kernel.ts") return text;
+    ANCHORS.forEach((anchor, s) => {
+      if (text.split(anchor).length !== 2) throw new Error(`--stages: kernel.ts's sample() has no single ${JSON.stringify(anchor)}`);
+      text = text.replace(anchor, `  if (stopAt == ${s}) return ${s};\n${anchor}`);
+    });
+    return text + "\nlet stopAt: i32 = -1;\nexport function stop_at(s: i32): void { stopAt = s; }\n";
+  };
+}
 
 const memory = new WebAssembly.Memory({ initial: 1, maximum: 16384 });
 const kernels = {};
@@ -48,13 +64,13 @@ for (const [name, read] of Object.entries(forms)) {
     dir + "kernel.ts", "-o", dir + "plain.wasm", "--enable", "simd"], { cwd: root, stdio: "inherit" });
   kernels[name] = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(dir + "plain.wasm")), { env: { memory } }).exports;
 }
-const names = Object.keys(kernels);
+const names = Object.keys(kernels).filter((n) => n !== "stages");
 
 const { pyodide: py } = await pyodideWithEngine();
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
 console.log(`${os.cpus()[0]?.model ?? "?"} (${process.arch}) × ${os.cpus().length}, Node ${process.version}, load ${os.loadavg().map((l) => l.toFixed(2)).join(" ")}; ` +
   `${rounds} rounds, ${tokens} tokens; forms ${names.join(", ")}`);
-const rows = [];
+const rows = [], stageRows = [];
 for (const id of ids.length ? ids : ["llm-jp-3-150m", "tiny-lm"]) {
   const entry = MODELS.find((m) => m.id === id);
   if (!entry) throw new Error(`${id} is not a model of src/models.js`);
@@ -150,11 +166,36 @@ llama.release(); del llama
   const m = Object.fromEntries(Object.entries(cells).map(([k, v]) => [k, median(v)]));
   const cell = (kind, name) => `${m[`${kind} ${name}`].toFixed(1)}${name === "main" ? "" : ` (${(m[`${kind} main`] / m[`${kind} ${name}`]).toFixed(2)}×)`}`;
   rows.push(`| ${entry.name} | ${V} | ${median(C)} | ${median(L)} | ${median(K)} | ${names.map((n) => cell("sample", n)).join(" | ")} | ${names.map((n) => cell("walk", n)).join(" | ")} |`);
+  if (staged) {
+    const stages = kernels.stages, spent = {};
+    for (let r = 0; r <= rounds; r++) {
+      const got = Array(STAGES.length + 1).fill(0);
+      for (let pos = 0; pos < tokens; pos++) {
+        for (let t = 0; t <= STAGES.length; t++) {
+          const s = (pos + t) % (STAGES.length + 1);
+          stages.stop_at(s < STAGES.length ? s : -1);
+          F().set(at(pos));
+          const began = performance.now();
+          stages.sample(logits, V, temperature, topp, (pos * 0.6180339887) % 1, probs, index);
+          got[s] += performance.now() - began;
+        }
+      }
+      if (r) got.forEach((v, s) => (spent[s] ??= []).push(v / tokens * 1000));
+    }
+    const until = Object.values(spent).map(median);
+    stageRows.push(`| ${entry.name} | ${until.map((v, s) => `${(s ? v - until[s - 1] : v).toFixed(1)}`).join(" | ")} | ${until[STAGES.length].toFixed(1)} |`);
+  }
   console.log(`${entry.name}: every form drew main's token in ${checked} draws (${tokens} positions)`);
 }
 console.log("The sampling kernel: µs a call, the median of the rounds (× against main's)");
 console.log(`| model | vocabulary | C | L | K | ${names.map((n) => `sample ${n}`).join(" | ")} | ${names.map((n) => `walk ${n}`).join(" | ")} |`);
 console.log(`|---|${"---:|".repeat(4 + 2 * names.length)}`);
 for (const row of rows) console.log(row);
+if (staged) {
+  console.log("Each step of the tree's sample() (--stages: returning after it), µs a call, the median of the rounds");
+  console.log(`| model | ${STAGES.join(" | ")} | the draw | all |`);
+  console.log(`|---|${"---:|".repeat(STAGES.length + 2)}`);
+  for (const row of stageRows) console.log(row);
+}
 console.log(`load after: ${os.loadavg().map((l) => l.toFixed(2)).join(" ")}`);
 process.exit(0);
