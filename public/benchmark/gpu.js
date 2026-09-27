@@ -1369,8 +1369,8 @@ async function layerSteps() {
   return scoped(async (owned) => {
     const parts = layerParts(shape, LAYER_POS, copies, owned, undefined, fallback ? 0 : MATVEC_BYTES);
     const caches = parts.caches();
-    // the fewest MB of weights (or caches) read before the same ones again: the layer's copies, a matrix's ranges, or
-    // the attention's caches
+    // the fewest MB of weights read before the same ones again: the layer's copies or a matrix's ranges (the
+    // attention's caches are their own line, result.caches)
     result.cycleMB = Math.min(copies * bytes, ...MATRIX_KEYS.map((key) => parts.ranges(key).length * matrixBytes(shape.matrices[key]))) / 1e6;
     result.spares = parts.spares;
     result.caches = { count: caches.length, MB: (caches.length * 2 * caches[0].keys.size) / 1e6 };
@@ -1454,10 +1454,13 @@ async function layerSteps() {
 // DP4A's two where the packed int8 dot is and llama.cpp's elsewhere, which on a device whose fastest layer is another
 // (Apple, where ONNX Runtime does not use DP4A, or llama.cpp's with subgroups) broke down a layer no token runs. Where
 // the layer table gave no time (it failed, or ran in no worker before), as T202.
+// The fastest only of the forms the engine has (public/gpu.js's TOKEN_FORMS; T208's review): not llama.cpp's with the
+// norms apart (withoutDp4a), which the layer table times where there is no packed int8 dot but no token runs; it can
+// still be the partner.
 function stepForms() {
-  const fused = layerForms().filter((form) => form.fused && !form.none);
+  const fused = layerForms().filter((form) => form.fused && !form.none), engine = fused.filter((form) => !form.withoutDp4a);
   const fastest = (layerTimes ?? []).filter((row) => row.fused && row.msPerLayer > 0 && layerVerdicts?.[row.check]?.ok === true)
-    .sort((a, b) => a.msPerLayer - b.msPerLayer).map((row) => fused.find((form) => form.name === row.form)).find(Boolean);
+    .sort((a, b) => a.msPerLayer - b.msPerLayer).map((row) => engine.find((form) => form.name === row.form)).find(Boolean);
   if (!fastest) {
     const forms = LAYER_KINDS.filter((kind) => kind.fused && Boolean(kind.dp4a) === packed).map((kind) => ({ ...kind, subgroups: false }));
     return { forms, chosen: { by: "packed", why: layerTimes ? "the layer table has no fused layer timed and found right" : "no layer table was timed before" } };
@@ -1470,11 +1473,15 @@ function stepForms() {
 // layers (on the copies in turn, as layer() times them), each layer a compute pass of its own that writes a timestamp
 // as it begins and as it ends (llama.cpp's GGML_WEBGPU_GPU_PROFILE writes them a dispatch a pass). The forms in turn,
 // PAIRS rounds, a form's ms a layer the median of its rounds' means. A check of the whole layer only, one line of the
-// table: Chrome rounds a timestamp to 100 µs (unless its developer features are on), too coarse for a step of 20 to 60
-// µs, and each layer's time is off by up to that much; the mean of many layers evens it out where they do not start in
-// step with the clock (not checked). Against the submissions' times: those hold the wait of a submission, taken out
-// as the difference of 2n and n, while these hold only what runs on the GPU. { none } where the device gives no
-// timestamp-query, { error } where it failed.
+// table: Chrome's Dawn cuts every timestamp down to a multiple of 65.5 µs (2^16 ns; Chrome's own words say 100 µs;
+// unless its developer features are on), too coarse for a step of 20 to 60 µs, and each layer's time is off by up to
+// that much. T208's review: the mean of the passes is off by 65.5 µs / (2 √32) = 6 µs or less (its spread) where the
+// passes start anywhere on that clock's steps (their times are not a multiple of it), and span (the first pass's
+// beginning to the last one's end, over the layers) by 65.5 µs / 32 = 2 µs or less whatever they do, the cuts of the
+// passes between cancelling. span also holds what comes between two passes; a mean above it says the passes overlapped
+// (a pass stamped as begun before the one before it ended), and then the mean is not the layers' work. Against the
+// submissions' times: those hold the wait of a submission, taken out as the difference of 2n and n, while these hold
+// only what runs on the GPU. { none } where the device gives no timestamp-query, { error } where it failed.
 const TIMESTAMP_LAYERS = 32;
 async function timestamps(parts, layers) {
   if (!device.features.has("timestamp-query")) return { none: "this device gives no timestamp-query (the GPU's own clock) to this page" };
@@ -1485,7 +1492,7 @@ async function timestamps(parts, layers) {
       const set = device.createQuerySet({ type: "timestamp", count: 2 * count });
       const resolved = buffer(16 * count, 0x200 | COPY_SRC);  // GPUBufferUsage.QUERY_RESOLVE
       owned.push(resolved, { destroy: () => set.destroy() });
-      const means = layers.map(() => []);
+      const means = layers.map(() => []), spans = layers.map(() => []);
       for (let round = 0; round < rounds; round++) {
         for (const [i, { each }] of layers.entries()) {
           parts.restart();
@@ -1500,10 +1507,11 @@ async function timestamps(parts, layers) {
           let ns = 0;
           for (let l = 0; l < count; l++) ns += Number(stamps[2 * l + 1] - stamps[2 * l]);
           means[i].push(ns / count / 1e6);
+          spans[i].push(Number(stamps[2 * count - 1] - stamps[0]) / count / 1e6);
         }
         postMessage({ alive: true });
       }
-      return { layers: count, rounds, forms: layers.map(({ form }, i) => ({ form, ms: middle(means[i]) })) };
+      return { layers: count, rounds, forms: layers.map(({ form }, i) => ({ form, ms: middle(means[i]), span: middle(spans[i]) })) };
     });
   } catch (error) {
     return { error: String(error?.message ?? error) };

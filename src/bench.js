@@ -517,14 +517,18 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
     const head = "The whole layer by the GPU's own clock (timestamp-query), a check of the times above";
     if (t.none || t.error) lines.push("", `${head}: ${t.none ? "not here" : "failed"}: ${tableCell(t.none ?? t.error)}.`);
     else {
-      const got = t.forms.map(({ form, ms }) => {
+      const ms = (value) => (Number.isFinite(value) && value > 0 ? number(value, 2) : "?");
+      const got = t.forms.map(({ form, ms: mean, span }) => {
         const above = stepMs(r.forms.find((one) => one.form === form));
-        return `"${tableCell(form)}" ${Number.isFinite(ms) && ms > 0 ? number(ms, 2) : "?"} ms (above: ${above === undefined ? "?" : number(above, 2)})`;
+        return `"${tableCell(form)}" ${ms(mean)} ms (first to last ${ms(span)}; above: ${above === undefined ? "?" : number(above, 2)})`;
       });
-      lines.push("", `${head}: ${got.join(", ")} a layer, each the median of ${t.rounds} submissions of ${t.layers} layers, each layer a compute pass that writes a timestamp as it begins and as it ends. ` +
-        "The times above are a submission of 2n layers less one of n, by the page's clock; these hold only what runs on the GPU, a layer at a time. " +
-        `Chrome rounds a timestamp to 100 µs (unless its developer features are on), so each layer's time is off by up to 0.1 ms and their mean over ${t.layers} by less, where the layers do not start in step with that clock. ` +
-        "Where the two agree to about that, the times above are the layers' work; where these are well below, the times above hold something besides it (what comes between one layer and the next, or of the submissions).");
+      lines.push("", `${head}: ${got.join(", ")} a layer, each the median of ${t.rounds} submissions of ${t.layers} layers, each layer a compute pass that writes a timestamp as it begins and as it ends: ` +
+        `the mean of the passes, and in parentheses from the first pass's beginning to the last one's end over the ${t.layers} layers. ` +
+        "The times above are a submission of 2n layers less one of n, by the page's clock; these hold only what runs on the GPU. " +
+        "Chrome cuts every timestamp down to a multiple of 65.5 µs (its own words say 100 µs; unless its developer features are on), so a layer's time is off by up to that, " +
+        `the mean of ${t.layers} by 6 µs or less where the passes start anywhere on that clock's steps, and first to last by ${number(65.5 / t.layers, 0)} µs or less whatever they do. ` +
+        "First to last also holds what comes between two passes; a mean above it says the passes overlapped (one stamped as begun before the one before it ended) and is not the layers' work. " +
+        "Where these agree with the times above to about 0.1 ms, the times above are the layers' work; where these are well below, the times above hold something besides it (what comes between one layer and the next, or of the submissions).");
     }
   }
   return lines;
