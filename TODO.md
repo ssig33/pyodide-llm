@@ -391,7 +391,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 ### T174 [文書] ライセンスを MPL-2.0 にする — 状態: **済（2026-09-27、持ち主「MPL-2.0 がいいかなって」「提案通りにライセンスファイル置いてほしい」）**（規模 小）
 - 決めたこと: リポジトリは MPL-2.0（Pyodide と同じ）。ファイル単位のコピーレフトで、写した MIT と Apache-2.0 のコードとは両立する（写した行は元の許諾文をそのファイルのコメントに残す: `public/shaders.js` の llama.cpp・ONNX Runtime（MIT）と TensorFlow.js（Apache-2.0）。clpeak（GPL-3.0）は形だけで行は写していない、T168）。
 - 入れたもの: `LICENSE`（mozilla.org の MPL-2.0 の本文、sha256 3f3d9e00…9d04）、README の「License」の節、`public/llama2_numpy.py` の頭に MIT の表示（tairov/llama2.py は MIT で LICENSE に著作権者の名が無い、karpathy/llama2.c は「Copyright (c) 2023 Andrej」、どちらも 2026-09-27 に GitHub の API で確かめた）。
-- 残り（未着手、要るときに）: 各ファイルの頭の MPL の Exhibit A の表示（任意）。`forward.js` など、llama2_numpy.py から JS に移した forward にも同じ表示を置くか。
+- **ファイルの頭には書かない**（2026-09-27、持ち主「ファイルの先頭にライセンスを書かなくてもよい」）: MPL の Exhibit A の表示は置かない（MPL は LICENSE があれば足りる）。`forward.js` のように llama2_numpy.py の計算を JS で書き直したファイルは、元の文を写していないので表示を置かない。写した行のあるファイル（`llama2_numpy.py`・`shaders.js`）だけが元の許諾文を持つ。
 
 ### T169 [文書] README を書き直し、しくみと計測の記録を docs/ に分ける — 状態: 未着手（2026-09-27、持ち主「採番せよ」。外からの設計の意見を持ち主が持ち込み、そのうち採るものを 3 つに分けた。規模 小〜中）
 - 根拠: README の冒頭が古い（「Python が層を順に呼び、ctypes でカーネルを呼ぶ」は T93 の前の形。いまの forward は JS と WASM で、GPU もある）。初めての人の「これは何か・どう使うか・どのブラウザで・何 MB か・自分のモデルは」が探しにくい。
