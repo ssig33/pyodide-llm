@@ -150,6 +150,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
     matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
   import { forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
+  import { hiddenLine, wakeKeeper } from "../wake.js";
 
   declare const __BUILD__: string;
   const BASE = import.meta.env.BASE_URL;
@@ -742,7 +743,9 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const shown = SECTIONS.filter((name) => results[name] && (name !== "model" || results[name]!.status !== "ok"));
     const sections = shown.map((name) => `#### ${TITLES[name]}${results[name]!.status === "ok" ? "" : ` (${STATE[results[name]!.status]})`}\n\n${results[name]!.markdown}`);
     // T184: the model page's own path right under the rounds' table (a table of its own: parseReport() reads the first)
-    const head = [benchMarkdown(measured?.rows ?? [], environment), ...(measured?.paths ? [measured.paths] : [])].join("\n\n");
+    // T194: the seconds the page was hidden while it ran, right under the machine (no line when it never was)
+    const hidden = hiddenLine(awake.hidden());
+    const head = [benchMarkdown(measured?.rows ?? [], environment), ...(hidden ? [hidden] : []), ...(measured?.paths ? [measured.paths] : [])].join("\n\n");
     const markdown = [head, ...sections].join("\n\n");
     $("markdown").textContent = markdown;
     // T185: where the whole is too long for the link, the link holds the head and a line a section
@@ -753,6 +756,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
     (window as any).__benchmark.markdown = markdown;
   }
 
+  // T194: the screen kept on while sections run, and the seconds the page was hidden counted
+  const awake = wakeKeeper({ document, navigator });
   let running = false;
   async function runSections(names: readonly Name[]) {
     if (running) return;
@@ -764,6 +769,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
     runBegan = performance.now();
     $("overall").hidden = names.length < 2;
     const tick = setInterval(ticked, 1000);
+    awake.start();
     for (const name of names) {
       const { state, progress, out } = parts[name];
       state.className = "state";
@@ -803,6 +809,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
       report();
     }
     clearInterval(tick);
+    awake.stop();
     current = undefined;
     if (names.length > 1) $("overall").textContent = `${names.length} sections in ${clock(performance.now() - runBegan)}`;
     buttons.forEach((b) => (b.disabled = false));

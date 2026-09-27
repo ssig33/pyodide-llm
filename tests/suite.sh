@@ -32,6 +32,7 @@ part "unit tests of the engine" python -m pytest tests -q
 page_modules() {
   node tests/bench.mjs
   node tests/page-memory.mjs
+  node tests/wake.mjs
   node tests/summary-check.mjs
   node tests/models-check.mjs
   node tests/ladder-check.mjs
