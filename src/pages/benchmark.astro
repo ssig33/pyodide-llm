@@ -466,13 +466,13 @@ const BENCH_MODEL = "llm-jp-3-150m";
         const why = steps[0].error ?? (info?.worker ? "navigator.gpu gave no adapter" : "no WebGPU in a worker here");
         return { status: "none", markdown: why };
       }
-      // the adapter, the check, the shapes, the tokens, the ways, a layer, besides the weights, the ceilings, a prompt,
-      // the bridge
-      of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 5;
+      // the adapter, the check, the shapes, the tokens, the ways, a layer, the tokens generated, besides the weights,
+      // the ceilings, a prompt, the bridge (T192: the tokens generated were left out, and the last two read "N / N")
+      of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 6;
       // T182: a fallback adapter (SwiftShader in CI: the CPU in a GPU's place) checks the shaders against JavaScript and
       // times nothing: its times are no GPU's, and they took about 4 minutes a browser (the owner, 2026-09-27: what CI
       // needs to know is that the GPU's path works). The timings are for a real GPU, on the owner's devices.
-      if (info.fallback) of = 2;
+      if (info.fallback) of = 3; // the adapter, the check, the bridge
       const check = await step("the shaders against JavaScript", { step: "check" });
       if (!info.fallback) {
       for (const [name, shape] of Object.entries(SHAPES)) await step(`bandwidth: ${name}`, { step: "bandwidth", shape });
