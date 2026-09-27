@@ -260,6 +260,10 @@ async function start(memory, plan) {
       } catch (error) {
         model.tokensWhy = String(error?.message ?? error);
         model.gen = null;
+      } finally {
+        // (the review of T156: the first layer read back for the checks of a model on the GPU alone goes with them: it
+        // stayed in this worker for the whole visit, 113 MB of Llama 3.2 3B, 245 MB of Llama 3.1 Swallow 8B)
+        model.firstLayer = undefined;
       }
       if (stopping) return end();
     }
