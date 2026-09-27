@@ -26,7 +26,10 @@
 //   - the logits of the prompt's last token (the CPU's in both runs, on the GPU's keys and values in one): the same
 //     most likely token as the run on the CPU, and no farther from NumPy's than LOGITS_LINE times that run (see there).
 // "synthetic": a made-up int8 model with grouped-query attention (4 heads, 2 of keys and values; none of the models
-// of this directory has it). The others are the models of this directory (make models kernels), or <prefix>.json: a
+// of this directory has it). T153: "synthetic-qwen2", the same with biases of q, k and v (Qwen2's) and an epsilon of
+// 1e-6; "synthetic-qwen3", the norms of every head of q and k (Qwen3's), heads of 32 where dim / heads is 16 (q and
+// the attention's output 128 wide, dim 64), and an epsilon of 0.5, near mean(x²) (T150: an epsilon far below it
+// hides a wrong one); both of three layers. The others are the models of this directory (make models kernels), or <prefix>.json: a
 // model tests/perplexity_prepare.py converted (<prefix>.bin, <prefix>.tokenizer.bin, and the options in <prefix>.json;
 // gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
 // the native Python ($PYTHON, python3 by default).
@@ -52,7 +55,11 @@ const engine = option("--engine", "chromium");
 // T147: --forms <part,part>: only the matrices' shaders whose names hold one of these (all of them by default)
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
-const ids = args.length ? args : ["synthetic", "stories15M", "tiny-lm", "llm-jp-3-150m"];
+const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "stories15M", "tiny-lm", "llm-jp-3-150m"];
+// T153: the made-up models of another form (see above). Three layers: a layer's vectors are read at l × their size,
+// which a second layer alone would not tell from 0 + size
+const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias: true }, { bias: true, rms_norm_eps: 1e-6 }],
+  "synthetic-qwen3": [{ layers: 3, qk_norm: true, head_dim: 32 }, { qk_norm: true, head_dim: 32, rms_norm_eps: 0.5 }] };
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
@@ -68,7 +75,16 @@ const COUNT = 150, KV_START = 8;
 //   8 bits (ORT's DP4A: the activations quantized as the CPU's matmul_q8 takes them, 8 bits where the CPU's relaxed
 //     SIMD takes 7): 0.30 to 0.56 of the CPU's. The line: 0.75 of the CPU's (a ratio to the CPU's error: measure it
 //     again where the CPU's arithmetic changes, T159, T165).
+// T153: those lines hold for the first layer of every model and for all layers of a shallow one. Over the layers of a
+// deep one the float16 of the cache grows by itself, the more so with Qwen's large activations: E16 (NumPy's answer
+// with nothing but its cache rounded to float16, against NumPy's) is its measure. A GPU that computes as it should is a
+// few E16 away, whatever the CPU's forward.js does (a line of a quarter of the CPU's error loosened the made-up models'
+// lines 1.3 to 10 times, and a GPU that used layer 0's biases in every layer passed: T153's review). So every layer of
+// a float32 or f16 form is held to the shader's line or K × E16, whichever is larger, and the first layer to the
+// shader's line alone; K: see TODO.md's T153 for the numbers they come from. The packed shaders stay on their ratio to
+// the CPU's (their 8-bit activations are some 20 to 50 E16 away: E16 is not their measure; T147's weakness, TODO.md)
 const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2, PACKED_LINE = 0.75;
+const K = { float32: 4, f16: 12 };
 // The logits of the prompt's last token, the largest difference from NumPy's over the largest of NumPy's: the CPU's
 // own run 1.6e-2 to 5.6e-2, the one on the GPU's keys and values 0.75 to 1.04 times that (closer: its keys and values
 // are NumPy's but for the float16); broken on purpose 0.27 to 1.13, 4.8 times the CPU's and more. The line: no more
@@ -81,12 +97,13 @@ const PYTHON = `
 import base64, struct, numpy as np, llama2_numpy, llama2_convert
 from llama2_numpy import Llama
 
-def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0):
-    """A made-up int8 checkpoint and its tokenizer.bin, as quantize.py writes one: grouped-query attention"""
+def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0, **form):
+    """A made-up int8 checkpoint and its tokenizer.bin, as quantize.py writes one: grouped-query attention. form
+    (T153): llama2_numpy.FORM's bias, qk_norm and head_dim, whose vectors are drawn as the norms' are"""
     rng = np.random.default_rng(seed)
     header = (dim, hidden, layers, heads, kv_heads, vocab, seq_len)
     out = [struct.pack("<7i", *header)]
-    for shape, is_matrix in llama2_convert.layout(*header):
+    for shape, is_matrix in llama2_convert.layout(*header, **form):
         if is_matrix is None:
             continue  # the RoPE tables: an int8 file leaves them out
         values = (rng.standard_normal(shape) * 0.3).astype(np.float32)
@@ -154,9 +171,11 @@ fs.mkdirSync(directory, { recursive: true });
 for (const id of ids) {
   let options, text;
   const began = performance.now();
-  if (id === "synthetic") {
-    py.runPython(`data, vocabulary = synthetic()`);
-    options = { dtype: "int8" };
+  if (SYNTHETIC[id]) {
+    const [form, engineOptions] = SYNTHETIC[id];
+    py.globals.set("FORM", py.toPy(form));
+    py.runPython(`data, vocabulary = synthetic(**FORM)`);
+    options = { dtype: "int8", ...engineOptions };
   } else if (id.endsWith(".json")) {
     // T153: NumPy's answer in the native Python ($PYTHON, python3 by default): Qwen3 0.6B widened to float32 is 2.4
     // GB, which with the file's copies went past Pyodide's 4 GB and a 7.5 GB scope of the development machine
@@ -304,10 +323,11 @@ try {
       return out;
     };
     const gpu = [];
-    for (const form of [undefined, ...forms]) gpu.push(await run(openGpu, { matrices: form }));
+    // (the forced ones untimed, T153: a block of 64 tokens of Qwen3 0.6B took more than the 180 s of a step on lavapipe)
+    for (const form of [undefined, ...forms]) gpu.push(await run(openGpu, form ? { matrices: form, quick: true } : {}));
     // the attention without subgroups or f16 (the lanes of the workgroup stand for a subgroup), where the adapter
     // has them and so chose the other
-    if (forms.length) gpu.push(await run(openGpu, { matrices: forms[0], attention: "llama.cpp flash attention tiles" }));
+    if (forms.length) gpu.push(await run(openGpu, { matrices: forms[0], attention: "llama.cpp flash attention tiles", quick: true }));
     // T148 (the made-up model only): a fallback adapter refused as the page refuses it, before anything is compiled;
     // the shaders of the first run remembered for this adapter (its key), which are then the only ones compiled, and
     // not for another key
@@ -494,12 +514,16 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     if (gpu.note !== "prompts on WebGPU") failures.push(`the GPU did not take it: ${gpu.note}`);
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
-    const line = /DP4A/.test(gpu.form ?? "") ? PACKED_LINE * cpuKv : /f16/.test(gpu.form ?? "") ? HALF_LINE : GPU_LINE;
+    const kind = /DP4A/.test(gpu.form ?? "") ? "packed" : /f16/.test(gpu.form ?? "") ? "f16" : "float32";
+    const shaderLine = kind === "packed" ? PACKED_LINE * cpuKv : kind === "f16" ? HALF_LINE : GPU_LINE;
+    const line = kind === "packed" ? shaderLine : Math.max(shaderLine, K[kind] * e16);
+    const firstLine = kind === "packed" ? PACKED_LINE * firstKv(cpu) : shaderLine;
     const gpuKv = kv(gpu), againKv = gpu.again ? kv(gpu.again) : NaN, gpuFirst = firstKv(gpu);
     gpu.line = line;
     if (!(gpuKv <= line) || !(againKv <= line)) {
       failures.push(`the keys and values of the GPU are ${gpuKv.toExponential(2)} and ${againKv.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
     }
+    if (!(gpuFirst <= firstLine)) failures.push(`the first layer's keys and values are ${gpuFirst.toExponential(2)} from NumPy's (line ${firstLine.toExponential(2)})`);
     const gpuLogits = logitsError(gpu.logits), againLogits = logitsError(gpu.again.logits);
     if (!(gpuLogits <= LOGITS_LINE * cpuLogits) || !(againLogits <= LOGITS_LINE * cpuLogits)) {
       failures.push(`the logits on the GPU's keys and values are ${gpuLogits.toExponential(2)} and ${againLogits.toExponential(2)} from NumPy's, the CPU's ${cpuLogits.toExponential(2)}`);
