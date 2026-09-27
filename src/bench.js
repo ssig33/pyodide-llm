@@ -456,10 +456,22 @@ export const threadsKey = (id, nav) => `threads:${id}:${nav.hardwareConcurrency}
 export function threadsHow(how) {
   if (!how) return "";
   if (how.alone) return `: ${how.alone}`;
-  if (how.unfinished) return `: the search had not ended after ${how.unfinished} s`;
-  if (how.remembered) return ", as the model page remembers";
+  // T190's review: a software thread that stopped after the count was found (T120): the later times are one thread's
+  const stopped = how.stopped ? "; a software thread stopped while timed, and one thread went on" : "";
+  if (how.unfinished) return `: the search had not ended after ${how.unfinished} s${stopped}`;
+  if (how.remembered) return `, as the model page remembers${stopped}`;
   const verdicts = (how.searched ?? []).map(([best, candidate, kept]) => `${best} or ${candidate}: ${kept}`);
-  return verdicts.length ? `, searched here (${verdicts.join(", ")})` : "";
+  return `${verdicts.length ? `, searched here (${verdicts.join(", ")})` : ""}${stopped}`;
+}
+
+/** T190's review: the writing on each number of software threads (worker.js's timedPaths: in turn, CPU only), the page's
+ * marked; "" where there is one count or none. perCount: [{ threads, speed, low, high, unsteady }] */
+export function threadsLine(perCount = [], page) {
+  if (perCount.length < 2) return "";
+  const rate = (value) => number(value, value >= 100 ? 0 : 1);
+  const cells = perCount.map((c) => `${c.threads}${c.threads === page ? " (the page's)" : ""}: ${rate(c.speed)} tok/s` +
+    ` (${rate(c.low)}–${rate(c.high)}${c.unsteady ? ", unsteady" : ""})`);
+  return `Writing on each number of software threads (CPU only): ${cells.join(" · ")}`;
 }
 
 /** T184: the prompts the model page's path is timed on: one block of the GPU's (forward.js's GPU_BLOCK) and four; and
@@ -479,7 +491,8 @@ export function gpuSkipped(why = "") {
 /** T184: the model page's own path on this device, as one table (the model section times it on its first load,
  * worker.js's timedPaths and forward.js's timePrompts): prompts as the page chooses between the GPU and the CPU (T148),
  * on the CPU only and on the GPU only, how many times faster the GPU is, and the writing after a prompt. paths:
- * { threads, gpu: { seconds, matrices, attention, lost? } or { why }, status (the status line's words of the GPU),
+ * { threads, how (threadsHow()), perCount (threadsLine()), gpu: { seconds, matrices, attention, lost? } or { why },
+ * status (the status line's words of the GPU),
  * rows: [{ what: "prompt" | "generation", tokens, chosen, cpu, gpu }] } where a cell is { speed, low, high, gpuTokens,
  * unsteady }, { same: "cpu" } (one path: timed once) or { skip: why }; or { error }. The writing's GPU cell stays open
  * for T152 (a token on the GPU): the same row, timed where it has a speed. A GPU that stopped while the sides were timed
@@ -515,6 +528,8 @@ export function pathTable(paths, name = "") {
       const ratio = !gpu.lost && row.gpu?.speed && row.cpu?.speed ? times(row.gpu.speed / row.cpu.speed) : "";
       return `| ${what} | ${speed(row.chosen)}${side(row.chosen, row.tokens)} | ${speed(row.cpu)} | ${speed(row.gpu)} | ${ratio} |`;
     })];
+  const counts = threadsLine(paths.perCount, paths.threads);
+  if (counts) lines.push("", counts);
   return lines.join("\n");
 }
 

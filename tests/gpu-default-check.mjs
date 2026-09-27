@@ -210,6 +210,35 @@ if (isMainThread) {
     engine.release();
     expect("a count the model page remembers: no search, that count", [ended.threads, ended.generations, tokens], [3, 0, 0]);
   }
+  // T190's review: a software thread that stops in the search (T120: the engine gives its helpers up and goes on with
+  // one) leaves found at 1 as well, so "fewer than found" never says it: the page path's head reads lostThreads. This
+  // helper takes a chunk and ends without counting it (threads-check's)
+  {
+    const { WAKE, COUNTER, ACTIVE, CONTROL_BYTES } = await import(path.join(root, "public/jobs.js"));
+    const dying = ({ memory: shared, share }) => new Promise((resolve) => {
+      const helper = new Worker(`
+        const { parentPort, workerData: { memory, share, WAKE, COUNTER, ACTIVE, CONTROL_BYTES } } = require("node:worker_threads");
+        const ctl = new Int32Array(memory.buffer, 0, CONTROL_BYTES / 4);
+        parentPort.postMessage("ready");
+        for (let gen = Atomics.load(ctl, WAKE + share); ; gen = Atomics.load(ctl, WAKE + share)) {
+          Atomics.wait(ctl, WAKE + share, gen);
+          if (Atomics.load(ctl, WAKE + share) & 1) continue;
+          Atomics.add(ctl, ACTIVE, 1);
+          Atomics.add(ctl, COUNTER, 1);  // a chunk taken, never done
+          process.exit(0);
+        }`, { eval: true, workerData: { memory: shared, share, WAKE, COUNTER, ACTIVE, CONTROL_BYTES } });
+      helper.once("message", () => resolve({ terminate: () => helper.terminate() }));
+    });
+    const engine = createForward({ memory, base, size, kernels, plan, spawn: dying, stalledMs: 300 });
+    await engine.findThreads({ from: 2 });
+    const warned = console.warn;
+    console.warn = () => {};  // the one line forward.js writes about it
+    const ended = await endSearch(engine, () => { for (let pos = 0; pos < 6; pos++) engine.forward(100 + pos, pos, true); });
+    console.warn = warned;
+    const lost = engine.lostThreads;
+    engine.release();
+    expect("a software thread that stops in the search: one thread, found 1 too, lostThreads", [ended.threads, ended.found, lost], [1, 1, true]);
+  }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");
   process.exit(failures.length ? 1 : 0);

@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, PASTE, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, gpuSummary, lineSummary,
          loginUrl, parseReport, reportBody, shortReport, storageSummary,
-         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, threadsLine, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -346,6 +346,19 @@ assert.ok(headOf({ searched: [[8, 4, 4], [4, 2, 4]] }).includes("4 software thre
 assert.ok(headOf({ unfinished: 120 }).includes("4 software threads: the search had not ended after 120 s ·"));
 assert.ok(headOf({ alone: "no shared memory here" }, 1).includes("1 software thread: no shared memory here ·"));
 assert.ok(headOf({ searched: [] }).includes("4 software threads ·"), "no search: nothing more");
+// T190's review: a software thread that stopped says so (worker.js reads engine.lostThreads: found is 1 then, and the
+// search's verdicts would name another count); one that stopped after the count was found, too
+assert.ok(headOf({ alone: "a software thread stopped" }, 1).includes("1 software thread: a software thread stopped ·"));
+assert.ok(headOf({ remembered: true, stopped: true }).includes("4 software threads, as the model page remembers; a software thread stopped while timed, and one thread went on ·"));
+assert.ok(headOf({ searched: [[8, 4, 4]], stopped: true }).includes("searched here (8 or 4: 4); a software thread stopped while timed"));
+// the writing on each number of threads, the page's marked, under the table; nothing with one count or none
+const counted = pathTable({ ...real, perCount: [{ threads: 1, speed: 107.2, low: 105, high: 108 }, { threads: 2, speed: 151, low: 149, high: 160, unsteady: true },
+  { threads: 4, speed: 163.4, low: 160, high: 165 }, { threads: 8, speed: 120, low: 118, high: 121 }] });
+assert.equal(counted.split("\n").at(-1), "Writing on each number of software threads (CPU only): 1: 107 tok/s (105–108) · 2: 151 tok/s (149–160, unsteady) · " +
+  "4 (the page's): 163 tok/s (160–165) · 8: 120 tok/s (118–121)");
+assert.ok(!pathTable({ ...real, perCount: [{ threads: 1, speed: 107, low: 105, high: 108 }] }).includes("Writing on each"));
+assert.ok(!pathTable(real).includes("Writing on each"));
+assert.equal(threadsLine([]), "");
 assert.deepEqual(PATH_PROMPTS, [64, 256]);
 assert.equal(PATH_WRITES, 64);
 // in the report, under the rounds' table: parseReport() still reads the rounds alone
