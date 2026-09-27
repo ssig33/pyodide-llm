@@ -666,6 +666,8 @@ function scaleOff(got, want) {
   for (let i = 0; i < want.length; i++) { gw += got[i] * want[i]; ww += want[i] * want[i]; }
   return gw / ww - 1;
 }
+// the status of a GPU that takes the prompts (T152: what it says of the tokens after it)
+const promptsOnGpu = (note) => /^prompts on WebGPU($|, )/.test(note ?? "");
 let failed = false;
 for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;
@@ -705,7 +707,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     `Q8 (and its matrices' inputs in 8 bits) ${q8.toExponential(2)}, the first layer ${q8First.toExponential(2)} (KL ${measures.kl8.toExponential(1)}, scale ${scale(eight).toExponential(1)})`);
   if (late) {
     // T147: a request forward.js gave up on is answered by nothing
-    const tried = late.note === "prompts on WebGPU" && late.gpuTokens === 0;
+    const tried = promptsOnGpu(late.note) && late.gpuTokens === 0;
     // T148: and the CPU did those blocks itself: its keys are the CPU's own run's, to the bit
     const cpuDid = late.keys === cpu.keys;
     const wrong = tried && (late.done !== 0 || late.failed !== 0 || !cpuDid);
@@ -726,7 +728,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
   }
   for (const gpu of runs) {
     const failures = [];
-    if (gpu.note !== "prompts on WebGPU") failures.push(`the GPU did not take it: ${gpu.note}`);
+    if (!promptsOnGpu(gpu.note)) failures.push(`the GPU did not take it: ${gpu.note}`);
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const kind = /DP4A/.test(gpu.form ?? "") ? "packed" : /f16/.test(gpu.form ?? "") ? "f16" : "float32";
@@ -760,7 +762,9 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       `the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
-    if (gpu.steps) failed ||= !stepsRight(c, gpu.steps, { cpuKv, e16, cpuLogits, kvDim });
+    // (evaluated, and said, whatever came before)
+    const stepsFine = gpu.steps ? stepsRight(c, gpu.steps, { cpuKv, e16, cpuLogits, kvDim }) : true;
+    failed ||= !stepsFine;
   }
   layerTables(c, cpu, runs, measures);
 }

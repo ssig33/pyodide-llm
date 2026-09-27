@@ -15,6 +15,12 @@
 // empty with why and no ratio anywhere (its time was the CPU's: 0.90× before); no GPU, the CPU's side alone.
 // T190: the page path's number of threads: a search run to its end (forward.js's endSearch) and timed on the count it
 // chose; a count the model page remembers taken with no search.
+// T152: the steps of a generation (forward.js's tokenBlock and generateMany, tokenTimes) on the same made-up GPU, whose
+// step sleeps a multiple of the CPU's own ms of a token and writes made-up ids: generations of STEPS steps after a short
+// prompt, as Python takes them (tokenBlock at a time on the GPU, else one on the CPU). Far faster: the first steps on the
+// CPU (timed first), then every one on the GPU, and the eighth generation after the first verdict its first 4 on the
+// CPU; far slower: every step on the CPU but that generation's first run; failing on its second request: the CPU from
+// there on, the step it gave back taken by the CPU.
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -28,18 +34,31 @@ const forwardFile = args.includes("--forward") ? path.resolve(args[args.indexOf(
 // sleep of that long and the answer
 const FAKE = `
 const { parentPort, workerData: line } = require("node:worker_threads");
-let ctl, words, blocks = 0;
+let ctl, words, ids, blocks = 0, requests = 0;
 const nap = new Int32Array(new SharedArrayBuffer(4)), ms = (n) => line.fixed + line.perToken * n;
 parentPort.on("message", (data) => {
   if (data.type === "start") {
     ctl = new Int32Array(data.memory.buffer, 0, 2048);
     words = data.plan.words;
+    // T152: where forward.js asked for the steps and the line has a cost of a step
+    ids = data.plan.tokens && line.step !== undefined ? new Int32Array(data.memory.buffer, data.plan.tokens.ids, 1 + data.plan.tokens.most) : null;
     parentPort.postMessage({ type: "ready", adapter: "made up", key: "k", bytes: 1, seconds: 0, form: "made up", attention: "made up",
-      forms: [], remembered: false, blocks: [{ count: 16, ms: ms(16) }, { count: 64, ms: ms(64) }] });
+      forms: [], remembered: false, blocks: [{ count: 16, ms: ms(16) }, { count: 64, ms: ms(64) }],
+      ...(ids ? { tokens: { form: "made up", ms: line.step, forms: [] } } : {}) });
   } else if (data.type === "prompt") {
     Atomics.wait(nap, 0, 0, ms(data.count));
     if (Atomics.load(ctl, words.wanted) !== data.serial) return;
     const fail = Boolean(line.failAt) && ++blocks >= line.failAt;  // T184: a GPU that fails on its failAt-th block
+    Atomics.store(ctl, words.failed, fail ? 1 : 0);
+    Atomics.store(ctl, words.done, data.serial);
+    Atomics.notify(ctl, words.done);
+  } else if (data.type === "tokens") {
+    // T152: count steps of a made-up generation: each id the one after the token fed
+    Atomics.wait(nap, 0, 0, line.step * data.count);
+    if (Atomics.load(ctl, words.wanted) !== data.serial) return;
+    const fail = Boolean(line.failTokensAt) && ++requests >= line.failTokensAt;
+    ids[0] = data.count;
+    for (let i = 0; i < data.count; i++) ids[1 + i] = data.token + 1 + i;
     Atomics.store(ctl, words.failed, fail ? 1 : 0);
     Atomics.store(ctl, words.done, data.serial);
     Atomics.notify(ctl, words.done);
@@ -238,6 +257,72 @@ if (isMainThread) {
     const lost = engine.lostThreads;
     engine.release();
     expect("a software thread that stops in the search: one thread, found 1 too, lostThreads", [ended.threads, ended.found, lost], [1, 1, true]);
+  }
+  // T152: the steps of a generation. The CPU's ms of a token here (the median of five of a GPU-less engine); a prompt of
+  // 16 (on the CPU: the made-up GPU's prompt is slow here), then STEPS steps as Python takes them: [on the GPU, on the CPU]
+  const STEPS = 20;
+  const cpuStep = (() => {
+    const engine = createForward({ memory, base, size, kernels, plan });
+    engine.forwardMany(prompt(16), 0);
+    const ms = [16, 17, 18, 19, 20].map((pos) => {
+      const began = performance.now();
+      engine.forward(100, pos);
+      return performance.now() - began;
+    }).sort((a, b) => a - b)[2];
+    engine.release();
+    return ms;
+  })();
+  say(`the CPU: ${cpuStep.toFixed(2)} ms a token with its logits`);
+  const write = (engine) => {
+    engine.newGeneration();
+    const fed = prompt(16);
+    engine.forwardMany(fed, 0);
+    let token = 100, pos = fed.length, onGpu = 0, onCpu = 0;
+    const history = [...fed, token];
+    while (pos < fed.length + STEPS) {
+      const many = Math.min(engine.tokenBlock, fed.length + STEPS - pos);
+      const ids = many > 0 ? engine.generateMany(token, pos, history.slice(-64), history.length, many, 0, 0.9, 1, [], []) : null;
+      const chosen = ids ?? (engine.forward(token, pos), [token + 1]);
+      if (ids) onGpu += ids.length;
+      else onCpu += 1;
+      for (const id of chosen) {
+        history.push(id);
+        token = id;
+        pos += 1;
+      }
+    }
+    return [onGpu, onCpu];
+  };
+  const steps = async (name, stepCost, generations, failTokensAt = 0) => {
+    const line = { fixed: 60 * perToken, perToken: 2 * perToken, step: stepCost * cpuStep, failTokensAt };
+    const gpu = () => {
+      const fake = new Worker(FAKE, { eval: true, workerData: line });
+      return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
+    };
+    const engine = createForward({ memory, base, size, kernels, plan, spawn, gpu });
+    await engine.setThreads(1);
+    await engine.gpu;
+    const seen = [];
+    for (let g = 1; g <= generations; g++) seen.push(write(engine));
+    say(`${name}: [on the GPU, on the CPU] ${seen.map((pair) => pair.join("/")).join(" ")}; status ${engine.gpuStatus}`);
+    engine.release();
+    return seen;
+  };
+  {
+    const seen = await steps("the steps, a GPU far faster", 0.2, 12);
+    expect("the first generation: 2 steps on the CPU (timed), the rest on the GPU", seen[0], [STEPS - 2, 2]);
+    expect("then every step on the GPU", seen.slice(1, 8), all(2, 8, [STEPS, 0]));
+    expect("the eighth after the first verdict: its first 4 on the CPU", seen[8], [STEPS - 4, 4]);
+    expect("and the GPU again", seen.slice(9), all(10, 12, [STEPS, 0]));
+  }
+  {
+    const seen = await steps("the steps, a GPU far slower", 5, 12);
+    expect("every step on the CPU but the check's first run", seen, [...all(1, 8, [0, STEPS]), [4, STEPS - 4], ...all(10, 12, [0, STEPS])]);
+  }
+  {
+    const seen = await steps("the steps, a GPU that fails on its second request", 0.2, 2, 2);
+    expect("the CPU from the failure on", seen, [[4, STEPS - 4], [0, STEPS]]);
   }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");

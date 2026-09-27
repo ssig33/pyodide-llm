@@ -1149,8 +1149,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   }
   // T152: whether the steps of a generation go to the GPU now (see tokenBlock)
   function gpuSteps() {
-    if (!tokensOn || !gpuOn || search || gpuSide === "cpu") return false;
-    if (gpuForce.always || gpuSide === "gpu" || tokenRecheck === "gpu") return true;
+    if (!tokensOn || !gpuOn || gpuSide === "cpu") return false;
+    if (gpuForce.always || gpuSide === "gpu") return true;
+    if (search) return false;
+    if (tokenRecheck === "gpu") return true;
     if (tokenRecheck === "cpu") return false;
     return Boolean(steps.of(threads)?.faster);
   }

@@ -264,6 +264,8 @@ const result = await page.evaluate(() => ({
   meta: document.querySelector(".model .meta summary")?.textContent ?? "",
   // the breakdown's line of the prompt (T135: "prompt 40 tokens on WebGPU · …")
   prompt: [...document.querySelectorAll(".model .meta *")].map((e) => e.textContent).find((t) => /^prompt \d/.test(t ?? "")) ?? "",
+  // T152: and of the tokens written ("generated 60 tokens on WebGPU · …")
+  generated: [...document.querySelectorAll(".model .meta *")].map((e) => e.textContent).find((t) => /^generated \d/.test(t ?? "")) ?? "",
   error: document.querySelector(".error .bubble")?.textContent ?? "",
   // which kernels this browser got: "SIMD kernels, int8, relaxed SIMD", or less
   status: document.getElementById("status-text")?.textContent ?? "",
@@ -277,6 +279,10 @@ if (!/tok\/s/.test(result.meta)) failures.push("no speed line under the answer")
 if (result.pageScrolls) failures.push("the page itself scrolls");
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
 if (gpuTest && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
+// T152: where the status says the GPU takes the tokens (a model it takes them of), they went through it
+if (gpuTest && /tokens on WebGPU/.test(result.status) && !/on WebGPU/.test(result.generated)) {
+  failures.push(`the tokens did not go through the GPU (${result.generated || "no line of the tokens"}; ${result.status})`);
+}
 // (refused as a fallback adapter, or before that for another reason: a page that is not cross-origin isolated)
 if (swiftShader && !gpuTest && (!/prompts on the CPU \(/.test(gpuVerdict?.status ?? "") || /on WebGPU/.test(result.prompt))) {
   failures.push(`SwiftShader was not refused (${gpuVerdict?.status}; ${result.prompt})`);
@@ -284,6 +290,7 @@ if (swiftShader && !gpuTest && (!/prompts on the CPU \(/.test(gpuVerdict?.status
 console.log(`${engine} ${browserVersion}, ${model}: ready in ${readySeconds.toFixed(1)}s, ${result.meta}`);
 console.log(`status: ${result.status}${result.isolated ? "" : " (not cross-origin isolated)"}`);
 if (result.prompt) console.log(result.prompt);
+if (result.generated) console.log(result.generated);
 const threadReportsSeen = await answerWatched("");
 console.log(result.text.slice(0, 160).replace(/\n/g, " / "));
 const then = [];
