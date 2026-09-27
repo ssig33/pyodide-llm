@@ -33,7 +33,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       <div class="models">
         <select id="model" aria-label="Model"></select>
         <!-- a model of the visitor's own disk: read where it is, nothing is uploaded -->
-        <label class="open" title="Open a model from this device: a llama2.c checkpoint and its tokenizer.bin, or the files of a Hugging Face Llama model (.safetensors, config.json, tokenizer.json), and optionally settings as .json. Nothing is uploaded.">
+        <label class="open" title="Open a model from this device: a llama2.c checkpoint and its tokenizer.bin, or the files of a Hugging Face model (.safetensors, config.json, and tokenizer.json, tokenizer.model or spiece.model), and optionally settings as .json. Nothing is uploaded.">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.4.6L12 6h7a2 2 0 0 1 2 2v1H3zm0 5h18v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="currentColor" /></svg>
           <input id="files" type="file" multiple hidden aria-label="Open a model from this device" />
         </label>

@@ -131,6 +131,7 @@
   - **CI（tests.yml run 36317019221、2026-09-27、5.3 分、成功）**: pytest 527 passed、worker-sink-check ok。わざと壊した 8 通り（footprint の既定の arch・head_dim、sink が form を渡さない、2 度目の open が前のバッファを残す、`TIGHT` を 1.0、Q8_0 の参照でだけ通る行を出さない、k を q の head で回す、分類器を行で見ない）は全部落ちた。`hf_fetch.py hf-sarashina2.2-0.5b-instruct` → 原本のフォルダ（config.json・tokenizer.model・tokenizer_config.json と GGUF のリンク）→ `perplexity_prepare.py` の int8 892,359,708 バイト → `profile-convert.mjs` 845 MB を 1.9 秒。
   - (9) の文面の案（持ち主の承認待ち、画面は触っていない）: 「Open a model from this device: a llama2.c checkpoint and its tokenizer.bin, or the files of a Hugging Face model (.safetensors, config.json, and tokenizer.json, tokenizer.model or spiece.model), and optionally settings as .json. Nothing is uploaded.」
 
+- **(9) は持ち主が文を選んだ（2026-09-27、「この文でよい」）**: フォルダのボタンの title を「Open a model from this device: a llama2.c checkpoint and its tokenizer.bin, or the files of a Hugging Face model (.safetensors, config.json, and tokenizer.json, tokenizer.model or spiece.model), and optionally settings as .json. Nothing is uploaded.」に。本線に入れた（道具の分と合わせて）。
 ### T134 [計測] 総合的なベンチマーク: CPU の計測と GPU の計測を 1 つに — 状態: **`/benchmark/` は公開済み（2026-09-26）。GPU の項目に足す計測（T135 の前）も公開済み（T140 の前に画面を確かめて本線へ、0affb08・ce4ae46）。レビュー済み（must-fix 3 つを直した、2026-09-26）。持ち主の 3 台の数字待ち。should 1・2・4 の直しもレビュー済み（must-fix 1 つを直した、2026-09-26 の 4 回目）**（2026-09-26、持ち主の指示「gpu test じゃなくて、総合的な benchmark を作って、それに gpu test をふくませるのがよくないか？」「T94 復活させて WebGPU でのパフォーマンス向上を目指そう」。**T128 の後**（Opus の提案。持ち主が変えてよい）。規模 中）
 - 根拠: いまの計測は 2 つに分かれている。`?bench=1`（T45・T76: そのページのモデルでカーネルなど 4 段を外して測る、Markdown と Issue の報告 T91）と `/gpu-test/`（T94 の第 0 段: アダプタ、int8 の行列 × ベクトルの GB/s、1 トークンぶんの仕事）。GPU の計測はバッチ 1 の生成だけで、**GPU を生かす形を測っていない**（T94 の完了の記録）。
 - 作るもの: 1 つのページ（場所は設計で決める: `?bench=` を広げるか、`/bench/` を新しく作って `/gpu-test/` を移すか）で、同じ端末の CPU と GPU を同じ表に出し、T91 と同じ形で Issue に報告できる。**モバイル Safari を含む全部のブラウザで動く**こと（持ち主「モバイル Safari でも有効なテクノロジーがいい」: WebGPU は Safari 26 から。Memory64 や relaxed SIMD の無いブラウザでは、その行を「無し」と書く）。
@@ -594,6 +595,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 見た目なので `preview.yml` の画面を持ち主に見せる。
 - 作ったもの（2026-09-27）: (1) 列が 2 つの表（名前と値。いまは「This browser」だけ）はセルを折り返す（`table.pairs`、`overflow-wrap: break-word`）。ほかの表は今までどおり折り返さず、表の中で横にスクロールする。(2) 層の判定の後ろに 1 行（`src/bench.js` の `layerCheckNumbers()`）: 4 つの量子化したベクトルのスケールの差の最大と ±1 の数の合計（「quantized: scales 2.5e-7, 6 of 8416 off by 1」、外れたものがあればその 1 つの名前と理由）、DP4A の融合の形は norm を分けた形との差（「norms apart: 2 ulp, 1 off by 1, stream 3.0e-7」、ビット単位で同じなら「bit for bit」だけ）。判定の `quantized` は文ではなく 4 つの `{point, wrong, scale, apart, of}` にし、CI のログ（`bench-check.mjs`）は今までどおり 4 つを別々に出す。報告の長さ（T185）: 層の形 1 つにつき約 40〜90 字増える（未計測）。
 
+- **持ち主が画面を見て「入れてよい」（2026-09-27）。本線に入れた。**
 ### ベンチの改善の順（2026-09-27）
 T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか（持ち主の iPhone と PC の数字を見て決める。例: llama.cpp の f16 のタイルは持ち主の Android で 1 トークン約 1 秒）→ 知人の独立した GPU の PC で測ってもらう。
 
@@ -760,6 +762,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - **確かめ**: 3 つの形とも、main の出力とビット単位で同じ（`six-bench.mjs` が両方の大きさで見る）。forward-check の頭（T165 の塊）に「`matmul_q6r` が、ここで取り出した int8 の値に対する `matmul_q8r` とビット単位で同じ」を足した（`six_sums` と `int8_sums` の補正、活性値 0〜127）。CI の tests.yml は x86-64 と arm64 の両方で全部通った（pytest・smoke・forward-check・threads-check・build）。わざと壊しての確かめはしていない（T98 の `six_sums` の試験と T165 の `matmul_q6` の試験が同じ値を JS で取り出して比べている）。
 - **足したもの**: `tests/six-bench.mjs`（main と作業ツリーの `kernels/` をその場でコンパイルして交互に測る。CI で main を取り寄せる）、tests.yml の入力 `runner`（既定 ubuntu-latest。arm64 のカーネルの速さを測るため）。
 
+- **持ち主の判断（2026-09-27）: 完了**（「完了にする」）。arm64 の DRAM の大きさで 1.26 倍と 1.3 倍にわずかに届かないが、x86 は 1.64 倍、出力はビット単位で同じ。差分は本会話が確かめた（カーネルの小さな直し）。本線に入れた。
 ### T167 [性能] 1 トークンの `matmul_q8r` の帳簿を減らす — 状態: 未着手（2026-09-27、T158 の案。規模 小。**T163 の結果を見てから**）
 - 根拠: キャッシュ内で上限の 46〜51%、ネイティブの同じ形の 56〜61%。4 グループごとの 4 × (convert + extract_lane + splat + mul + add) を、4 つの dot を 1 つの i32x4（グループごとの和）にまとめてから convert 1 + mul 1 + add 1 にする形（shuffle の transpose が要る）。a1-free では帯域の陰に隠れて見えない（生成は 91〜97% が帯域）。効くのは 1 本の帯域が 20 GB/s を超える端末で、持ち主の Android はそれに当たる見込み（1 本 18.9 GB/s、4 本 28 GB/s）。完了条件: T163 で「読み出しだけ > 1 本の 1 トークン」の端末があり、そこで 1 本の 1 トークンが 1.15 倍以上。a1-free ではキャッシュ内（2048×2048）の G MAC/s で見る。
 
