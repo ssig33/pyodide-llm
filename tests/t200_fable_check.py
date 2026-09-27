@@ -117,10 +117,15 @@ def build(mod, data, options):
     return mod.Tokenizer(data, count, kind=options.get("tokenizer_kind", "bpe"), **{k: options[k] for k in keys if k in options})
 
 
+class Real:
+    def __init__(self, encode, normalize=None):
+        self.encode, self.normalize = encode, normalize
+
+
 def real_hf(path):
     from tokenizers import Tokenizer
     tk = Tokenizer.from_file(path)
-    return lambda text: tk.encode(text, add_special_tokens=False).ids
+    return Real(lambda text: tk.encode(text, add_special_tokens=False).ids)
 
 
 def real_sp(path):
@@ -129,7 +134,33 @@ def real_sp(path):
     except ImportError:
         return None
     sp = spm.SentencePieceProcessor(model_file=path)
-    return lambda text: sp.encode(text, out_type=int)
+    normalize = (lambda text: sp.normalize(text)) if hasattr(sp, "normalize") else None
+    return Real(lambda text: sp.encode(text, out_type=int), normalize)
+
+
+PROBES = ["\x7f", "a\x7fb", "a\x7f", "\x7fb", "\x1c", "a\x1cb", "\x01", "a\x01b", " \x7f ", "a \x7f b", "\u200b", "a\u200bb",
+          "▁", "a▁b", " ▁", "▁ ", "\u3000", "a\u3000b", "\t", "a\tb", "\n", "a\nb", "\x85", "a\x85b", "<s>", "a<s>b", "～", "a～b"]
+
+
+def probe(toks, real):
+    """what the real tokenizer and the engine make of a few characters, one by one"""
+    print("  probes (real ids | new ids | real normalized | engine normalized):")
+    for text in PROBES:
+        theirs, mine = outcome(real.encode, text), outcome(toks["new"].encode, text)
+        norm = outcome(real.normalize, text) if real.normalize else "-"
+        engine_norm = outcome(toks["new"].normalized, text)
+        mark = "" if theirs == mine else "   <- differ"
+        print(f"    {text!r}: {theirs} | {mine} | {norm!r} | {engine_norm!r}{mark}")
+
+
+def distinct(diffs, differs, cap=20):
+    """the smallest texts of the differences, each taken to explain the texts it is a part of"""
+    left, found = sorted(diffs, key=len), []
+    while left and len(found) < cap and len(left[0]) <= 200:
+        small = shrink(left[0], differs)
+        found.append(small)
+        left = [t for t in left if small not in t]
+    return found, len(left)
 
 
 def outcome(f, text):
@@ -208,20 +239,17 @@ def compare(label, data, options, specials, real, texts):
     for name in ("new", "t206"):
         diffs = []
         for text in texts:
-            theirs = outcome(real, text)
+            theirs = outcome(real.encode, text)
             mine = outcome(toks[name].encode, text)
             if theirs != mine:
                 diffs.append(text)
         print(f"  {name} against the real tokenizer: {len(diffs)} of {len(texts)} texts differ")
-        shown = set()
-        for text in sorted(diffs, key=len)[:40]:
-            small = shrink(text, lambda t: outcome(real, t) != outcome(toks[name].encode, t))
-            if small in shown:
-                continue
-            shown.add(small)
-            print(f"    {small!r}: real {outcome(real, small)} {name} {outcome(toks[name].encode, small)}")
-            if len(shown) >= 12:
-                break
+        found, left = distinct(diffs, lambda t: outcome(real.encode, t) != outcome(toks[name].encode, t))
+        for small in found:
+            print(f"    {small!r}: real {outcome(real.encode, small)} {name} {outcome(toks[name].encode, small)}")
+        if left:
+            print(f"    ... and {left} texts not explained by those (too long to shrink, or past the cap)")
+    probe(toks, real)
     return len(unexpected), len(unexplained)
 
 
