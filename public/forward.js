@@ -40,7 +40,6 @@ const TOKEN_RECHECK = 4, STOPS_MOST = 8;
 // are kept from model to model, T96): a request of an engine let go is never one of the next engine's
 let gpuRequests = 0;
 const align = (n, to = 64) => Math.ceil(n / to) * to;
-const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
 // T148 (the review): the lower of the two middles. A block is slowed by what else runs (the first after a pause, a
 // page in the background), never sped up: of two, the faster says the device, and one slow first block does not
 // move a verdict
@@ -387,6 +386,7 @@ function halfToFloat(h) {
 /** wrap (tests/profile.mjs only): gets the kernels' exports and returns what to call instead, to time the forward
  * pass with some kernels replaced by functions that do nothing. */
 /** stalledMs (tests only): how long a phase may make no progress before its software threads are given up (T120) */
+/** clock (tests only, T199): the time the threads' search reads, in ms (a made-up one slows a block of its choice) */
 /** halfKeys (T160): keysInHalf's answer for this model, which the worker sized the memory by. Left out (the tests,
  * the benchmark's own model): float16 where every head has keys of its own, which keysInHalf answers for every model
  * that fits a 32-bit memory with float32 keys and values. */
@@ -398,7 +398,7 @@ function halfToFloat(h) {
  * gpu.js's STEP_MS in CI, T147); pieceBytes (T155), the most bytes of a piece of a matrix on the GPU, so that a small
  * model goes in pieces as a matrix past a buffer of the device does */
 export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, gpuRemembered, gpuForce = {},
-  halfKeys, wrap = (exports) => exports, stalledMs = STALLED_MS }) {
+  halfKeys, wrap = (exports) => exports, stalledMs = STALLED_MS, clock = () => performance.now() }) {
   const { dim, n_layers: layers, n_heads: heads, n_kv_heads: kvHeads, head_size: headSize, vocab_size: vocab,
     seq_len: seqLen, rotary, arch } = plan;
   const hidden = plan.hidden_dim, kvDim = kvHeads * headSize, qDim = heads * headSize;
@@ -805,6 +805,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // best-candidate-candidate-best, so that the growing cost of later positions falls on both alike, and drops the
   // first token of every block (the switch). Helpers that a count needs are started in the background; until they
   // are ready the tokens run on the best count and are not timed.
+  // T199: a count's time is the lower median of its 8 (two blocks of 4). What else runs (a collection of the garbage,
+  // another tab, the page on its way to the background) slows a block, never speeds one up, so one block slowed whole
+  // leaves the other block's 4 below it and the verdict stands. The upper median it was took that block's time: twice
+  // in CI 2 threads 1.24 to 1.34 times as fast as 1 lost to it (T190's review).
   const BLOCK = 4;
   let search = null, chosen = 0, generations = 0, recheckEvery = 0, onChosen = null, onCompared = null;
   const searchLog = [];  // every comparison: the counts, their times in ms per token, and the verdict
@@ -850,11 +854,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     search.step += 1;
     if (search.step < 4 * (BLOCK + 1)) return;
     const { best, candidate } = search;
-    const faster = median(search.times[candidate]) < median(search.times[best]) * BETTER;
+    const bestMs = lowerMedian(search.times[best]), candidateMs = lowerMedian(search.times[candidate]);
+    const faster = candidateMs < bestMs * BETTER;
     searchLog.push({ best, candidate, times: search.times, faster });
     // T114: every verdict, so that a device's choice can be followed afterwards (the page writes it to the console)
-    onCompared?.({ best, candidate, bestMs: median(search.times[best]), candidateMs: median(search.times[candidate]),
-                   faster, tokens: search.times[best].length + search.times[candidate].length });
+    onCompared?.({ best, candidate, bestMs, candidateMs, faster, tokens: search.times[best].length + search.times[candidate].length });
     if (faster) {
       search.best = candidate;
       search.moved = true;
@@ -1388,9 +1392,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (search && needLogits) {
         const [count, timed] = countForToken();
         threads = count;
-        const began = performance.now();
+        const began = clock();
         forward(token, pos, needLogits);
-        recordToken(count, performance.now() - began, timed);
+        recordToken(count, clock() - began, timed);
         if (search) threads = search.best;
       } else if (needLogits && tokensOn && gpuOn) {
         // T152: a step on the CPU, timed against the GPU's

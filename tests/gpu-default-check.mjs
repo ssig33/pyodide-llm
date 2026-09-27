@@ -15,6 +15,8 @@
 // empty with why and no ratio anywhere (its time was the CPU's: 0.90× before); no GPU, the CPU's side alone.
 // T190: the page path's number of threads: a search run to its end (forward.js's endSearch) and timed on the count it
 // chose; a count the model page remembers taken with no search.
+// T199: the search's verdict on a made-up clock (forward.js's clock), with one block of every comparison slowed 3 times:
+// the count that is fastest still chosen (4 of the owner's Android's 8 logical cores, 2 of CI's runner's 4).
 // T152: the steps of a generation (forward.js's tokenBlock and generateMany, tokenTimes) on the same made-up GPU, whose
 // step sleeps a multiple of the CPU's own ms of a token and writes made-up ids: generations of STEPS steps after a short
 // prompt, as Python takes them (tokenBlock at a time on the GPU, else one on the CPU). Far faster: the first steps on the
@@ -236,6 +238,37 @@ if (isMainThread) {
     const ended = await endSearch(engine, () => tokens++);
     engine.release();
     expect("a count the model page remembers: no search, that count", [ended.threads, ended.generations, tokens], [3, 0, 0]);
+  }
+  // T199: the search's verdict stands where one block of 4 timed tokens is slowed whole (a collection of the garbage,
+  // another tab). On a made-up clock (forward.js's clock) a token of n threads takes ms[n], and in every comparison the
+  // tokens of one block (0 and 3 are the best count's, 1 and 2 the candidate's) take 3 times as long: the owner's
+  // Android (4 threads fastest, from its 8 logical cores) and CI's runner where 2 threads were 1.3 times as fast as 1
+  // (the upper median chose 1 twice, T190's review)
+  for (const [name, ms, from, want] of [["the owner's Android", { 1: 16.4, 2: 10.5, 4: 8.8, 8: 12 }, 8, 4],
+                                        ["CI's runner", { 1: 13, 2: 10, 4: 11 }, 4, 2]]) {
+    const chosen = [];
+    for (const slowed of [null, 0, 1, 2, 3]) {
+      let engine = null, starting = false, time = 0, comparison = -1, token = 0;
+      const clock = () => {
+        starting = !starting;  // the search reads the clock as a token starts and as it ends
+        if (starting) return time;
+        // the end of a token: its count is the one the engine runs it on. No helper is started on the way to the
+        // count wanted (the search goes down from counts whose helpers findThreads started), so a comparison's 20 tokens
+        // are its 4 blocks of 5. (A count past ms: a search gone the wrong way)
+        if (engine.searchLog.length !== comparison) [comparison, token] = [engine.searchLog.length, 0];
+        const block = Math.floor(token++ / 5);
+        time += (ms[engine.threads] ?? 30) * (block === slowed ? 3 : 1);
+        return time;
+      };
+      engine = createForward({ memory, base, size, kernels, plan, spawn, clock });
+      await engine.findThreads({ from });
+      const ended = await endSearch(engine, () => { for (let pos = 0; pos < 6; pos++) engine.forward(100 + pos, pos, true); });
+      const log = engine.searchLog.map(({ best, candidate, faster }) => `${best} or ${candidate}: ${faster ? candidate : best}`);
+      engine.release();
+      chosen.push(`${slowed === null ? "none slowed" : `block ${slowed} slowed`}: ${ended.threads} (${log.join(", ")})`);
+      expect(`${name}, ${slowed === null ? "no block" : `block ${slowed}`} slowed 3 times: the count chosen`, [ended.ended, ended.threads], [true, want]);
+    }
+    say(`the search on a made-up clock, ${name}: ${chosen.join("; ")}`);
   }
   // T190's review: a software thread that stops in the search (T120: the engine gives its helpers up and goes on with
   // one) leaves found at 1 as well, so "fewer than found" never says it: the page path's head reads lostThreads. This
