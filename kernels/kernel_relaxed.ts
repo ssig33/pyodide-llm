@@ -20,13 +20,17 @@ const GS: i32 = 32;
   return i32x4.extract_lane(d, 0) + i32x4.extract_lane(d, 1) + i32x4.extract_lane(d, 2) + i32x4.extract_lane(d, 3);
 }
 
-// activations from quantize_x(bias = 64). wc = scale * sum(group weights) removes that bias again:
-// dot(w, q - 64) = dot(w, q) - 64 * sum(w)
+// activations from quantize_x(bias = 64). wc = -64 * sum(group weights), an int32 a group (int8_sums, six_sums),
+// removes that bias again: dot(w, q - 64) = dot(w, q) - 64 * sum(w). T197: it is added to the group's integer sum
+// before the sum is scaled, so that the sum is dot(w, q - 64) exactly (|32 × 128 × 127| at most on the way: int32 and
+// float32 hold it exactly) and is rounded once a group. Before T197 wc was the float32 scale * sum(w), dotted with the
+// activations' scales on its own and taken off at the end: a multiply and an add more a group, four more accumulators
+// in the tile, and the difference of two large float32 sums at the end.
 // T167: four groups at a time; their dot products are added up to one integer a group (groupSums), converted and
 // multiplied by the four scales (weight scale times activation scale) at once, and added into one accumulator whose
 // lane k holds the groups 4j + k: each group's sum times its scale is rounded once (before T167 each of the four
-// lanes of a group was scaled and rounded on its own, and four groups cost 4 × (convert, splat, mul, add)). The bias
-// correction is a dot product of its own, also by fours. A last group or three take the same steps one at a time.
+// lanes of a group was scaled and rounded on its own, and four groups cost 4 × (convert, splat, mul, add)). A last
+// group or three take the same steps one at a time.
 export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize, n: i32, r0: i32, r1: i32): void {
   const ng = n / GS;
   const ng4 = ng & ~3;
@@ -34,13 +38,11 @@ export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
     const row = wq + <usize>i * <usize>n;
     const srow = ws + ((<usize>i * <usize>ng) << 2);
     const crow = wc + ((<usize>i * <usize>ng) << 2);
-    let facc = f32x4.splat(0), corrs = f32x4.splat(0);
+    let facc = f32x4.splat(0);
     let g = 0;
     for (; g < ng4; g += 4) {
       const o = <usize>(g * GS);
-      const xsv = v128.load(xs + (<usize>g << 2));
-      const scales = f32x4.mul(v128.load(srow + (<usize>g << 2)), xsv);
-      corrs = f32x4.add(corrs, f32x4.mul(v128.load(crow + (<usize>g << 2)), xsv));
+      const scales = f32x4.mul(v128.load(srow + (<usize>g << 2)), v128.load(xs + (<usize>g << 2)));
       let d0 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o), v128.load(xq + o), i32x4.splat(0));
       let d1 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 32), v128.load(xq + o + 32), i32x4.splat(0));
       let d2 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 64), v128.load(xq + o + 64), i32x4.splat(0));
@@ -49,19 +51,18 @@ export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
       d1 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 48), v128.load(xq + o + 48), d1);
       d2 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 80), v128.load(xq + o + 80), d2);
       d3 = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 112), v128.load(xq + o + 112), d3);
-      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupSums(d0, d1, d2, d3)), scales));
+      const sums = i32x4.add(groupSums(d0, d1, d2, d3), v128.load(crow + (<usize>g << 2)));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(sums), scales));
     }
     let sum: f32 = f32x4.extract_lane(facc, 0) + f32x4.extract_lane(facc, 1) + f32x4.extract_lane(facc, 2) + f32x4.extract_lane(facc, 3);
-    let corr: f32 = f32x4.extract_lane(corrs, 0) + f32x4.extract_lane(corrs, 1) + f32x4.extract_lane(corrs, 2) + f32x4.extract_lane(corrs, 3);
     for (; g < ng; g++) {
       const o = <usize>(g * GS);
       let acc = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o), v128.load(xq + o), i32x4.splat(0));
       acc = i32x4.relaxed_dot_i8x16_i7x16_add_s(v128.load(row + o + 16), v128.load(xq + o + 16), acc);
-      const xsg = load<f32>(xs + (<usize>g << 2));
-      sum += <f32>laneSum(acc) * (load<f32>(srow + (<usize>g << 2)) * xsg);
-      corr += load<f32>(crow + (<usize>g << 2)) * xsg;
+      const whole = laneSum(acc) + load<i32>(crow + (<usize>g << 2));
+      sum += <f32>whole * (load<f32>(srow + (<usize>g << 2)) * load<f32>(xs + (<usize>g << 2)));
     }
-    store<f32>(xout + (<usize>i << 2), sum - <f32>64.0 * corr);
+    store<f32>(xout + (<usize>i << 2), sum);
   }
 }
 
@@ -74,11 +75,11 @@ export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
 // out of groupSums with the tokens in the lanes.
 //
 // Every (row, token) is matmul_q8r's number to the bit. A lane k of matmul_q8r adds the groups 4j + k in order and
-// the four lanes are added in order, then the groups past the last four one at a time, the corrections likewise; so
-// the tile takes the groups 4j + k in one pass for each k (its lanes are the tokens), adds the passes in that order,
-// then the groups past the fours, each with the same float32 operations (the weight scale times the activation scale,
-// times the group's exact integer sum). The rows past the last four and the tokens past the last four go through
-// matmul_q8r itself.
+// the four lanes are added in order, then the groups past the last four one at a time; so the tile takes the groups
+// 4j + k in one pass for each k (its lanes are the tokens), adds the passes in that order, then the groups past the
+// fours, each with the same float32 operations (the weight scale times the activation scale, times the group's exact
+// integer sum with the correction in it, T197). The rows past the last four and the tokens past the last four go
+// through matmul_q8r itself.
 // @ts-ignore: decorator
 @inline function scalesOf(xs: usize, frame: usize, g: i32): v128 {  // the four tokens' scales of group g
   const at = xs + (<usize>g << 2);
@@ -88,14 +89,16 @@ export function matmul_q8r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
   return v128.load32_lane(at + 3 * frame, v, 3);
 }
 // @ts-ignore: decorator
-@inline function sumsOf(w: usize, x0: v128, x1: v128, x2: v128, x3: v128, x4: v128, x5: v128, x6: v128, x7: v128): v128 {
-  // a row's group (32 bytes at w) with the four tokens' (x0 and x1 the first token's two halves, ...): its four
-  // exact integer sums, as float32 (at most 520192, exact)
-  const lo = v128.load(w), hi = v128.load(w, 16);
-  const d0 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x1, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x0, i32x4.splat(0)));
-  const d1 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x3, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x2, i32x4.splat(0)));
-  const d2 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x5, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x4, i32x4.splat(0)));
-  const d3 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x7, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x6, i32x4.splat(0)));
+@inline function sumsOf(w: usize, c: usize, x0: v128, x1: v128, x2: v128, x3: v128, x4: v128, x5: v128, x6: v128, x7: v128): v128 {
+  // a row's group (32 bytes at w, its correction at c) with the four tokens' (x0 and x1 the first token's two halves,
+  // ...): its four exact integer sums with the bias taken out, as float32 (exact). T197: each token's dot product
+  // starts from the correction in its lane 0 and zeros in the others (groupSums adds the four lanes), where it
+  // started from zeros before
+  const lo = v128.load(w), hi = v128.load(w, 16), start = v128.load32_zero(c);
+  const d0 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x1, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x0, start));
+  const d1 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x3, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x2, start));
+  const d2 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x5, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x4, start));
+  const d3 = i32x4.relaxed_dot_i8x16_i7x16_add_s(hi, x7, i32x4.relaxed_dot_i8x16_i7x16_add_s(lo, x6, start));
   return f32x4.convert_i32x4_s(groupSums(d0, d1, d2, d3));
 }
 
@@ -108,29 +111,24 @@ function tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize
   const s0 = ws + <usize>i * sb, s1 = s0 + sb, s2 = s1 + sb, s3 = s2 + sb;
   const c0 = wc + <usize>i * sb, c1 = c0 + sb, c2 = c1 + sb, c3 = c2 + sb;
   const x1 = xq + frame, x2 = x1 + frame, x3 = x2 + frame;
-  // f: the rows' sums so far, k: their corrections (a lane a token)
-  let f0 = f32x4.splat(0), f1 = f0, f2 = f0, f3 = f0, k0 = f0, k1 = f0, k2 = f0, k3 = f0;
+  // f: the rows' sums so far (a lane a token)
+  let f0 = f32x4.splat(0), f1 = f0, f2 = f0, f3 = f0;
   for (let lane = 0; lane < 4; lane++) {
-    let a0 = f32x4.splat(0), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    let a0 = f32x4.splat(0), a1 = a0, a2 = a0, a3 = a0;
     for (let g = lane; g < ng4; g += 4) {
       const o = <usize>(g * GS), gs = <usize>g << 2;
       const t0 = v128.load(xq + o), t1 = v128.load(xq + o, 16), t2 = v128.load(x1 + o), t3 = v128.load(x1 + o, 16);
       const t4 = v128.load(x2 + o), t5 = v128.load(x2 + o, 16), t6 = v128.load(x3 + o), t7 = v128.load(x3 + o, 16);
       const xsv = scalesOf(xs, frame, g);
-      a0 = f32x4.add(a0, f32x4.mul(sumsOf(w0 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
-      a1 = f32x4.add(a1, f32x4.mul(sumsOf(w1 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
-      a2 = f32x4.add(a2, f32x4.mul(sumsOf(w2 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
-      a3 = f32x4.add(a3, f32x4.mul(sumsOf(w3 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
-      b0 = f32x4.add(b0, f32x4.mul(v128.load32_splat(c0 + gs), xsv));
-      b1 = f32x4.add(b1, f32x4.mul(v128.load32_splat(c1 + gs), xsv));
-      b2 = f32x4.add(b2, f32x4.mul(v128.load32_splat(c2 + gs), xsv));
-      b3 = f32x4.add(b3, f32x4.mul(v128.load32_splat(c3 + gs), xsv));
+      a0 = f32x4.add(a0, f32x4.mul(sumsOf(w0 + o, c0 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
+      a1 = f32x4.add(a1, f32x4.mul(sumsOf(w1 + o, c1 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
+      a2 = f32x4.add(a2, f32x4.mul(sumsOf(w2 + o, c2 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
+      a3 = f32x4.add(a3, f32x4.mul(sumsOf(w3 + o, c3 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
     }
     if (lane == 0) {
-      f0 = a0; f1 = a1; f2 = a2; f3 = a3; k0 = b0; k1 = b1; k2 = b2; k3 = b3;
+      f0 = a0; f1 = a1; f2 = a2; f3 = a3;
     } else {
       f0 = f32x4.add(f0, a0); f1 = f32x4.add(f1, a1); f2 = f32x4.add(f2, a2); f3 = f32x4.add(f3, a3);
-      k0 = f32x4.add(k0, b0); k1 = f32x4.add(k1, b1); k2 = f32x4.add(k2, b2); k3 = f32x4.add(k3, b3);
     }
   }
   for (let g = ng4; g < ng; g++) {  // the groups past the fours, one at a time
@@ -138,21 +136,14 @@ function tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize
     const t0 = v128.load(xq + o), t1 = v128.load(xq + o, 16), t2 = v128.load(x1 + o), t3 = v128.load(x1 + o, 16);
     const t4 = v128.load(x2 + o), t5 = v128.load(x2 + o, 16), t6 = v128.load(x3 + o), t7 = v128.load(x3 + o, 16);
     const xsv = scalesOf(xs, frame, g);
-    f0 = f32x4.add(f0, f32x4.mul(sumsOf(w0 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
-    f1 = f32x4.add(f1, f32x4.mul(sumsOf(w1 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
-    f2 = f32x4.add(f2, f32x4.mul(sumsOf(w2 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
-    f3 = f32x4.add(f3, f32x4.mul(sumsOf(w3 + o, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
-    k0 = f32x4.add(k0, f32x4.mul(v128.load32_splat(c0 + gs), xsv));
-    k1 = f32x4.add(k1, f32x4.mul(v128.load32_splat(c1 + gs), xsv));
-    k2 = f32x4.add(k2, f32x4.mul(v128.load32_splat(c2 + gs), xsv));
-    k3 = f32x4.add(k3, f32x4.mul(v128.load32_splat(c3 + gs), xsv));
+    f0 = f32x4.add(f0, f32x4.mul(sumsOf(w0 + o, c0 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s0 + gs), xsv)));
+    f1 = f32x4.add(f1, f32x4.mul(sumsOf(w1 + o, c1 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s1 + gs), xsv)));
+    f2 = f32x4.add(f2, f32x4.mul(sumsOf(w2 + o, c2 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s2 + gs), xsv)));
+    f3 = f32x4.add(f3, f32x4.mul(sumsOf(w3 + o, c3 + gs, t0, t1, t2, t3, t4, t5, t6, t7), f32x4.mul(v128.load32_splat(s3 + gs), xsv)));
   }
-  const bias = f32x4.splat(64);
-  const r0 = f32x4.sub(f0, f32x4.mul(bias, k0)), r1 = f32x4.sub(f1, f32x4.mul(bias, k1));
-  const r2 = f32x4.sub(f2, f32x4.mul(bias, k2)), r3 = f32x4.sub(f3, f32x4.mul(bias, k3));
-  // token t's four rows are lane t of r0..r3: a transpose
-  const p01 = v128.shuffle<f32>(r0, r1, 0, 4, 1, 5), p23 = v128.shuffle<f32>(r2, r3, 0, 4, 1, 5);
-  const q01 = v128.shuffle<f32>(r0, r1, 2, 6, 3, 7), q23 = v128.shuffle<f32>(r2, r3, 2, 6, 3, 7);
+  // token t's four rows are lane t of f0..f3: a transpose
+  const p01 = v128.shuffle<f32>(f0, f1, 0, 4, 1, 5), p23 = v128.shuffle<f32>(f2, f3, 0, 4, 1, 5);
+  const q01 = v128.shuffle<f32>(f0, f1, 2, 6, 3, 7), q23 = v128.shuffle<f32>(f2, f3, 2, 6, 3, 7);
   const at = xout + (<usize>i << 2);
   v128.store(at, v128.shuffle<f32>(p01, p23, 0, 1, 4, 5));
   v128.store(at + os, v128.shuffle<f32>(p01, p23, 2, 3, 6, 7));
@@ -192,8 +183,8 @@ export function matmul_q8r_tile(xout: usize, xq: usize, xs: usize, wq: usize, ws
 }
 
 // T98: the same on int6 weights (six.ts: 24 bytes a group, widened straight into int8), in the same order as
-// matmul_q8r: four groups at a time, one sum a group (T167), their scales and corrections as vectors. wc as
-// for matmul_q8r (scale times the sum of the group's int8 values).
+// matmul_q8r: four groups at a time, one sum a group (T167) with the corrections in it (T197), their scales as
+// vectors. wc as for matmul_q8r (-64 times the sum of the group's int8 values, six_sums).
 // @ts-ignore: decorator
 @inline function dot6(p: usize, x: usize): v128 {
   const low = v128.load(p), t = sixTops(p);
@@ -208,23 +199,20 @@ export function matmul_q6r(xout: usize, xq: usize, xs: usize, wq: usize, ws: usi
     const row = wq + <usize>i * <usize>ng * 24;
     const srow = ws + ((<usize>i * <usize>ng) << 2);
     const crow = wc + ((<usize>i * <usize>ng) << 2);
-    let facc = f32x4.splat(0), corrs = f32x4.splat(0);
+    let facc = f32x4.splat(0);
     let g = 0;
     for (; g < ng4; g += 4) {
       const p = row + <usize>g * 24, o = xq + <usize>(g * GS);
-      const xsv = v128.load(xs + (<usize>g << 2));
-      const scales = f32x4.mul(v128.load(srow + (<usize>g << 2)), xsv);
-      corrs = f32x4.add(corrs, f32x4.mul(v128.load(crow + (<usize>g << 2)), xsv));
+      const scales = f32x4.mul(v128.load(srow + (<usize>g << 2)), v128.load(xs + (<usize>g << 2)));
       const d0 = dot6(p, o), d1 = dot6(p + 24, o + 32), d2 = dot6(p + 48, o + 64), d3 = dot6(p + 72, o + 96);
-      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(groupSums(d0, d1, d2, d3)), scales));
+      const sums = i32x4.add(groupSums(d0, d1, d2, d3), v128.load(crow + (<usize>g << 2)));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(sums), scales));
     }
     let sum: f32 = f32x4.extract_lane(facc, 0) + f32x4.extract_lane(facc, 1) + f32x4.extract_lane(facc, 2) + f32x4.extract_lane(facc, 3);
-    let corr: f32 = f32x4.extract_lane(corrs, 0) + f32x4.extract_lane(corrs, 1) + f32x4.extract_lane(corrs, 2) + f32x4.extract_lane(corrs, 3);
     for (; g < ng; g++) {
-      const xsg = load<f32>(xs + (<usize>g << 2));
-      sum += <f32>laneSum(dot6(row + <usize>g * 24, xq + <usize>(g * GS))) * (load<f32>(srow + (<usize>g << 2)) * xsg);
-      corr += load<f32>(crow + (<usize>g << 2)) * xsg;
+      const whole = laneSum(dot6(row + <usize>g * 24, xq + <usize>(g * GS))) + load<i32>(crow + (<usize>g << 2));
+      sum += <f32>whole * (load<f32>(srow + (<usize>g << 2)) * load<f32>(xs + (<usize>g << 2)));
     }
-    store<f32>(xout + (<usize>i << 2), sum - <f32>64.0 * corr);
+    store<f32>(xout + (<usize>i << 2), sum);
   }
 }

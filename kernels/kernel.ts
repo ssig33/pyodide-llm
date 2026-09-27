@@ -186,27 +186,28 @@ export function quantize6_x(out: usize, xs: usize, x: usize, n: i32): void {
   }
 }
 
-// T98: the corrections of matmul_q6r for int6 weights (w, groups of 24 bytes; ws their scales): out[g] = the scale
-// times the sum of the group's int8 values, as forward.js computes them for int8 (an integer sum is exact in float32)
-export function six_sums(out: usize, w: usize, ws: usize, groups: i32): void {
+// T98: the corrections of matmul_q6r for int6 weights (w, groups of 24 bytes): out[g] = -64 times the sum of the
+// group's int8 values, an int32 (T197: before it the float32 scale times the sum; the kernels of kernel_relaxed.ts
+// add it to the group's integer sum now)
+export function six_sums(out: usize, w: usize, groups: i32): void {
   for (let g = 0; g < groups; g++) {
     const p = w + <usize>g * 24, low = v128.load(p), t = sixTops(p);
     const pairs = i16x8.add(i16x8.extadd_pairwise_i8x16_s(sixFirst(low, t)), i16x8.extadd_pairwise_i8x16_s(sixSecond(low, t)));
     const quads = i32x4.extadd_pairwise_i16x8_s(pairs);
     const sum = i32x4.extract_lane(quads, 0) + i32x4.extract_lane(quads, 1) + i32x4.extract_lane(quads, 2) + i32x4.extract_lane(quads, 3);
-    store<f32>(out + (<usize>g << 2), load<f32>(ws + (<usize>g << 2)) * <f32>sum);
+    store<i32>(out + (<usize>g << 2), -64 * sum);
   }
 }
 
-// T123: the same for int8 weights: the sums of groups of 32 int8 values (w), times the group's scale (ws), the
-// corrections of matmul_q8r. forward.js made them one value at a time in JavaScript (7B: 266 s of its construct)
-export function int8_sums(out: usize, w: usize, ws: usize, groups: i32): void {
+// T123: the same for int8 weights: the sums of groups of 32 int8 values (w), times -64 (T197), the corrections of
+// matmul_q8r. forward.js made them one value at a time in JavaScript (7B: 266 s of its construct)
+export function int8_sums(out: usize, w: usize, groups: i32): void {
   for (let g = 0; g < groups; g++) {
     const p = w + (<usize>g << 5);
     const pairs = i16x8.add(i16x8.extadd_pairwise_i8x16_s(v128.load(p)), i16x8.extadd_pairwise_i8x16_s(v128.load(p + 16)));
     const quads = i32x4.extadd_pairwise_i16x8_s(pairs);
     const sum = i32x4.extract_lane(quads, 0) + i32x4.extract_lane(quads, 1) + i32x4.extract_lane(quads, 2) + i32x4.extract_lane(quads, 3);
-    store<f32>(out + (<usize>g << 2), load<f32>(ws + (<usize>g << 2)) * <f32>sum);
+    store<i32>(out + (<usize>g << 2), -64 * sum);
   }
 }
 

@@ -8,7 +8,7 @@
 //
 // Three sizes: 8192 x 8192 (64 MiB of int8, far past the caches), 2048 x 2048 (4 MiB: T167's size "in the caches"
 // of a server's last level) and 256 x 1024 (in the first levels, called over and over). GB/s counts the bytes a row
-// reads: 32 a group of int8 (24 of int6), its float32 scale and its float32 correction.
+// reads: 32 a group of int8 (24 of int6), its float32 scale and its correction (4 bytes: float32 before T197, int32 from it).
 // T167's review: and the runner's ceilings, T163's loops (kernels/ceilings*.ts): at each size the read-only loop over
 // as many bytes as matmul_q8r reads (40 a group), taking turns with the kernels, and once relaxed_dot with its two
 // loads in L1. A form at the read's GB/s is held by the memory there, not by its own instructions.
@@ -51,6 +51,9 @@ const ceilings = { ...instance(work + "ceilings.wasm"), ...instance(work + "ceil
 // Xeon 6973P-C, 8573C and 8370C, where the same change was 0.88 to 1.18 times main)
 console.log(`cpu: ${os.cpus()[0]?.model ?? "unknown"}, ${os.cpus().length} logical cores, ${process.arch}`);
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+// the corrections of matmul_q8r and matmul_q6r as a form makes them: before T197 int8_sums and six_sums took the
+// scales (out, w, scales, groups: float32 scale × sum), from T197 not (out, w, groups: int32 −64 × sum)
+const sums = (plain, kernel, out, w, ws, groups) => (plain[kernel].length === 4 ? plain[kernel](out, w, ws, groups) : plain[kernel](out, w, groups));
 {  // relaxed_dot with its two loads, on 8 KB at 4096 (below the matrices), the second 4 KB 0..127 as the loop wants
   const I = new Int8Array(memory.buffer);
   for (let j = 0; j < 8192; j++) I[4096 + j] = j < 4096 ? (Math.imul(j, 2654435761) >>> 24) - 128 : (j * 37) % 128;
@@ -62,7 +65,9 @@ for (const [rows, n, calls] of [[8192, 8192, 1], [2048, 2048, 12], [256, 1024, 2
   const ng = n / 32;
   let top = 65536;
   const take = (bytes) => { const at = top; top += Math.ceil(bytes / 64) * 64; return at; };
-  const w8 = take(rows * n), w6 = take(rows * ng * 24), ws = take(rows * ng * 4), wc8 = take(rows * ng * 4), wc6 = take(rows * ng * 4);
+  // each form's corrections in its own place: T197 changed them from the float32 scale × sum to the int32 −64 × sum
+  const w8 = take(rows * n), w6 = take(rows * ng * 24), ws = take(rows * ng * 4);
+  const wc8 = { main: take(rows * ng * 4), tree: take(rows * ng * 4) }, wc6 = { main: take(rows * ng * 4), tree: take(rows * ng * 4) };
   const x = take(n), xs = take(ng * 4), out = take(rows * 4);
   if (top > memory.buffer.byteLength) memory.grow(Math.ceil((top - memory.buffer.byteLength) / 65536));
   const U = new Uint8Array(memory.buffer), I = new Int8Array(memory.buffer), F = new Float32Array(memory.buffer);
@@ -73,46 +78,48 @@ for (const [rows, n, calls] of [[8192, 8192, 1], [2048, 2048, 12], [256, 1024, 2
   for (let i = 0; i < rows * ng; i++) F[ws / 4 + i] = Math.fround(1e-3 * (1 + (next() % 1000)));
   for (let g = 0; g < ng; g++) F[xs / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
   for (let j = 0; j < n; j++) I[x + j] = next() % 128;  // quantize_x(bias = 64): 0..127
-  kernels.main.plain.int8_sums(wc8, w8, ws, rows * ng);
-  kernels.main.plain.six_sums(wc6, w6, ws, rows * ng);
+  for (const [name, k] of Object.entries(kernels)) {
+    sums(k.plain, "int8_sums", wc8[name], w8, ws, rows * ng);
+    sums(k.plain, "six_sums", wc6[name], w6, ws, rows * ng);
+  }
   const six = (i, j) => {  // the int8 value of int6 weight j of row i (forward-check's six())
     const at = w6 + (i * ng + (j >> 5)) * 24, m = j & 31;
     const low = m < 16 ? U[at + m] & 15 : U[at + m - 16] >> 4, t = (U[at + 16 + (m % 8)] >> (2 * ((m / 8) | 0))) & 3;
     return (((low | (t << 4)) << 2) << 24) >> 24;
   };
-  const exact = (weight, wc) => Array.from({ length: rows }, (_, i) => {  // float64, the same integers and scales
-    let sum = 0, corr = 0;
+  // float64, the same integers and scales: each group's dot(w, q − 64) (the activations carry quantize_x's bias of 64)
+  const exact = (weight) => Array.from({ length: rows }, (_, i) => {
+    let sum = 0;
     for (let g = 0; g < ng; g++) {
       let dot = 0;
-      for (let j = g * 32; j < g * 32 + 32; j++) dot += weight(i, j) * I[x + j];
+      for (let j = g * 32; j < g * 32 + 32; j++) dot += weight(i, j) * (I[x + j] - 64);
       sum += dot * F[ws / 4 + i * ng + g] * F[xs / 4 + g];
-      corr += F[wc / 4 + i * ng + g] * F[xs / 4 + g];
     }
-    return sum - 64 * corr;
+    return sum;
   });
   const runs = {
-    q8r: { run: (k) => k.relaxed.matmul_q8r(out, x, xs, w8, ws, wc8, n, 0, rows), bytes: rows * ng * 40, reference: exact((i, j) => I[w8 + i * n + j], wc8) },
-    q6r: { run: (k) => k.relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, n, 0, rows), bytes: rows * ng * 32, reference: exact(six, wc6) },
+    q8r: { run: (k, name) => k.relaxed.matmul_q8r(out, x, xs, w8, ws, wc8[name], n, 0, rows), bytes: rows * ng * 40, reference: exact((i, j) => I[w8 + i * n + j]) },
+    q6r: { run: (k, name) => k.relaxed.matmul_q6r(out, x, xs, w6, ws, wc6[name], n, 0, rows), bytes: rows * ng * 32, reference: exact(six) },
   };
   // each form against the float64 sums, and the two against each other: the largest error over the rows, relative
   // to the largest |output| of the matrix (a row's own output can be near 0 while its terms are not)
   for (const [kernel, { run, reference }] of Object.entries(runs)) {
     const scale = Math.max(...reference.map(Math.abs));
     const outputs = {};
-    for (const [name, k] of Object.entries(kernels)) { F.fill(0, out / 4, out / 4 + rows); run(k); outputs[name] = F.slice(out / 4, out / 4 + rows); }
+    for (const [name, k] of Object.entries(kernels)) { F.fill(0, out / 4, out / 4 + rows); run(k, name); outputs[name] = F.slice(out / 4, out / 4 + rows); }
     const error = (a, b) => Math.max(...Array.from(a, (v, i) => Math.abs(v - b[i]))) / scale;
     const same = outputs.main.filter((v, i) => v === outputs.tree[i]).length;
     console.log(`${rows} x ${n} ${kernel}: against float64 main ${error(outputs.main, reference).toExponential(2)}, tree ${error(outputs.tree, reference).toExponential(2)}; `
       + `tree against main ${error(outputs.tree, outputs.main).toExponential(2)}, ${same} of ${rows} rows the same to the bit`);
   }
-  const time = (run, k) => { const t0 = performance.now(); for (let c = 0; c < calls; c++) run(k); return (performance.now() - t0) / calls; };
+  const time = (run, k, name) => { const t0 = performance.now(); for (let c = 0; c < calls; c++) run(k, name); return (performance.now() - t0) / calls; };
   // the read: as many bytes as q8r's, from w8 on, after the turns of the kernels and not between them (between them
   // it read w8 just before main's q8r and not before the tree's)
   const readBytes = rows * ng * 40, read = () => ceilings.read(w8, readBytes, 1);
   for (let r = 0; r < rounds; r++) {
     const ms = { read: [] };
     for (let t = 0; t < turns; t++) {
-      for (const [name, k] of Object.entries(kernels)) for (const [kernel, { run }] of Object.entries(runs)) (ms[`${kernel} ${name}`] ??= []).push(time(run, k));
+      for (const [name, k] of Object.entries(kernels)) for (const [kernel, { run }] of Object.entries(runs)) (ms[`${kernel} ${name}`] ??= []).push(time(run, k, name));
     }
     for (let t = 0; t < turns; t++) ms.read.push(time(read));
     const readSpeed = readBytes / median(ms.read) / 1e6;

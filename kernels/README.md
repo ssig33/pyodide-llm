@@ -225,8 +225,9 @@ which is what the model usually writes before it stops by itself, costs what it 
 Weights as `quantize.py` writes them: int8 values in groups of 32 with one float32 scale per group; they stay
 views into the downloaded buffer and are never widened. Per matmul the input is quantized once
 (`quantize_x`, shared by q/k/v and by w1/w3) and multiplied by `matmul_q8`. With relaxed SIMD, `matmul_q8r`
-multiplies int8 by 7-bit unsigned values: activations get a bias of 64, and `corrections = scale * sum of the
-group` takes it out again. The relaxed module is loaded in `try/except`: a browser without relaxed SIMD
+multiplies int8 by 7-bit unsigned values: activations get a bias of 64, and `corrections = -64 * sum of the
+group` (an int32 a group, T197; before it the float32 `scale * sum`) takes it out again, added to the group's
+integer sum before that is scaled. The relaxed module is loaded in `try/except`: a browser without relaxed SIMD
 (shipping Safari) refuses to compile it, which arrives in Python as `OSError` (verified by switching the
 feature off in Firefox), and int8 then runs on `matmul_q8`.
 

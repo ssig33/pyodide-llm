@@ -36,15 +36,15 @@ const modelOf = (id) => MODELS.find((m) => m.id === id) ?? { name: path.basename
 const file = (f) => (path.isAbsolute(f) ? f : root + f);
 
 // T98: six_sums (the corrections of int6 weights for matmul_q6r) against the sums of the int8 values the layout of
-// llama2_numpy.pack6 holds, taken apart byte by byte here; the products rounded as JavaScript's Math.fround would
+// llama2_numpy.pack6 holds, taken apart byte by byte here. T197: a correction is the int32 −64 × the sum (before it
+// the float32 scale × the sum)
 {
   const memory = new WebAssembly.Memory({ initial: 4 });
   const k = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_plain.wasm`)), { env: { memory } }).exports;
-  const U = new Uint8Array(memory.buffer), F = new Float32Array(memory.buffer);
-  const groups = 2000, w = 4096, scales = w + groups * 24, out = scales + groups * 4;
+  const U = new Uint8Array(memory.buffer), N = new Int32Array(memory.buffer);
+  const groups = 2000, w = 4096, out = w + groups * 24;
   for (let i = 0; i < groups * 24; i++) U[w + i] = (Math.imul(i, 2654435761) >>> 7) & 255;
-  for (let g = 0; g < groups; g++) F[scales / 4 + g] = Math.fround(0.001 + g * 1.37e-3);
-  k.six_sums(out, w, scales, groups);
+  k.six_sums(out, w, groups);
   for (let g = 0; g < groups; g++) {
     let sum = 0;
     for (let j = 0; j < 32; j++) {
@@ -52,15 +52,18 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
       const top = (U[at + 16 + (j % 8)] >> (2 * ((j / 8) | 0))) & 3;
       sum += (((low | (top << 4)) << 2) << 24) >> 24;
     }
-    if (Math.fround(F[scales / 4 + g] * sum) !== F[out / 4 + g]) throw new Error(`six_sums differs at group ${g}`);
+    if (-64 * sum !== N[out / 4 + g]) throw new Error(`six_sums differs at group ${g}: ${N[out / 4 + g]} against ${-64 * sum}`);
   }
-  // T123: int8_sums, the same for int8 weights, 32 bytes a group, against the sums taken here
+  // T123: int8_sums, the same for int8 weights, 32 bytes a group, against the sums taken here; groups at the ends of
+  // int8 (all -128: 262144, all 127: -260096)
   const I = new Int8Array(memory.buffer);
-  k.int8_sums(out, w, scales, groups * 24 / 32);
+  I.fill(-128, w, w + 32);
+  I.fill(127, w + 32, w + 64);
+  k.int8_sums(out, w, groups * 24 / 32);
   for (let g = 0; g < groups * 24 / 32; g++) {
     let sum = 0;
     for (let j = 0; j < 32; j++) sum += I[w + g * 32 + j];
-    if (Math.fround(F[scales / 4 + g] * sum) !== F[out / 4 + g]) throw new Error(`int8_sums differs at group ${g}`);
+    if (-64 * sum !== N[out / 4 + g]) throw new Error(`int8_sums differs at group ${g}: ${N[out / 4 + g]} against ${-64 * sum}`);
   }
 }
 
@@ -124,7 +127,7 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   // corrections from six_sums and int8_sums. T167: and matmul_q8r to the bit against its sums taken here: each
   // group's 32 products as one exact integer, times the group's scale (weight scale times activation scale) rounded
   // once, added into lane g % 4 for the groups in fours and the lanes added in order, the groups past the last four
-  // added one at a time; the corrections the same way. At 1 to 7 groups (no four at all, and one four with 0 to 3
+  // added one at a time (T197: the bias of 64 taken out of each group's integer before it is scaled). At 1 to 7 groups (no four at all, and one four with 0 to 3
   // after it) and at 41: T167's review, at 41 alone one group comes after the fours, and a kernel that scaled every
   // group after the fours with the first one's scale passed
   const relaxed = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_relaxed_plain.wasm`)), { env: { memory } }).exports;
@@ -138,30 +141,22 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   for (const groups of [1, 2, 3, 4, 5, 6, 7, 8, 11, ng]) {
     const m = groups * 32, fours = groups & ~3;
     for (let i = 0; i < rows; i++) for (let j = 0; j < m; j++) I[w8 + i * m + j] = six(i, j, groups);
-    k.six_sums(wc6, w6, ws, rows * groups);
-    k.int8_sums(wc8, w8, ws, rows * groups);
+    k.six_sums(wc6, w6, rows * groups);
+    k.int8_sums(wc8, w8, rows * groups);
     relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, m, 0, rows);
     relaxed.matmul_q8r(out8, x, xs, w8, ws, wc8, m, 0, rows);
     for (let i = 0; i < rows; i++) {
       if (F[out / 4 + i] !== F[out8 / 4 + i]) throw new Error(`matmul_q6r differs at row ${i} of ${groups} groups: ${F[out / 4 + i]} against matmul_q8r's ${F[out8 / 4 + i]}`);
-      const part = (g) => {
+      const part = (g) => {  // T197: the group's exact dot(w, q - 64), scaled once
         let dot = 0;
-        for (let j = 0; j < 32; j++) dot += I[w8 + i * m + g * 32 + j] * I[x + g * 32 + j];
+        for (let j = 0; j < 32; j++) dot += I[w8 + i * m + g * 32 + j] * (I[x + g * 32 + j] - 64);
         return round(dot * round(F[ws / 4 + i * groups + g] * F[xs / 4 + g]));
       };
-      const correction = (g) => round(F[wc8 / 4 + i * groups + g] * F[xs / 4 + g]);
-      const lanes = [0, 0, 0, 0], corrs = [0, 0, 0, 0];
-      for (let g = 0; g < fours; g++) {
-        lanes[g & 3] = round(lanes[g & 3] + part(g));
-        corrs[g & 3] = round(corrs[g & 3] + correction(g));
-      }
+      const lanes = [0, 0, 0, 0];
+      for (let g = 0; g < fours; g++) lanes[g & 3] = round(lanes[g & 3] + part(g));
       let sum = round(round(round(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
-      let corr = round(round(round(corrs[0] + corrs[1]) + corrs[2]) + corrs[3]);
-      for (let g = fours; g < groups; g++) {
-        sum = round(sum + part(g));
-        corr = round(corr + correction(g));
-      }
-      const expected = round(sum - round(64 * corr));
+      for (let g = fours; g < groups; g++) sum = round(sum + part(g));
+      const expected = sum;
       if (F[out8 / 4 + i] !== expected) throw new Error(`matmul_q8r differs at row ${i} of ${groups} groups: ${F[out8 / 4 + i]} against ${expected}`);
     }
     // T159: matmul_q8r_tile (a prompt's count tokens, four rows by four tokens) to the bit against matmul_q8r token by

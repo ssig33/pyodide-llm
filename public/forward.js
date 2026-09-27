@@ -256,7 +256,7 @@ const frameBytes = (arrays) => arrays.reduce((size, [, bytes]) => size + align(b
  * above what createForward allocates (tests/forward-check.mjs holds the two together).
  * header: the 7 ints of the legacy format. dtype: the file's ("float32", "float16", "int8", "int6"). int8: the int8
  * kernels compute on the weights (not with ?without=int8, which widens them to float32); relaxed: with relaxed SIMD
- * (a float32 correction a group); halfKV: the keys and values may be float16 (T110: an int8 model on a shared memory;
+ * (an int32 correction a group, T197); halfKV: the keys and values may be float16 (T110: an int8 model on a shared memory;
  * whether they are is keysInHalf's, T160).
  * kvStart and outliers are llama2_numpy's KV_START and OUTLIER_CHANNELS. arch and head_dim are of the form
  * (llama2_numpy.FORM, which a model's options carry: the caller passes them in as they are, T144): head_dim is the
@@ -271,7 +271,7 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   const onInt8 = int8 && dim % 32 === 0 && qDim % 32 === 0 && kvDim % 32 === 0 && hidden % 32 === 0;
   let bytes = 0;
   // what the file holds in another form, for its matrices (not the tables that are no matrix multiplied: an
-  // embedding apart from the classifier, GPT-2's positions): the corrections of relaxed SIMD, one float32 a group,
+  // embedding apart from the classifier, GPT-2's positions): the corrections of relaxed SIMD, one int32 a group,
   // as many as the scales (a ninth of an int8 file, a seventh of an int6 one), and the float32 columns of the
   // outlier channels (T92); or, off the int8 kernels, every weight widened to float32
   const tables = (signedVocab < 0 ? vocab * dim : 0) + (arch === "gpt2" ? seqLen * dim : 0);
@@ -481,11 +481,12 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       let corrections = scales;
       if (relaxed) {
         // relaxed SIMD multiplies by 7-bit unsigned activations with a bias of 64, which this takes out again:
-        // dot(w, q - 64) = dot(w, q) - 64 * sum(w). scale * sum of the group, in float32
+        // dot(w, q - 64) = dot(w, q) - 64 * sum(w). -64 * sum of the group, an int32 (T197: the kernels add it to the
+        // group's integer sum; before it the float32 scale * sum)
         corrections = alloc(groups * 4);
         // the same numbers as a sum in JavaScript, a kernel's speed (T98, T123: 7B spent 266 s here one value at a
         // time). Groups of 32: relaxed runs only where every row is whole groups
-        (six ? k.six_sums : k.int8_sums)(corrections, values, scales, groups);
+        (six ? k.six_sums : k.int8_sums)(corrections, values, groups);
       }
       const layer = (l) => [values + l * rows * rowBytes, scales + l * rows * (n / t.group) * 4, corrections + l * rows * (n / t.group) * 4];
       return { rows, n, int8: true, six, group: t.group, layer };

@@ -11,7 +11,8 @@ import os from "node:os";
 import path from "node:path";
 import { Worker, isMainThread, workerData } from "node:worker_threads";
 
-const CONTROL = 16;  // int32s: 0 go, 1 done, 2 form, 3 n, 4..7 addresses (out, x, xs, w8), 8 ws, 9 wc8, 10 rows, 11 threads
+const CONTROL = 16;  // int32s: 0 go, 1 done, 2 form, 3 n, 4..7 addresses (out, x, xs, w8), 8 ws, 9 main's wc8, 10 rows, 11 threads,
+// 12 the tree's wc8 (T197 changed the corrections: each form reads its own)
 
 if (!isMainThread) {
   const { memory, forms, control, index } = workerData;
@@ -25,7 +26,7 @@ if (!isMainThread) {
     const rows = c[10], threads = c[11], share = Math.ceil(rows / threads);
     if (index >= threads) continue;  // not asked this time
     const r0 = Math.min(rows, index * share), r1 = Math.min(rows, r0 + share);
-    kernels[c[2]].matmul_q8r(c[4], c[5], c[6], c[7], c[8], c[9], c[3], r0, r1);
+    kernels[c[2]].matmul_q8r(c[4], c[5], c[6], c[7], c[8], c[2] === 0 ? c[9] : c[12], c[3], r0, r1);
     Atomics.add(c, 1, 1);
     Atomics.notify(c, 1);
   }
@@ -49,11 +50,13 @@ if (!isMainThread) {
     execFileSync("npx", [...asc, dir + "kernel_relaxed.ts", "-o", dir + "relaxed.wasm", "--enable", "simd,relaxed-simd,threads"], { cwd: root, stdio: "inherit" });
     files.push(dir + "relaxed.wasm");
   }
-  execFileSync("npx", [...asc, `${work}tree/kernel.ts`, "-o", work + "plain.wasm", "--enable", "simd,threads"], { cwd: root, stdio: "inherit" });
+  for (const name of ["main", "tree"]) execFileSync("npx", [...asc, `${work}${name}/kernel.ts`, "-o", `${work}${name}/plain.wasm`, "--enable", "simd,threads"], { cwd: root, stdio: "inherit" });
   console.log(`cpu: ${os.cpus()[0]?.model ?? "unknown"}, ${os.cpus().length} logical cores, ${process.arch}`);
 
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536, shared: true });
-  const plain = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(work + "plain.wasm")), { env: { memory } }).exports;
+  const plains = ["main", "tree"].map((name) => new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${work}${name}/plain.wasm`)), { env: { memory } }).exports);
+  // before T197 int8_sums took the scales (out, w, scales, groups: float32 scale × sum), from T197 not (int32 −64 × sum)
+  const sums = (plain, out, w, ws, groups) => (plain.int8_sums.length === 4 ? plain.int8_sums(out, w, ws, groups) : plain.int8_sums(out, w, groups));
   const control = new SharedArrayBuffer(CONTROL * 4), c = new Int32Array(control);
   const workers = [0, 1, 2, 3].map((index) => new Worker(new URL(import.meta.url), { workerData: { memory, forms: files, control, index } }));
   const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
@@ -62,7 +65,7 @@ if (!isMainThread) {
     const ng = n / 32;
     let top = 65536;
     const take = (bytes) => { const at = top; top += Math.ceil(bytes / 64) * 64; return at; };
-    const w8 = take(rows * n), ws = take(rows * ng * 4), wc8 = take(rows * ng * 4), x = take(n), xs = take(ng * 4), out = take(rows * 4);
+    const w8 = take(rows * n), ws = take(rows * ng * 4), wc8 = take(rows * ng * 4), wcTree = take(rows * ng * 4), x = take(n), xs = take(ng * 4), out = take(rows * 4);
     const pages = Math.ceil(top / 65536) - memory.buffer.byteLength / 65536;
     if (pages > 0) memory.grow(pages);
     const I = new Int8Array(memory.buffer), F = new Float32Array(memory.buffer);
@@ -72,8 +75,9 @@ if (!isMainThread) {
     for (let i = 0; i < rows * ng; i++) F[ws / 4 + i] = Math.fround(1e-3 * (1 + (next() % 1000)));
     for (let g = 0; g < ng; g++) F[xs / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
     for (let j = 0; j < n; j++) I[x + j] = next() % 128;
-    plain.int8_sums(wc8, w8, ws, rows * ng);
-    Object.assign(c, { 3: n, 4: out, 5: x, 6: xs, 7: w8, 8: ws, 9: wc8, 10: rows });
+    sums(plains[0], wc8, w8, ws, rows * ng);
+    sums(plains[1], wcTree, w8, ws, rows * ng);
+    Object.assign(c, { 3: n, 4: out, 5: x, 6: xs, 7: w8, 8: ws, 9: wc8, 10: rows, 12: wcTree });
     const run = (form, threads) => {
       c[2] = form; c[11] = threads;
       Atomics.store(c, 1, 0);

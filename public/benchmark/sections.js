@@ -216,7 +216,7 @@ async function cpu(counts = [1, 2, 4]) {
            layerWeights: layerWeights(model), rows, ceilings: ceilings ? { read, dot, dotRegisters, fma } : { error: ceilingsFailed } };
 }
 
-// what a token reads: the checkpoint, and with relaxed SIMD matmul_q8r's corrections too (a float32 for each group of
+// what a token reads: the checkpoint, and with relaxed SIMD matmul_q8r's corrections too (an int32 for each group of
 // every int8 matrix: 23.4 MB here). The GB/s column stays the checkpoint's (T157 turns it into other models' speeds);
 // its share of reading alone counts these bytes (T163's review). Safari's matmul_q8 reads no corrections.
 const tokenBytes = ({ plan, size }, kernels) => size + (kernels.relaxed ? Object.values(plan.tensors)
