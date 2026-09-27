@@ -61,6 +61,7 @@ The shapes are taken from public implementations, and each file keeps their noti
 | Attention | llama.cpp's `flash_attn_tile` (MIT). The path for devices without subgroups is ours. |
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
 | One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |
+| One token's layer on packed int8 dot products, the vector quantized before each matrix (benchmark only) | ONNX Runtime's DP4A MatMulNBits for small M (MIT), with the fused writes of the line above. The norm and its quantizing in one dispatch are ours. |
 | The device's ceilings (benchmark only) | the loops of clpeak (GPL-3.0): the shapes only, no lines copied |
 | Sampling on the GPU and several tokens a submission (benchmark only): the repetition penalty, softmax, top-p and the draw, the next token's row of the embedding | the penalty of MLC LLM (Apache-2.0); llama.cpp's `argmax`, `soft_max`, `cumsum` and `get_rows` (MIT); top-p without sorting from MLC LLM's `top_p_pivot` (Apache-2.0). Carrying the state from one token to the next, and the draw by the same pivots, are ours. |
 

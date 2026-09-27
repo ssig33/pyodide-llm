@@ -213,45 +213,55 @@ assert.ok(matVecTable(matVecSteps, {}, matVecCeilings).includes("| llama.cpp MMV
 // one; the share of the buffer's reads beside GB/s, but not after a lost device or on a fallback adapter; every row
 // as many cells as the header, a failure's | in its cell
 const layerStep = { name: "a layer of a token", result: { model: "Llama 3.2 1B", pos: 127, layers: 16, GB: 0.0684, rows: [
-  { form: "separate steps", check: "a layer, separate steps", fused: false, subgroups: false, dispatches: 14, msPerLayer: 4.2, GBps: 16.3 },
-  { form: "fused (T150), the norms apart", check: "a layer, fused (T150), the norms apart", fused: true, normApart: true, subgroups: false, dispatches: 7, msPerLayer: 2.8, GBps: 24.4 },
-  { form: "fused (T150)", check: "a layer, fused (T150)", fused: true, subgroups: false, dispatches: 5, msPerLayer: 2.1, GBps: 32.6 },
-  { form: "separate steps, subgroups", check: "a layer, separate steps, subgroups", fused: false, subgroups: true, error: "a | b\nc" },
-  { form: "fused (T150), subgroups", check: "a layer, fused (T150), subgroups", fused: true, subgroups: true, dispatches: 5, msPerLayer: 1.9, GBps: 36 }] } };
-const layerRight = { "a layer, separate steps": { ok: true }, "a layer, fused (T150)": { ok: true } };
+  { form: "llama.cpp, separate steps", check: "a layer, llama.cpp, separate steps", base: "llama.cpp", fused: false, subgroups: false, dispatches: 14, msPerLayer: 4.2, GBps: 16.3 },
+  { form: "llama.cpp, fused (T150)", check: "a layer, llama.cpp, fused (T150)", base: "llama.cpp", fused: true, subgroups: false, dispatches: 5, msPerLayer: 2.1, GBps: 32.6 },
+  { form: "llama.cpp, separate steps, subgroups", check: "a layer, llama.cpp, separate steps, subgroups", base: "llama.cpp", fused: false, subgroups: true, error: "a | b\nc" },
+  { form: "llama.cpp, fused (T150), subgroups", check: "a layer, llama.cpp, fused (T150), subgroups", base: "llama.cpp", fused: true, subgroups: true, dispatches: 5, msPerLayer: 1.9, GBps: 36 },
+  { form: "DP4A, separate steps", check: "a layer, DP4A, separate steps", base: "DP4A", fused: false, subgroups: false, dispatches: 18, msPerLayer: 3.0, GBps: 22.8 },
+  { form: "DP4A, fused (T175), the norms apart", check: "a layer, DP4A, fused (T175), the norms apart", base: "DP4A", fused: true, normApart: true, subgroups: false, dispatches: 11, msPerLayer: 2.0, GBps: 34.2 },
+  { form: "DP4A, fused (T175)", check: "a layer, DP4A, fused (T175)", base: "DP4A", fused: true, subgroups: false, dispatches: 9, msPerLayer: 1.5, GBps: 45.6 }] } };
+const layerRight = { "a layer, llama.cpp, separate steps": { ok: true }, "a layer, llama.cpp, fused (T150)": { ok: true }, "a layer, DP4A, separate steps": { ok: true },
+  "a layer, DP4A, fused (T175)": { ok: true } };
 const layerCeilings = { global: { GBps: 40 } };
 const fasterOf = (lines, form) => cellsOf(lines.find((line) => line.startsWith(`| ${form} |`) || line.startsWith(`| ${form} (WRONG`))).at(-1).trim();
 const layerLines = layerTable(layerStep, layerRight, layerCeilings);
-assert.ok(layerLines.includes("| fused (T150) | 5 | 2.10 | 32.6 (81.5%) | 33.6 | 2.0× |"), layerLines.join("\n"));
-assert.ok(layerLines.includes("| fused (T150), the norms apart | 7 | 2.80 | 24.4 (61.0%) | 44.8 | 1.5× |"), layerLines.join("\n"));
-assert.equal(fasterOf(layerLines, "separate steps"), "");
+assert.ok(layerLines.includes("| llama.cpp, fused (T150) | 5 | 2.10 | 32.6 (81.5%) | 33.6 | 2.0× |"), layerLines.join("\n"));
+// T175: the DP4A forms against DP4A's separate steps (not llama.cpp's: 4.2 / 1.5 would say 2.8×)
+assert.ok(layerLines.includes("| DP4A, fused (T175) | 9 | 1.50 | 45.6 (114.0%) | 24.0 | 2.0× |"), layerLines.join("\n"));
+assert.ok(layerLines.includes("| DP4A, fused (T175), the norms apart | 11 | 2.00 | 34.2 (85.5%) | 32.0 | 1.5× |"), layerLines.join("\n"));
+assert.equal(fasterOf(layerLines, "llama.cpp, separate steps"), "");
+assert.equal(fasterOf(layerLines, "DP4A, separate steps"), "");
 // no separate steps measured with subgroups: nothing to hold the fused one against
-assert.equal(fasterOf(layerLines, "fused (T150), subgroups"), "");
-assert.ok(layerLines.includes("| separate steps, subgroups | failed: a \\| b c | | | | |"), layerLines.join("\n"));
+assert.equal(fasterOf(layerLines, "llama.cpp, fused (T150), subgroups"), "");
+assert.ok(layerLines.includes("| llama.cpp, separate steps, subgroups | failed: a \\| b c | | | | |"), layerLines.join("\n"));
+// a device without the packed int8 dot: the DP4A rows say so, and nothing is held against them
+const noPackedStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.base === "DP4A" ? { form: row.form, check: row.check, base: row.base, fused: row.fused, none: "no packed int8 dot here" } : row)) } };
+const noPackedLines = layerTable(noPackedStep, layerRight, layerCeilings);
+assert.ok(noPackedLines.includes("| DP4A, fused (T175) | not here: no packed int8 dot here | | | | |"), noPackedLines.join("\n"));
 for (const [label, lines] of [["right", layerLines], ["lost", layerTable(layerStep, layerRight, layerCeilings, { lost: "lost" })],
-  ["fallback", layerTable(layerStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true })], ["no check", layerTable(layerStep)]]) {
+  ["fallback", layerTable(layerStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true })], ["no check", layerTable(layerStep)], ["no packed", noPackedLines]]) {
   const rowsOf = lines.filter((line) => line.startsWith("|"));
   assert.equal(rowsOf.length, 2 + layerStep.result.rows.length, label);
   for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
   assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), label);
 }
 const lostLayer = layerTable(layerStep, layerRight, layerCeilings, { lost: "lost" });
-assert.equal(fasterOf(lostLayer, "fused (T150)"), "");
-assert.ok(lostLayer.includes("| fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), lostLayer.join("\n"));
+assert.equal(fasterOf(lostLayer, "llama.cpp, fused (T150)"), "");
+assert.ok(lostLayer.includes("| llama.cpp, fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), lostLayer.join("\n"));
 assert.ok(lostLayer.some((line) => line.includes("the device was lost")));
 const fallbackLayer = layerTable(layerStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true });
-assert.equal(fasterOf(fallbackLayer, "fused (T150)"), "");
-assert.ok(fallbackLayer.includes("| fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), fallbackLayer.join("\n"));
-const layerWrong = { ...layerRight, "a layer, fused (T150)": { ok: false } };
-assert.equal(fasterOf(layerTable(layerStep, layerWrong), "fused (T150)"), "");
-assert.ok(layerTable(layerStep, layerWrong).some((line) => line.startsWith("| fused (T150) (WRONG in the check) |")));
+assert.equal(fasterOf(fallbackLayer, "DP4A, fused (T175)"), "");
+assert.ok(fallbackLayer.includes("| llama.cpp, fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), fallbackLayer.join("\n"));
+const layerWrong = { ...layerRight, "a layer, DP4A, fused (T175)": { ok: false } };
+assert.equal(fasterOf(layerTable(layerStep, layerWrong), "DP4A, fused (T175)"), "");
+assert.ok(layerTable(layerStep, layerWrong).some((line) => line.startsWith("| DP4A, fused (T175) (WRONG in the check) |")));
 // the separate steps WRONG: nothing right to hold the fused one against
-assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, separate steps": { ok: false } }), "fused (T150)"), "");
-const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.fused && !row.subgroups && !row.normApart ? { ...row, unsteady: true } : row)) } };
-assert.ok(layerTable(unsteadyStep, layerRight).includes("| fused (T150) | 5 | unsteady: 2.10 | 32.6 | 33.6 |  |"));
+assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, DP4A, separate steps": { ok: false } }), "DP4A, fused (T175)"), "");
+const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.form === "llama.cpp, fused (T150)" ? { ...row, unsteady: true } : row)) } };
+assert.ok(layerTable(unsteadyStep, layerRight).includes("| llama.cpp, fused (T150) | 5 | unsteady: 2.10 | 32.6 | 33.6 |  |"));
 // a fallback adapter's few hundredths of a GB/s still show
 const slowStep = { ...layerStep, result: { ...layerStep.result, rows: [{ ...layerStep.result.rows[0], msPerLayer: 2900, GBps: 0.0236 }] } };
-assert.ok(layerTable(slowStep, layerRight, undefined, { fallback: true }).includes("| separate steps | 14 | 2900.00 | 0.024 | 46400.0 |  |"));
+assert.ok(layerTable(slowStep, layerRight, undefined, { fallback: true }).includes("| llama.cpp, separate steps | 14 | 2900.00 | 0.024 | 46400.0 |  |"));
 assert.equal(layerTable({ name: "a layer of a token", error: "x | y" })[0], "**A layer of a token**: x \\| y");
 // T151: the table of tokens generated on the GPU: what a submission costs besides its tokens and how many times faster
 // several a submission are than one, neither after a lost device, on a fallback adapter or with the sampling WRONG
@@ -261,6 +271,8 @@ const generateStep = { name: "tokens generated on the GPU", result: { model: "Ll
   sampling: { vocab: 128256, msEach: 0.31, over: 5114, flat: { msEach: 1.2, over: 128256, unsteady: true } } } };
 const generateRight = { sampling: { ok: true }, "tokens on the GPU": { ok: true } };
 const generateLines = generateTable(generateStep, generateRight);
+// T175: the layer the tokens ran, by its name in the layer table
+assert.ok(generateTable({ ...generateStep, result: { ...generateStep.result, layer: "DP4A, fused (T175)" } }, generateRight)[0].includes(`the layer table's "DP4A, fused (T175)"`));
 assert.ok(generateLines.includes("| 1, each read back as it comes | 14.20 | 5.10 | 5.10 |  |"), generateLines.join("\n"));
 assert.ok(generateLines.includes("| 16, read back once | 9.40 | 4.80 | 0.30 | 1.5× |"), generateLines.join("\n"));
 assert.ok(generateLines.at(-1).includes("9.10 ms") && generateLines.at(-1).includes("0.310 ms (5114 tokens over the floor)"), generateLines.at(-1));

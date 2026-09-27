@@ -13,7 +13,9 @@
 //                                         most likely token found on the GPU, and only its id read back instead of every
 //                                         logit
 //   { step: "layer" }                     T150: one layer of a token of Llama 3.2 1B's width, as its fourteen separate
-//                                         steps and fused into five dispatches (shaders.js's fusedMatVec), ms a layer
+//                                         steps and fused into five dispatches (shaders.js's fusedMatVec), ms a layer;
+//                                         T175: the same on ORT's DP4A for small M (fusedDp4aMatVec), its vector
+//                                         quantized before each matrix
 //   { step: "generate" }                  T151: tokens generated on the GPU (the sampling too), each read back as it
 //                                         comes against 4, 8 and 16 a submission read back once, ms a token
 //   { step: "overhead" }                  what a token costs besides the weights: 240 empty dispatches, a submission
@@ -704,9 +706,8 @@ async function token(name, kind = "widen", { sample = false } = {}) {
 // steps (RMSNorm, q, k, v, RoPE and the cache, the attention, o, the residual add, RMSNorm, gate, up, SwiGLU, down, the
 // residual add: the prompt's shaders and T149's matrix × vector), fused into five (shaders.js's fusedMatVec: q, k
 // and v with the norm and RoPE, the attention, o with the add, gate and up with the norm and SwiGLU, down with the
-// add), and fused but for the norms, which stay dispatches of their own (seven: what folding the norm into the read
-// saves or costs, T150's review), each with the workgroup's reduction and, where subgroups are, with subgroupAdd. All
-// read the same weights: a layer's four matrices (q, k and v one after the other; o; gate and up; down), the separate
+// add), each with the workgroup's reduction and, where subgroups are, with subgroupAdd; and T175's forms on DP4A
+// below (LAYER_KINDS). All read the same weights: a layer's four matrices (q, k and v one after the other; o; gate and up; down), the separate
 // steps a range of rows of them each. Timed as the matrix × vector is (T149), n layers a submission, each on the next
 // copy of the weights (copies that make MATVEC_BYTES, so that a layer is not read from the GPU's caches), a submission
 // of 2n less one of n, but the forms in turn (interleaved: T150's review, as T147's timeForms), so that a device that
@@ -718,14 +719,71 @@ const layerShape = ({ dim, hidden, heads, kvHeads }) => {
   return { dim, hidden, heads, kvHeads, headSize, kvDim,
     matrices: { qkv: [dim + 2 * kvDim, dim], o: [dim, dim], gateUp: [2 * hidden, dim], down: [dim, hidden] } };
 };
-// fused: the matrices fused (fusedMatVec); normApart: their norms still dispatches of their own
-const LAYER_KINDS = [{ name: "separate steps", fused: false }, { name: "fused (T150), the norms apart", fused: true, normApart: true },
-  { name: "fused (T150)", fused: true }];
+// T175: the same on ONNX Runtime's DP4A for small M (the matrix × vector that read Llama 3.2 1B's w1 at 96.8% of the
+// buffer's reads on the owner's Android, T149, where llama.cpp's read a layer at 18.5%, T150): its vector quantized
+// before each matrix (QUANTIZE, four a layer), as separate steps (eighteen dispatches), fused but for the norms (eleven:
+// the matrices with T150's writes, RMSNORM and QUANTIZE apart) and fused (nine: the norm with the quantizer,
+// NORM_QUANTIZE). Where a device has no packed int8 dot, those rows say so. llama.cpp's rows stay beside them.
+// base: whose matrix × vector; fused: the matrices with T150's writes (fusedMatVec, fusedDp4aMatVec); normApart: the
+// norms dispatches of their own. T150's llama.cpp form with the norms apart is gone (the owner's Android: 0.93× the
+// separate steps, T150): the DP4A one stands for what folding the norm saves.
+const LAYER_KINDS = [{ name: "llama.cpp, separate steps", base: "llama.cpp", fused: false },
+  { name: "llama.cpp, fused (T150)", base: "llama.cpp", fused: true },
+  { name: "DP4A, separate steps", base: "DP4A", dp4a: true, fused: false },
+  { name: "DP4A, fused (T175), the norms apart", base: "DP4A", dp4a: true, fused: true, normApart: true },
+  { name: "DP4A, fused (T175)", base: "DP4A", dp4a: true, fused: true }];
 const layerForms = () => {
   const subgroups = device.features.has("subgroups") && (navigator.gpu.wgslLanguageFeatures?.has("subgroup_id") ?? false);
-  return (subgroups ? [false, true] : [false]).flatMap((withSubgroups) => LAYER_KINDS.map((kind) =>
-    ({ ...kind, name: `${kind.name}${withSubgroups ? ", subgroups" : ""}`, subgroups: withSubgroups })));
+  const llama = LAYER_KINDS.filter((kind) => !kind.dp4a), dp4a = LAYER_KINDS.filter((kind) => kind.dp4a);
+  return [...(subgroups ? [false, true] : [false]).flatMap((withSubgroups) => llama.map((kind) =>
+    ({ ...kind, name: `${kind.name}${withSubgroups ? ", subgroups" : ""}`, subgroups: withSubgroups }))),
+    ...dp4a.map((kind) => ({ ...kind, subgroups: false, ...(packed ? {} : { none: "no packed int8 dot here" }) }))];
 };
+// the layer a token runs on the GPU (generate(), T151): T175's fused DP4A where the packed int8 dot is, else T150's
+const tokenForm = () => ({ ...LAYER_KINDS.find((kind) => kind.fused && !kind.normApart && Boolean(kind.dp4a) === packed), subgroups: false });
+// what a form of the layer dispatches besides the attention, [key, WGSL] each (layer() and generate())
+const layerCodes = ({ dp4a, fused, normApart, subgroups }) => {
+  if (!dp4a) {
+    return fused ? [["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups })], ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })],
+      ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })]]
+      : [["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["product", WGSL.mulMatVec({ packed: false, subgroups })]];
+  }
+  if (!fused) return [["quantize", WGSL.QUANTIZE], ["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["product", WGSL.ortDp4aMatVec]];
+  return [["quantize", WGSL.QUANTIZE], normApart ? ["norm", WGSL.RMSNORM] : ["normQuantize", WGSL.NORM_QUANTIZE],
+    ["qkv", WGSL.fusedDp4aMatVec({ output: "rope" })], ["add", WGSL.fusedDp4aMatVec({ output: "add" })], ["glu", WGSL.fusedDp4aMatVec({ output: "swiglu" })]];
+};
+// T175: a vector of n values quantized (QUANTIZE) into { xq, xs }: a thread a group of 32
+const quantizing = (pipes, group, x, into, uniform, n, step) => [pipes.quantize, group(pipes.quantize, [[0, x], [1, into.xq], [2, into.xs], [3, uniform], [4, step]]), Math.ceil(n / GROUP / 64), 1];
+// The dispatches of one layer of a token in a fused form (layer() and generate()): T150's five (fusedMatVec), or on
+// DP4A (T175) the norm and its quantizing (NORM_QUANTIZE, or with the norms apart RMSNORM and QUANTIZE), q, k and v
+// with RoPE and the cache, the attention, its output quantized, o with the add, the norm and its quantizing, gate and up
+// with SwiGLU, its output quantized, down with the add. m: the layer's matrices ({w, s, rows} each); cache: its keys and
+// values; v: the vectors (h, xb, q, att, g, the norms' weights, the angles, and quantized: the { xq, xs } of each
+// quantization, q, k and v's, o's, gate and up's, down's); u: the uniforms (step, flash, the matrices' Params, the norms'
+// attentionNorm and ffnNorm, and quantize: QUANTIZE's of dim and of hidden); group(pipeline, entries): a bind group
+function fusedLayer(form, pipes, { dim, hidden, heads }, m, cache, v, u, group) {
+  const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, cache.keys], [2, cache.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
+  const rope = [[5, v.q], [6, cache.keys], [7, cache.values], [8, v.angles], [9, u.step]];
+  if (!form.dp4a) {
+    const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
+    return [[pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], ...rope]), groups(m.qkv.rows), 1],
+      attention,
+      [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
+      [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
+      [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
+  }
+  const [qkvIn, oIn, gluIn, downIn] = v.quantized;
+  const normed = (params, into) => (form.normApart
+    ? [[pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1], quantizing(pipes, group, v.xb, into, u.quantize[0], dim, u.step)]
+    : [[pipes.normQuantize, group(pipes.normQuantize, [[0, v.h], [1, v.norms], [2, into.xq], [3, into.xs], [4, params], [5, u.step]]), 1, 1]]);
+  // a matrix by its quantized input: rows its workgroups take (gate's, where up's go beside them)
+  const product = (pipeline, { w, s }, into, params, rows, output) => [pipeline, group(pipeline, [[0, w], [1, s], [2, into.xq], [3, params], [4, into.xs], ...output]),
+    Math.ceil(rows / WGSL.ORT_DP4A_MATVEC_ROWS), 1];
+  return [...normed(u.attentionNorm, qkvIn), product(pipes.qkv, m.qkv, qkvIn, u.qkv, m.qkv.rows, rope),
+    attention, quantizing(pipes, group, v.att, oIn, u.quantize[0], dim, u.step), product(pipes.add, m.o, oIn, u.o, dim, [[5, v.h]]),
+    ...normed(u.ffnNorm, gluIn), product(pipes.glu, m.gateUp, gluIn, u.gateUp, hidden, [[5, v.g]]),
+    quantizing(pipes, group, v.g, downIn, u.quantize[1], hidden, u.step), product(pipes.add, m.down, downIn, u.down, dim, [[5, v.h]])];
+}
 // the check's verdict of a form, by name
 const layerCheck = (form) => `a layer, ${form.name}`;
 // a pipeline of its WGSL, made once (in a validation scope: a shader this device refuses rejects there)
@@ -737,19 +795,15 @@ async function compiled(code) {
   }
   return layerPipelines.get(code);
 }
-async function layerPipes(shape, subgroups) {
+// the pipelines a form of the layer runs (what layerCodes() says, the attention, and SMALL for the separate steps' adds)
+async function layerPipes(shape, form) {
   const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX } = device.limits;
   const flash = WGSL.flashShape({ headSize: shape.headSize, half: false, subgroups: false, memory,
     threads: Math.min(maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX) });
   if (flash.none) throw new Error(flash.none);
   // one at a time: each in an error scope of its own
   const pipes = { small: pipelinesFor().small };
-  for (const [key, code] of [["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["flash", WGSL.flashTile(flash)],
-    ["product", WGSL.mulMatVec({ packed: false, subgroups })], ["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups })],
-    ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })], ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })],
-    ["qkvPlain", WGSL.fusedMatVec({ input: "plain", output: "rope", subgroups })], ["gluPlain", WGSL.fusedMatVec({ input: "plain", output: "swiglu", subgroups })]]) {
-    pipes[key] = await compiled(code);
-  }
+  for (const [key, code] of [["flash", WGSL.flashTile(flash)], ...layerCodes(form)]) pipes[key] = await compiled(code);
   return pipes;
 }
 // A layer's buffers: copies of its four matrices (data: the check's weights, else random), the vectors, the norms'
@@ -787,7 +841,9 @@ function layerParts(shape, pos, copies, owned, data) {
   const cacheBytes = (pos + 1) * kvDim * 2;
   const v = { h: make(dim * 4), xb: make(dim * 4), q: make(dim * 4), k: make(kvDim * 4), v: make(kvDim * 4), att: make(dim * 4),
     t: make(dim * 4), g: make(hidden * 4), u: make(hidden * 4), norms: make(2 * dim * 4), angles: make((pos + 1) * headSize * 4),
-    keys: make(cacheBytes), values: make(cacheBytes) };
+    keys: make(cacheBytes), values: make(cacheBytes),
+    // T175: the DP4A forms' four quantized vectors, each its own (the check reads every one back)
+    quantized: [dim, dim, dim, hidden].map((n) => ({ xq: make(n), xs: make((n / GROUP) * 4) })) };
   const eps = data?.eps ?? EPS;
   // RoPE's table on the GPU, a row a position up to pos (T151: fusedMatVec reads the Step's row; ROPE, the prompt's,
   // takes the rows of its block's positions, here the row at pos bound on its own: a row of headSize 64 is 256 bytes,
@@ -822,7 +878,9 @@ function layerParts(shape, pos, copies, owned, data) {
   };
   const u = { step, attentionNorm: normParams(0), ffnNorm: normParams(dim), rope: uniform(new Uint32Array([heads, kvHeads, headSize, headSize])),
     flash: uniform(new Uint8Array(flashParams)), swiglu: uniform(new Uint32Array([hidden, 0, 0, 0])),
-    qkv: fusedParams(dim + 2 * kvDim, dim), o: fusedParams(dim, dim), gateUp: fusedParams(hidden, dim, hidden, dim), down: fusedParams(dim, hidden) };
+    qkv: fusedParams(dim + 2 * kvDim, dim), o: fusedParams(dim, dim), gateUp: fusedParams(hidden, dim, hidden, dim), down: fusedParams(dim, hidden),
+    // QUANTIZE's (n, xStride) of dim and of hidden
+    quantize: [dim, hidden].map((n) => uniform(new Uint32Array([n, n, 0, 0]))) };
   // the matrix × vector's Shape (rows, words, perRow, first) of each range the separate steps read, made once
   const shapes = new Map();
   const shapeOf = (rows, n) => {
@@ -834,36 +892,24 @@ function layerParts(shape, pos, copies, owned, data) {
     entries: entries.map(([binding, resource]) => ({ binding, resource: "offset" in resource ? resource : { buffer: resource } })) });
   const dispatches = (form, pipes, copy) => {
     const m = copiesOf[copy];
+    if (form.fused) return fusedLayer(form, pipes, shape, m, v, v, u, group);
     const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, v.keys], [2, v.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
-    const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
     const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
-    if (form.normApart) {
-      return [norm(u.attentionNorm),
-        [pipes.qkvPlain, group(pipes.qkvPlain, [[0, m.qkv.w], [1, m.qkv.s], [2, v.xb], [3, u.qkv], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles], [9, u.step]]), groups(m.qkv.rows), 1],
-        attention,
-        [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
-        norm(u.ffnNorm),
-        [pipes.gluPlain, group(pipes.gluPlain, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.xb], [3, u.gateUp], [5, v.g]]), groups(hidden), 1],
-        [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
-    }
-    if (form.fused) {
-      return [
-        [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles], [9, u.step]]), groups(m.qkv.rows), 1],
-        attention,
-        [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
-        [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
-        [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
-    }
-    // rows first to first + rows of a matrix, x into y
-    const product = ({ w, s, n }, first, rows, x, y) => [pipes.product, group(pipes.product, [
+    // the separate steps: rows first to first + rows of a matrix, x into y (on DP4A, x's quantizing into)
+    const [qkvIn, oIn, gluIn, downIn] = v.quantized;
+    const product = ({ w, s, n }, first, rows, x, y, into) => [pipes.product, group(pipes.product, [
       [0, { buffer: w, offset: first * n, size: rows * n }], [1, { buffer: s, offset: first * n / 8, size: rows * n / 8 }],
-      [2, x], [3, y], [4, shapeOf(rows, n)]]), groups(rows), 1];
+      [2, form.dp4a ? into.xq : x], [3, y], [4, shapeOf(rows, n)], ...(form.dp4a ? [[5, into.xs]] : [])]),
+      Math.ceil(rows / (form.dp4a ? WGSL.ORT_DP4A_MATVEC_ROWS : WGSL.MUL_MAT_VEC_ROWS)), 1];
+    const quantize = (x, into, n) => (form.dp4a ? [quantizing(pipes, group, x, into, u.quantize[n === dim ? 0 : 1], n, u.step)] : []);
     const add = [pipes.small, group(pipes.small, [[0, v.t], [1, v.h]]), 1, 1];
-    return [norm(u.attentionNorm), product(m.qkv, 0, dim, v.xb, v.q), product(m.qkv, dim, kvDim, v.xb, v.k), product(m.qkv, dim + kvDim, kvDim, v.xb, v.v),
+    return [norm(u.attentionNorm), ...quantize(v.xb, qkvIn, dim), product(m.qkv, 0, dim, v.xb, v.q, qkvIn),
+      product(m.qkv, dim, kvDim, v.xb, v.k, qkvIn), product(m.qkv, dim + kvDim, kvDim, v.xb, v.v, qkvIn),
       [pipes.rope, group(pipes.rope, [[0, v.q], [1, v.k], [2, v.v], [3, v.keys], [4, v.values], [5, angleRow], [6, u.rope], [7, u.step]]), 1, 1],
-      attention, product(m.o, 0, dim, v.att, v.t), add, norm(u.ffnNorm), product(m.gateUp, 0, hidden, v.xb, v.g),
-      product(m.gateUp, hidden, hidden, v.xb, v.u), [pipes.swiglu, group(pipes.swiglu, [[0, v.g], [1, v.u], [2, u.swiglu], [3, u.step]]), Math.ceil(hidden / 64), 1],
-      product(m.down, 0, dim, v.g, v.t), add];
+      attention, ...quantize(v.att, oIn, dim), product(m.o, 0, dim, v.att, v.t, oIn), add, norm(u.ffnNorm), ...quantize(v.xb, gluIn, dim),
+      product(m.gateUp, 0, hidden, v.xb, v.g, gluIn), product(m.gateUp, hidden, hidden, v.xb, v.u, gluIn),
+      [pipes.swiglu, group(pipes.swiglu, [[0, v.g], [1, v.u], [2, u.swiglu], [3, u.step]]), Math.ceil(hidden / 64), 1],
+      ...quantize(v.g, downIn, hidden), product(m.down, 0, dim, v.g, v.t, downIn), add];
   };
   return { vectors: v, reset, dispatches };
 }
@@ -910,10 +956,42 @@ function fromHalf(h) {
   const exponent = (h >> 10) & 31, mantissa = h & 1023, sign = h & 0x8000 ? -1 : 1;
   return sign * (exponent ? 2 ** (exponent - 15) * (1 + mantissa / 1024) : 2 ** -14 * (mantissa / 1024));
 }
-// The layer in JavaScript (float64 sums), as the CPU's forward pass runs it: what both forms are held to. d: the
-// check's weights ({w, s} of each matrix), h, norms, keys, values (float16 bits), angles and eps. Returns the residual stream
-// after the layer and the float16 bits of the keys and values of the position
-function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d) {
+// T175: where a matrix of a layer takes its input (layerReference's inputs), in the order of the DP4A forms' quantized
+// vectors: the normed stream before q, k and v; the attention's output before o; the normed stream before gate and up;
+// silu(gate) × up before down
+const INPUTS = ["qkv", "o", "ffn", "down"];
+// a quantized vector's values (int8 × the scale of its group of 32), as a matrix on DP4A takes it
+function dequantized(xq, xs) {
+  return Float64Array.from(xq, (value, i) => value * xs[(i / GROUP) | 0]);
+}
+// T175: how a vector the GPU quantized (xq, xs) holds to quantize_x of x, the reference's values where it was made
+// (from the GPU's own inputs before it: they differ as float32 and float64 sums in another order, about 1e-6, and a
+// key or value of the position rounded the other way in float16 moves the attention's output by up to about 1e-4 of
+// itself): each scale within QUANTIZED_SCALE_LINE of the reference's (a scale of another group, a norm left out or
+// read from the wrong weights is off by far more), each value within 1, and no more than 1% of them off by 1 (a value
+// on a rounding's edge goes either way: about 1e-4 of them). Returns { wrong: why or null, scale: the worst relative
+// difference of a scale, apart: the values off by 1, of: how many }
+const QUANTIZED_SCALE_LINE = 1e-3;
+function quantizedOff(x, xq, xs) {
+  const mine = WGSL.quantizedLikeCpu(Float32Array.from(x));
+  let far = false, apart = 0, scale = 0;
+  mine.xs.forEach((want, g) => {
+    const off = want > 0 ? Math.abs(xs[g] - want) / want : xs[g] === 0 ? 0 : Infinity;
+    scale = Math.max(scale, off);
+    far ||= !(off <= QUANTIZED_SCALE_LINE);
+  });
+  mine.xq.forEach((value, i) => {
+    far ||= Math.abs(xq[i] - value) > 1;
+    apart += xq[i] !== value;
+  });
+  const wrong = far ? "far from quantize_x's" : apart > 0.01 * x.length ? `${apart} of ${x.length} values not quantize_x's` : null;
+  return { wrong, scale, apart, of: x.length };
+}
+// The layer in JavaScript (float64 sums), as the CPU's forward pass runs it: what every form is held to. d: the
+// check's weights ({w, s} of each matrix), h, norms, keys, values (float16 bits), angles and eps. inputs(point, x): the
+// vector a matrix takes where x comes in, at the points INPUTS names (T175: the DP4A forms' x quantized; else x itself).
+// Returns the residual stream after the layer and the float16 bits of the keys and values of the position
+function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d, inputs = (point, x) => x) {
   const product = ({ w, s }, n, first, rows, x) => {
     const signed = new Int8Array(w.buffer, w.byteOffset, w.length), out = new Float64Array(rows);
     for (let r = 0; r < rows; r++) {
@@ -937,7 +1015,7 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
     }
     return vector;
   };
-  const h = Float64Array.from(d.h), xb = normed(h, 0);
+  const h = Float64Array.from(d.h), xb = inputs("qkv", normed(h, 0));
   const q = turned(product(d.qkv, dim, 0, dim, xb)), k = turned(product(d.qkv, dim, dim, kvDim, xb));
   const v = product(d.qkv, dim, dim + kvDim, kvDim, xb);
   const keys = Uint16Array.from(k, toHalf), values = Uint16Array.from(v, toHalf);
@@ -953,12 +1031,13 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
     const most = Math.max(...scores), weights = scores.map((score) => Math.exp(score - most)), sum = weights.reduce((a, b) => a + b);
     for (let p = 0; p <= pos; p++) for (let i = 0; i < headSize; i++) att[head * headSize + i] += (weights[p] / sum) * V(p, kv + i);
   }
-  const o = product(d.o, dim, 0, dim, att), h1 = h.map((value, i) => value + o[i]), xb2 = normed(h1, dim);
+  const o = product(d.o, dim, 0, dim, inputs("o", att)), h1 = h.map((value, i) => value + o[i]), xb2 = inputs("ffn", normed(h1, dim));
   const gate = product(d.gateUp, dim, 0, hidden, xb2), up = product(d.gateUp, dim, hidden, hidden, xb2);
-  const down = product(d.down, hidden, 0, dim, gate.map((g, i) => (g / (1 + Math.exp(-g))) * up[i]));
+  const down = product(d.down, hidden, 0, dim, inputs("down", gate.map((g, i) => (g / (1 + Math.exp(-g))) * up[i])));
   return { h: h1.map((value, i) => value + down[i]), keys, values };
 }
-// The check (T150): every form of the layer (Llama's shape: GQA, 33 heads of 64 and 3 of K and V; a width of 2112 = 66
+// The check (T150; T175: the DP4A forms held to the reference fed their own quantized vectors, each held to
+// quantize_x, quantizedOff): every form of the layer (Llama's shape: GQA, 33 heads of 64 and 3 of K and V; a width of 2112 = 66
 // groups and a hidden width of 2080 = 65, each past one pass of mul_mat_vec's 64 groups a workgroup, so that the x²
 // and the rows' sums of the second pass are seen: T150's review, whose three breakings of them the width of 256 let
 // through), at position 70 (71 positions, two tiles of the attention), against layerReference. The weights' scales
@@ -985,24 +1064,43 @@ async function checkLayer() {
   for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
     data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01 * Math.sqrt(256 / n)) };
   }
-  const want = layerReference(shape, pos, data);
-  let added = 0, largestKey = 0, largestValue = 0;
-  want.h.forEach((value, i) => (added = Math.max(added, Math.abs(value - data.h[i]))));
-  want.keys.forEach((bits) => (largestKey = Math.max(largestKey, Math.abs(fromHalf(bits)))));
-  want.values.forEach((bits) => (largestValue = Math.max(largestValue, Math.abs(fromHalf(bits)))));
   for (const form of layerForms()) {
+    if (form.none) continue;
     try {
       const got = await scoped(async (owned) => {
-        const pipes = await layerPipes(shape, form.subgroups);
+        const pipes = await layerPipes(shape, form);
         const parts = layerParts(shape, pos, 1, owned, data);
         const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
         parts.dispatches(form, pipes, 0).forEach((d) => run(pass, d));
         pass.end();
         const h = new Float32Array(await readBack(encoder, parts.vectors.h, shape.dim * 4));
         const cacheBytes = (pos + 1) * shape.kvDim * 2;
-        return { h, keys: new Uint16Array(await readBack(device.createCommandEncoder(), parts.vectors.keys, cacheBytes)),
-          values: new Uint16Array(await readBack(device.createCommandEncoder(), parts.vectors.values, cacheBytes)) };
+        const back = async (source, bytes) => readBack(device.createCommandEncoder(), source, bytes);
+        // T175: the four vectors the DP4A form quantized, each as the matrix after it took it
+        const quantized = [];
+        if (form.dp4a) {
+          for (const [i, n] of [shape.dim, shape.dim, shape.dim, shape.hidden].entries()) {
+            quantized.push({ xq: new Int8Array(await back(parts.vectors.quantized[i].xq, n)),
+              xs: new Float32Array(await back(parts.vectors.quantized[i].xs, (n / GROUP) * 4)) });
+          }
+        }
+        return { h, keys: new Uint16Array(await back(parts.vectors.keys, cacheBytes)), values: new Uint16Array(await back(parts.vectors.values, cacheBytes)), quantized };
       });
+      // T175: on DP4A the reference takes the GPU's own quantized vectors (a value on a rounding's edge may go either
+      // way, and moves a layer's output by more than LAYER_LINE), and each of them is held to quantize_x of the
+      // reference's values where it was made (quantizedOff)
+      const made = [];
+      const want = layerReference(shape, pos, data, form.dp4a ? (point, x) => {
+        const i = INPUTS.indexOf(point);
+        made[i] = x;
+        return dequantized(got.quantized[i].xq, got.quantized[i].xs);
+      } : undefined);
+      const quantizing = form.dp4a ? INPUTS.map((point, i) => [point, quantizedOff(made[i], got.quantized[i].xq, got.quantized[i].xs)]) : [];
+      const wrongly = quantizing.filter(([, q]) => q.wrong);
+      let added = 0, largestKey = 0, largestValue = 0;
+      want.h.forEach((value, i) => (added = Math.max(added, Math.abs(value - data.h[i]))));
+      want.keys.forEach((bits) => (largestKey = Math.max(largestKey, Math.abs(fromHalf(bits)))));
+      want.values.forEach((bits) => (largestValue = Math.max(largestValue, Math.abs(fromHalf(bits)))));
       let off = 0, keyOff = 0, valueOff = 0, touched = false;
       got.h.forEach((value, i) => (off = Math.max(off, Math.abs(value - want.h[i]) / added)));
       for (let p = 0; p <= pos; p++) {
@@ -1015,8 +1113,10 @@ async function checkLayer() {
         }
       }
       const cache = Math.max(keyOff, valueOff);
-      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched,
-        stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}) };
+      // on DP4A, how each quantized vector held (for CI's logs): the worst scale apart and the values off by 1
+      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length,
+        stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}),
+        ...(quantizing.length ? { quantized: quantizing.map(([point, q]) => `${point}: ${q.wrong ?? `scales ${q.scale.toExponential(1)}, ${q.apart} of ${q.of} values off by 1`}`).join("; ") } : {}) };
     } catch (error) {
       verdicts[layerCheck(form)] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
     } finally {
@@ -1037,9 +1137,13 @@ async function layer() {
     // the forms that can run here, each with what submits n layers of it (each on the next copy) and waits
     const timed = [];
     for (const form of layerForms()) {
-      const row = { form: form.name, check: layerCheck(form), fused: form.fused, subgroups: form.subgroups, ...(form.normApart ? { normApart: true } : {}) };
+      const row = { form: form.name, check: layerCheck(form), base: form.base, fused: form.fused, subgroups: form.subgroups, ...(form.normApart ? { normApart: true } : {}) };
+      if (form.none) {
+        timed.push({ row: { ...row, none: form.none } });
+        continue;
+      }
       try {
-        const pipes = await layerPipes(shape, form.subgroups);
+        const pipes = await layerPipes(shape, form);
         const each = await validated(async () => [...Array(copies)].map((_, copy) => parts.dispatches(form, pipes, copy)));
         let next = 0;
         const submission = async (n) => {
@@ -1078,8 +1182,10 @@ async function layer() {
 // ---- T151: generated tokens on the GPU (shaders.js's EMBED, fusedMatVec and SAMPLE): a token a compute pass, the
 // sampler's state carried from one to the next on the GPU, and the ids read back once for the run: against reading
 // each one back, whose wait (3 to 8.6 ms for 4 bytes on the owner's Android, T134) a token pays alone.
-// The layers are T150's fused form with the workgroup's reduction (the form every device runs: which is faster is
-// the layer table's, and both forms here run the same work, so their difference is the reading back alone)
+// The layers are tokenForm()'s (T175): the fused layer on DP4A where the packed int8 dot is, else T150's with the
+// workgroup's reduction (which layer is faster is the layer table's; every row here runs the same layers, so their
+// difference is the reading back alone). On DP4A the classifier takes its normed input quantized too
+// (NORM_QUANTIZE, then fusedDp4aMatVec's "write")
 const GENERATE_MODEL = { ...PROMPT_MODEL, vocab: 32000 };  // the CPU section's model and its vocabulary
 // the settings a token is timed with: the list's sampled models' (src/models.js: temperature 0.7, top-p 0.9, and
 // tiny-lm's penalty 1.3)
@@ -1088,14 +1194,13 @@ const GENERATE_SETTINGS = { temperature: 0.7, topp: 0.9, penalty: 1.3 };
 const GENERATE_COUNTS = [1, 4, 8, 16], GENERATE_TOKENS = 16, GENERATE_ROUNDS = 5, GENERATE_MOST = 64, GENERATE_POS = 127;
 // a fallback adapter runs the check's small model, 2 tokens a form once: its times are no GPU's
 const GENERATE_CHECK = { dim: 256, hidden: 512, heads: 4, kvHeads: 2, layers: 2, vocab: 1003 };
-async function generationPipes(headSize) {
+async function generationPipes(headSize, form) {
   const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX } = device.limits;
   const flash = WGSL.flashShape({ headSize, half: false, subgroups: false, memory, threads: Math.min(maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX) });
   if (flash.none) throw new Error(flash.none);
   const pipes = {};
-  for (const [key, code] of [["embed", WGSL.EMBED], ["sample", WGSL.SAMPLE], ["flash", WGSL.flashTile(flash)],
-    ["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups: false })], ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups: false })],
-    ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups: false })], ["classifier", WGSL.fusedMatVec({ input: "norm", output: "write", subgroups: false })]]) {
+  const classifier = form.dp4a ? WGSL.fusedDp4aMatVec({ output: "write" }) : WGSL.fusedMatVec({ input: "norm", output: "write", subgroups: false });
+  for (const [key, code] of [["embed", WGSL.EMBED], ["sample", WGSL.SAMPLE], ["flash", WGSL.flashTile(flash)], ...layerCodes(form), ["classifier", classifier]]) {
     pipes[key] = await compiled(code);
     postMessage({ alive: true });
   }
@@ -1103,9 +1208,12 @@ async function generationPipes(headSize) {
 }
 // A model on the GPU for a run of tokens: its layers (T150's four matrices each, the cache of its own), the norms
 // (two a layer, then the final one), the classifier (the embedding too: tied, as Llama 3.2 1B's), RoPE's table of
-// `positions`, and the sampler's buffers. data: the check's ({layers: [{qkv, o, gateUp, down: {w, s}}], classifier,
-// norms, keys, values}), else random. encode(encoder): one token's pass and the Step copied from the state after it
-function generationParts(model, pipes, positions, owned, data) {
+// `positions`, and the sampler's buffers. form: the layer's (tokenForm()). data: the check's ({layers: [{qkv, o,
+// gateUp, down: {w, s}}], classifier, norms, keys, values}), else random. encode(encoder): one token's pass and the
+// Step copied from the state after it. T175: on DP4A with the check's data, every quantized vector of a pass is its
+// own (four a layer, then the classifier's), and encode copies them into `recorded` after the pass, token by token
+// from reset() on (recording: their sizes; recorded(bytes) cuts what was read back into [token][vector] {xq, xs})
+function generationParts(model, form, pipes, positions, owned, data) {
   const shape = layerShape(model), { dim, hidden, heads, kvDim, headSize } = shape, { vocab, layers } = model;
   const make = (bytes, usage = STORAGE | COPY_DST | COPY_SRC) => {
     const b = buffer(bytes, usage);
@@ -1140,6 +1248,12 @@ function generationParts(model, pipes, positions, owned, data) {
     return { ...m, keys, values };
   });
   const classifier = weights([vocab, dim], data?.classifier);
+  // T175: one quantized vector serves all of a token's quantizations (each is read before the next is made), but for
+  // the check, which reads each one back
+  const pair = (n) => ({ n, xq: make(n), xs: make((n / GROUP) * 4) });
+  const kept = form.dp4a && data;
+  const sizes = [...[...Array(layers)].flatMap(() => [dim, dim, dim, hidden]), dim];
+  const quantizedAll = kept ? sizes.map(pair) : Array(sizes.length).fill(pair(Math.max(dim, hidden)));
   const v = { h: make(dim * 4), q: make(dim * 4), att: make(dim * 4), g: make(hidden * 4), logits: make(vocab * 4),
     probs: make(vocab * 4), order: make(vocab * 4), norms: make((2 * layers + 1) * dim * 4), angles: make(positions * headSize * 4),
     state: make(WGSL.STATE_BYTES), chosen: make(Math.max(positions, 4) * 4), randoms: make(positions * 4),
@@ -1157,38 +1271,73 @@ function generationParts(model, pipes, positions, owned, data) {
   const flashParams = new ArrayBuffer(16);
   new Uint32Array(flashParams, 0, 2).set([heads, shape.kvHeads]);
   new Float32Array(flashParams, 8, 1)[0] = 1 / Math.sqrt(headSize);
-  const u = { flash: uniform(new Uint8Array(flashParams)), embed: uniform(new Uint32Array([dim, 0, 0, 0])),
-    classifier: params(vocab, dim, 0, 2 * layers * dim), o: params(dim, dim), down: params(dim, hidden),
-    layers: stack.map((_, l) => ({ qkv: params(dim + 2 * kvDim, dim, 0, 2 * l * dim), gateUp: params(hidden, dim, hidden, (2 * l + 1) * dim) })) };
+  const step = v.step;
+  // RMSNORM's and NORM_QUANTIZE's Norm (size, at, eps): a layer's two norms and the final one, from `at` in the norms
+  const normParams = (at) => {
+    const bytes = new ArrayBuffer(16);
+    new Uint32Array(bytes, 0, 2).set([dim, at]);
+    new Float32Array(bytes, 8, 1)[0] = eps;
+    return uniform(new Uint8Array(bytes));
+  };
+  const common = { step, flash: uniform(new Uint8Array(flashParams)), o: params(dim, dim), down: params(dim, hidden),
+    quantize: [dim, hidden].map((n) => uniform(new Uint32Array([n, n, 0, 0]))) };
+  const u = { embed: uniform(new Uint32Array([dim, 0, 0, 0])), classifier: params(vocab, dim, 0, 2 * layers * dim), final: normParams(2 * layers * dim),
+    layers: stack.map((_, l) => ({ ...common, qkv: params(dim + 2 * kvDim, dim, 0, 2 * l * dim), gateUp: params(hidden, dim, hidden, (2 * l + 1) * dim),
+      attentionNorm: normParams(2 * l * dim), ffnNorm: normParams((2 * l + 1) * dim) })) };
   const group = (pipeline, entries) => device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
     entries: entries.map(([binding, resource]) => ({ binding, resource: { buffer: resource } })) });
-  const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
   const dispatches = [[pipes.embed, group(pipes.embed, [[0, classifier.w], [1, classifier.s], [2, v.state], [3, v.h], [4, u.embed]]), 1, 1]];
-  stack.forEach((m, l) => dispatches.push(
-    [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.layers[l].qkv], [4, v.norms], [5, v.q], [6, m.keys], [7, m.values], [8, v.angles], [9, v.step]]), groups(m.qkv.rows), 1],
-    [pipes.flash, group(pipes.flash, [[0, v.q], [1, m.keys], [2, m.values], [3, v.att], [4, u.flash], [5, v.step]]), heads, 1],
-    [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
-    [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.layers[l].gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
-    [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]));
-  const across = Math.min(groups(vocab), device.limits.maxComputeWorkgroupsPerDimension);
-  dispatches.push([pipes.classifier, group(pipes.classifier, [[0, classifier.w], [1, classifier.s], [2, v.h], [3, u.classifier], [4, v.norms], [5, v.logits]]), across, Math.ceil(groups(vocab) / across)],
+  stack.forEach((m, l) => dispatches.push(...fusedLayer(form, pipes, shape, m, m, { ...v, quantized: quantizedAll.slice(4 * l, 4 * l + 4) }, u.layers[l], group)));
+  const quantized = quantizedAll[4 * layers];
+  const rows = Math.ceil(vocab / (form.dp4a ? WGSL.ORT_DP4A_MATVEC_ROWS : WGSL.MUL_MAT_VEC_ROWS));
+  const across = Math.min(rows, device.limits.maxComputeWorkgroupsPerDimension);
+  if (form.dp4a) {
+    dispatches.push([pipes.normQuantize, group(pipes.normQuantize, [[0, v.h], [1, v.norms], [2, quantized.xq], [3, quantized.xs], [4, u.final], [5, step]]), 1, 1],
+      [pipes.classifier, group(pipes.classifier, [[0, classifier.w], [1, classifier.s], [2, quantized.xq], [3, u.classifier], [4, quantized.xs], [5, v.logits]]), across, Math.ceil(rows / across)]);
+  } else {
+    dispatches.push([pipes.classifier, group(pipes.classifier, [[0, classifier.w], [1, classifier.s], [2, v.h], [3, u.classifier], [4, v.norms], [5, v.logits]]), across, Math.ceil(rows / across)]);
+  }
+  dispatches.push(
     [pipes.sample, group(pipes.sample, [[0, v.logits], [1, v.probs], [2, v.order], [3, v.state], [4, v.chosen], [5, v.randoms], [6, v.settings]]), 1, 1]);
+  // the check's record of the quantized vectors: a token's are perToken bytes, each xq then its xs
+  const perToken = kept ? quantizedAll.reduce((sum, { n }) => sum + n + (n / GROUP) * 4, 0) : 0;
+  const record = kept ? make(positions * perToken) : undefined;
+  let passes = 0;
   const encode = (encoder) => {
     const pass = encoder.beginComputePass();
     dispatches.forEach((d) => run(pass, d));
     pass.end();
     // the Step of the next token: the state's first four words (a uniform is not a shader's to write)
     encoder.copyBufferToBuffer(v.state, 0, v.step, 0, 16);
+    if (record) {
+      let at = passes * perToken;
+      for (const { n, xq, xs } of quantizedAll) {
+        encoder.copyBufferToBuffer(xq, 0, record, at, n);
+        encoder.copyBufferToBuffer(xs, 0, record, at + n, (n / GROUP) * 4);
+        at += n + (n / GROUP) * 4;
+      }
+    }
+    passes++;
   };
+  // the recorded vectors read back (bytes: count tokens' of them), [token][vector] { xq, xs }
+  const recorded = (bytes, count) => [...Array(count)].map((_, k) => {
+    let at = k * perToken;
+    return quantizedAll.map(({ n }) => {
+      const one = { xq: new Int8Array(bytes, at, n), xs: new Float32Array(bytes, at + n, n / GROUP) };
+      at += n + (n / GROUP) * 4;
+      return one;
+    });
+  });
   // a run from the start: the state (samplingState), the random numbers and the settings (samplingSettings)
   const reset = (state, randoms, settings) => {
+    passes = 0;
     device.queue.writeBuffer(v.state, 0, state);
     device.queue.writeBuffer(v.step, 0, state.subarray(0, 4));
     if (randoms) device.queue.writeBuffer(v.randoms, 0, randoms);
     if (settings) device.queue.writeBuffer(v.settings, 0, settings);
   };
   const bytes = layers * Object.values(shape.matrices).reduce((sum, matrix) => sum + matrixBytes(matrix), 0) + matrixBytes([vocab, dim]);
-  return { vectors: v, encode, reset, dispatches: dispatches.length, bytes };
+  return { vectors: v, encode, reset, dispatches: dispatches.length, bytes, ...(record ? { record, recording: positions * perToken, recorded } : {}) };
 }
 // what submitting the tokens of a run and reading back their ids and the state costs: count tokens, per of them a
 // submission (each read back before the next is submitted, as a token's text is shown), from the state given. Returns
@@ -1226,8 +1375,8 @@ async function generate() {
   const start = WGSL.samplingState({ token: history[history.length - 1], pos: GENERATE_POS, history });
   const randoms = randomsOf(positions);
   return scoped(async (owned) => {
-    const pipes = await generationPipes(headSize);
-    const parts = generationParts(model, pipes, positions, owned);
+    const form = tokenForm(), pipes = await generationPipes(headSize, form);
+    const parts = generationParts(model, form, pipes, positions, owned);
     parts.reset(start, randoms, WGSL.samplingSettings({ vocab: model.vocab, ...GENERATE_SETTINGS }));
     await device.queue.onSubmittedWorkDone();
     const targets = new Map(counts.map((per) => [per, buffer(per * 4 + WGSL.STATE_BYTES, MAP_READ | COPY_DST)]));
@@ -1263,7 +1412,7 @@ async function generate() {
     });
     // the sampling alone, on Llama 3's vocabulary: logits as a model's, and flat ones (every token over the floor)
     const sampling = fallback ? undefined : await samplingAlone();
-    return { model: fallback ? "the check's small model" : "Llama 3.2 1B's width", layers: model.layers, vocab: model.vocab,
+    return { model: fallback ? "the check's small model" : "Llama 3.2 1B's width", layer: form.name, layers: model.layers, vocab: model.vocab,
       GB: parts.bytes / 1e9, dispatches: parts.dispatches, tokens, settings: GENERATE_SETTINGS, work, rows, sampling };
   });
 }
@@ -1509,9 +1658,13 @@ const NOT_A_TOKEN = 200000;
 // the first index of the largest logit or one within 1e-4 of the logits' largest magnitude of it (the GPU's float32
 // forward pass is off by about 1e-6 of it), or a token acceptable() takes. Then the sampled run again with its fourth
 // token as a stop token: the same three tokens, the stop written, and the run stopped there.
+// T175: the layers are tokenForm()'s. On DP4A the reference takes the vectors the GPU quantized (each pass records
+// them: generationParts), as checkLayer does, and each is held to quantize_x of the reference's values where it was
+// made (quantizedOff): quantizing its own values instead, a value on a rounding's edge in float32 goes either way and
+// moved this model's logits by up to 6.5% of the largest (a JavaScript emulation, 360 tokens, .tmp/t175/band.mjs)
 const GENERATION_CHECK_POS = 5, GENERATION_CHECK_TOKENS = 6;
 async function checkGeneration() {
-  const model = GENERATE_CHECK, shape = layerShape(model), { dim, hidden, kvDim, headSize } = shape;
+  const model = GENERATE_CHECK, shape = layerShape(model), { dim, hidden, kvDim, headSize } = shape, form = tokenForm();
   const pos = GENERATION_CHECK_POS, count = GENERATION_CHECK_TOKENS, positions = pos + count + 1;
   const matrix = ([rows, n], scale) => ({ w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, scale) });
   const cache = () => new Uint16Array(positions * kvDim).map((_, i) => (i < pos * kvDim ? toHalf((Math.random() - 0.5) * 4) : 0));
@@ -1524,15 +1677,23 @@ async function checkGeneration() {
     for (let i = 0; i < dim; i++) h[i] = signed[token * dim + i] * data.classifier.s[(token * dim + i) / GROUP | 0];
     return h;
   };
-  // the logits of the GPU's tokens, position by position, in float64 (the caches go on as the GPU's)
-  const referenceLogits = (tokens) => {
+  // the logits of the GPU's tokens, position by position, in float64 (the caches go on as the GPU's). vectors: on DP4A
+  // the GPU's quantized vectors of each pass ([token][layer × 4 + point, then the classifier's] {xq, xs}); quantizing
+  // collects where one of them is not quantize_x's of the reference's values
+  const referenceLogits = (tokens, vectors, quantizing) => {
     const keys = data.keys.map((k) => Uint16Array.from(k)), values = data.values.map((v) => Uint16Array.from(v)), out = [];
     for (let k = 0; k < tokens.length; k++) {
       const p = pos + k;
       let h = embedded(tokens[k]);
+      // the GPU's quantized vector in place of x (T175), held to quantize_x of x
+      const taken = (at, x, what) => {
+        const { xq, xs } = vectors[k][at], { wrong } = quantizedOff(x, xq, xs);
+        if (wrong) quantizing.push(`token ${k}, ${what}: ${wrong}`);
+        return dequantized(xq, xs);
+      };
       data.layers.forEach((m, l) => {
         const r = layerReference(shape, p, { ...m, h, norms: data.norms.subarray(2 * l * dim, (2 * l + 2) * dim), keys: keys[l], values: values[l],
-          angles: layerAngles(headSize, p), eps: data.eps });
+          angles: layerAngles(headSize, p), eps: data.eps }, vectors ? (point, x) => taken(4 * l + INPUTS.indexOf(point), x, `layer ${l} ${point}`) : undefined);
         keys[l].set(r.keys, p * kvDim);
         values[l].set(r.values, p * kvDim);
         h = r.h;
@@ -1540,7 +1701,7 @@ async function checkGeneration() {
       let squares = 0;
       for (const value of h) squares += value * value;
       const scale = 1 / Math.sqrt(squares / dim + data.eps), final = 2 * model.layers * dim;
-      const x = h.map((value, i) => data.norms[final + i] * (scale * value));
+      const normed = h.map((value, i) => data.norms[final + i] * (scale * value)), x = vectors ? taken(4 * model.layers, normed, "the classifier") : normed;
       const signed = new Int8Array(data.classifier.w.buffer), logits = new Float32Array(model.vocab);
       for (let r = 0; r < model.vocab; r++) {
         let sum = 0;
@@ -1556,8 +1717,8 @@ async function checkGeneration() {
   const problems = [];
   try {
     await scoped(async (owned) => {
-      const pipes = await generationPipes(headSize);
-      const parts = generationParts(model, pipes, positions, owned, data);
+      const pipes = await generationPipes(headSize, form);
+      const parts = generationParts(model, form, pipes, positions, owned, data);
       for (const settings of [{ temperature: 0, topp: 0.9, penalty: 1 }, { ...GENERATE_SETTINGS }]) {
         const runOnce = async (stops = []) => {
           // (the caches need no reset: a run writes each position's row before its attention reads it)
@@ -1566,7 +1727,10 @@ async function checkGeneration() {
         };
         const got = await runOnce();
         const sampled = Math.min(got.state[5], count), fed = [history[pos], ...got.ids.subarray(0, sampled - 1)];
-        const logits = referenceLogits(fed), seen = [...history];
+        const vectors = parts.record ? parts.recorded(await readBack(device.createCommandEncoder(), parts.record, parts.recording), sampled) : undefined;
+        const quantizing = [];
+        const logits = referenceLogits(fed, vectors, quantizing), seen = [...history];
+        problems.push(...quantizing.slice(0, 3).map((why) => `T ${settings.temperature}, ${why}`));
         for (let k = 0; k < sampled; k++) {
           const cpu = logits[k];
           WGSL.penalizeLikeCpu(cpu, seen, settings.penalty);
@@ -1597,7 +1761,7 @@ async function checkGeneration() {
         postMessage({ alive: true });
       }
     });
-    verdicts["tokens on the GPU"] = { worstRelative: 0, ok: problems.length === 0, tokens, edge, ...(problems.length ? { problems } : {}) };
+    verdicts["tokens on the GPU"] = { worstRelative: 0, ok: problems.length === 0, tokens, edge, layer: form.name, ...(problems.length ? { problems } : {}) };
   } catch (error) {
     verdicts["tokens on the GPU"] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
   }

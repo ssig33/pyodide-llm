@@ -324,14 +324,17 @@ export function tokenTable(steps, baseline, gpu = {}) {
 }
 
 /**
- * T150: the GPU section's table of one layer of a token: its fourteen steps each a dispatch of their own, the same
- * fused into five (public/shaders.js's fusedMatVec), and fused but for the norms (seven). step: {name, result: {model,
- * pos, layers, GB, rows: [{form, check, fused, normApart, subgroups, dispatches, msPerLayer, GBps, unsteady}, or {form,
- * check, error}]}} or {name, error}; check: the shaders against JavaScript (a form's verdict under row.check);
- * ceilings: T168's (the buffer's reads, for the share of it the layer's weights are read at); gpu: { fallback, lost }.
- * "Faster than the separate steps" beside a fused row, against the separate steps of the same reduction (measured in
- * turn with it): not where noRatios() says none, nor for a row the check found WRONG or that was unsteady. The share
- * of the reads: not after a lost device, on a fallback adapter, or where that read was unsteady (as matVecTable).
+ * T150: the GPU section's table of one layer of a token: its fourteen steps each a dispatch of their own and the same
+ * fused into five (public/shaders.js's fusedMatVec), on llama.cpp's matrix × vector; T175: the same on ONNX Runtime's
+ * DP4A for small M, its vector quantized before each matrix: separate steps (eighteen), fused but for the norms
+ * (eleven) and fused (nine: fusedDp4aMatVec, the norm with the quantizer). step: {name, result: {model, pos, layers,
+ * GB, rows: [{form, check, base, fused, normApart, subgroups, dispatches, msPerLayer, GBps, unsteady}, or {form, check,
+ * error}, or {form, none}]}} or {name, error}; check: the shaders against JavaScript (a form's verdict under
+ * row.check); ceilings: T168's (the buffer's reads, for the share of it the layer's weights are read at); gpu: {
+ * fallback, lost }. "Faster than the separate steps" beside a fused row, against the separate steps of the same matrix
+ * × vector (base) and reduction (measured in turn with it): not where noRatios() says none, nor for a row the check
+ * found WRONG or that was unsteady. The share of the reads: not after a lost device, on a fallback adapter, or where
+ * that read was unsteady (as matVecTable). none: a form this device cannot run (no packed int8 dot), and why.
  */
 export function layerTable(step, check, ceilings, gpu = {}) {
   if (!step) return [];
@@ -342,19 +345,22 @@ export function layerTable(step, check, ceilings, gpu = {}) {
   const usable = (row) => Number.isFinite(row?.msPerLayer) && row.msPerLayer > 0 && !row.unsteady && !wrong(row);
   const faster = (row) => {
     if (none || !row.fused || !usable(row)) return "";
-    const separate = r.rows.find((one) => !one.fused && one.subgroups === row.subgroups);
+    const separate = r.rows.find((one) => !one.fused && one.subgroups === row.subgroups && one.base === row.base);
     return usable(separate) ? times(separate.msPerLayer / row.msPerLayer) : "";
   };
   // two significant digits under 1 GB/s (a fallback adapter reads a layer at a few hundredths)
   const GBps = (row) => (Number.isFinite(row.GBps) ? `${row.GBps < 1 ? row.GBps.toPrecision(2) : number(row.GBps)}${reads ? ` (${number((100 * row.GBps) / reads)}%)` : ""}` : "");
-  return [`**A layer of a token** (${r.model}'s width, at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights): its fourteen steps each a dispatch of its own ` +
-    "(the norm, q, k, v, RoPE and the cache, the attention, o, the residual's add, the norm, gate, up, SwiGLU, down, the add), the same fused into five " +
-    "(q, k and v with the norm, RoPE and the cache; the attention; o with the add; gate and up with the norm and SwiGLU; down with the add), " +
-    "and fused but for the two norms (seven). The forms are timed in turn, each as a submission of 2n layers less one of n, the weights read from copies of them in turn, as the matrix × vector is. " +
+  return [`**A layer of a token** (${r.model}'s width, at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights): on llama.cpp's matrix × vector, its fourteen steps each a dispatch of its own ` +
+    "(the norm, q, k, v, RoPE and the cache, the attention, o, the residual's add, the norm, gate, up, SwiGLU, down, the add) and the same fused into five " +
+    "(q, k and v with the norm, RoPE and the cache; the attention; o with the add; gate and up with the norm and SwiGLU; down with the add); " +
+    "on ONNX Runtime's DP4A, the vector quantized to 8 bits before each matrix, as separate steps (eighteen), fused but for the two norms (eleven), " +
+    "and fused (nine: the norm with its quantizing, q, k and v with RoPE and the cache, the attention, its quantizing, o with the add, the norm with its quantizing, " +
+    "gate and up with SwiGLU, its quantizing, down with the add). The forms are timed in turn, each as a submission of 2n layers less one of n, the weights read from copies of them in turn, as the matrix × vector is. " +
     `GB/s: the layer's weights over its time${reads ? `; in parentheses, the share of what a loop that only reads a buffer reads, ${number(reads)} GB/s below` : ""}.`,
     ...(none ? [`Faster than the separate steps: ${none}.`] : []), ...(gpu.lost ? ["No share of the buffer's reads: the device was lost."] : []), "",
     `| a layer | dispatches | GPU ms | GB/s | its ${r.layers} layers, ms | faster than the separate steps |`, "|---|---:|---:|---:|---:|---:|",
-    ...r.rows.map((row) => (row.error ? `| ${tableCell(row.form)} | ${tableCell(`failed: ${row.error}`)} | | | | |`
+    ...r.rows.map((row) => (row.none ? `| ${tableCell(row.form)} | ${tableCell(`not here: ${row.none}`)} | | | | |`
+      : row.error ? `| ${tableCell(row.form)} | ${tableCell(`failed: ${row.error}`)} | | | | |`
       : `| ${tableCell(row.form)}${wrong(row) ? " (WRONG in the check)" : ""} | ${row.dispatches} | ${row.unsteady ? "unsteady: " : ""}${number(row.msPerLayer, 2)} | ` +
         `${GBps(row)} | ${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
 }
@@ -384,7 +390,7 @@ export function generateTable(step, check, gpu = {}) {
   const fixed = (row, ms) => (derived && Number.isFinite(ms) ? (ms < 0 ? "under the noise" : number(ms, 2)) : "");
   const s = r.settings ?? {};
   return [`**Tokens generated on the GPU** (${tableCell(r.model)}: ${r.layers} layers, a vocabulary of ${r.vocab}, ${number(r.GB, 2)} GB of weights a token; ` +
-    `a token is ${r.dispatches} dispatches: its row of the embedding, the layers fused as T150's, the classifier, and the sampling on the GPU, ` +
+    `a token is ${r.dispatches} dispatches: its row of the embedding, the layers as ${r.layer ? `the layer table's "${tableCell(r.layer)}"` : "T150's fused"}, the classifier, and the sampling on the GPU, ` +
     `penalty ${s.penalty}, temperature ${s.temperature}, top-p ${s.topp}). The same ${r.tokens} tokens each way, the ways in turn; ` +
     "a token's work alone is a submission of 2n tokens less one of n. A submission besides its tokens: what it costs past their work (submitting, waiting, reading the ids back)." +
     `${wrong ? " The check found the sampling on the GPU WRONG." : ""}`,
