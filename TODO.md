@@ -455,6 +455,11 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 持ち主に見てもらうこと: preview.yml の画面（棒の色と太さ、帯の位置、全体の行の位置と言い方）。GPU の節の段の名前は長いものがあり、スマホでは 2 行に折れる。
 
 - **本線に入れた（2026-09-27、持ち主が `preview.yml` の画面を見て「なんかよさそう。入れてみて違ったらまた言うよ」）**。画面で気づいた別件: スマホ幅で機能の表の「storage the browser grants」の値が右で切れる（T177 の前から）。
+### T182 [計測] CI のベンチを軽く: 代わりのアダプタでは突き合わせだけ、モデルは tiny-lm — 状態: **入れた（2026-09-27、持ち主「CI で重いモデル走らせるの、必要あんの？軽いモデルでも WebGPU を使えてることが確認できれば別にいいのでは？」「なるはやで入れて再走」）**（規模 小）
+- 根拠: CI で見たいのは正しさと GPU の道を通るかで、SwiftShader の速さは意味が無い。bench.yml の Chromium 系は GPU の節で 1 ブラウザ約 4 分（Linux・macOS のジョブ約 19 分）。T176 で CI のモデルも llm-jp-3 150M にしたら macOS の保存の節が「No space」（T180）。
+- 入れたもの: `/benchmark/` の GPU の節は、代わりのアダプタ（`isFallbackAdapter`）では「the adapter」と「the shaders against JavaScript」だけで、時間を測る段（帯域・トークン・層・生成・固定費・上限・プロンプト）は飛ばす。bench.yml と `bench-check.mjs` の既定のモデルを tiny-lm に戻す（ページの既定は T176 のまま llm-jp-3 150M）。models.yml の GPU の確認は小さいモデルで（頼みの形。ファイルは変えていない）。
+- 確かめ: build と `node tests/bench.mjs`。本番の bench.yml で GPU の節が突き合わせで ok になり、ジョブが短くなること。
+
 ### T181 [バグ] Windows の CI で bench-check のブラウザが 1 つも起動せず、それでも成功になる — 状態: **直した（2026-09-27）**（規模 小）
 - 根拠: T180 のプロファイルの場所を `new URL(import.meta.url).pathname` から作ったので、Windows では「/D:/a/…」が `D:\D:\a\…` になり、5 つのブラウザが全部「could not start: … ENOENT」（bench.yml 36301878917）。起動しないブラウザは飛ばす作り（ランナーに Chrome や Edge が無いこともある）なので、何も測らずにジョブは success だった。
 - 直し: パスは `fileURLToPath` で作る。ブラウザが 1 つも起動しなければ exit 1。

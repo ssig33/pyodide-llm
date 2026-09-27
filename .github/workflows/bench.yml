@@ -13,7 +13,7 @@ on:
         required: false
       model:
         description: The site's model the model section loads
-        default: 'llm-jp-3-150m'
+        default: 'tiny-lm'
       size:
         description: MiB the storage section writes
         default: '256'
@@ -52,4 +52,4 @@ jobs:
           SITE: ${{ inputs.url || 'https://takano32.github.io/pyodide-llm/' }}
         run: |
           echo "## ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
-          node tests/bench-check.mjs "$SITE" ${{ matrix.browsers }} --model "${{ inputs.model || 'llm-jp-3-150m' }}" --size "${{ inputs.size || '256' }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          node tests/bench-check.mjs "$SITE" ${{ matrix.browsers }} --model "${{ inputs.model || 'tiny-lm' }}" --size "${{ inputs.size || '256' }}" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -429,7 +429,12 @@ const BENCH_MODEL = "llm-jp-3-150m";
       // the adapter, the check, the shapes, the tokens, the ways, a layer, besides the weights, the ceilings, a prompt,
       // the bridge
       of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 5;
+      // T182: a fallback adapter (SwiftShader in CI: the CPU in a GPU's place) checks the shaders against JavaScript and
+      // times nothing: its times are no GPU's, and they took about 4 minutes a browser (the owner, 2026-09-27: what CI
+      // needs to know is that the GPU's path works). The timings are for a real GPU, on the owner's devices.
+      if (info.fallback) of = 2;
       const check = await step("the shaders against JavaScript", { step: "check" });
+      if (!info.fallback) {
       for (const [name, shape] of Object.entries(SHAPES)) await step(`bandwidth: ${name}`, { step: "bandwidth", shape });
       for (const name of models) {
         await step(`a token of ${name}`, { step: "token", model: name, kind: "widen" });
@@ -445,6 +450,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
       // T168: the ceilings just before the prompt, so that both are measured as warm as each other
       await step("the device's ceilings", { step: "ceilings" });
       await step("a prompt all at once", { step: "prompt", counts: PROMPT_COUNTS });
+      }
       staged("gpu", { stage: "the bridge", at: of, of });
       const bridge = await gpuBridge(w);
       const wrong = check && Object.values(check).some((v: any) => !v.ok && !v.error);
