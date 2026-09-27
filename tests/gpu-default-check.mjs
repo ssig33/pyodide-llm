@@ -26,6 +26,9 @@
 // runs it, on the far faster one: sampled and greedy, the steps on the GPU and the counts right (the made-up GPU fails a
 // request whose random numbers, history or settings are not what Python should hand over); and through Python on one
 // that fails on its second request: the generation goes on whole on the CPU (T152's review: JavaScript's null is jsnull).
+// T205: release() waits for the GPU's worker to say "ended" (a slow one; one that never does, terminated after 5 s; one
+// stopped while it got ready), and so does Llama.release() called from JavaScript through Python, as the page's worker
+// calls it (the review); a browser that does not say the device's memory keeps the steps on the CPU.
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -460,7 +463,8 @@ if (isMainThread) {
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
         set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
     };
-    const outside = external({ memory, base, size, kernels, gpu: gpuOf(line) });
+    // (T205's review: its worker says ended 300 ms after the stop, for the release through Python below)
+    const outside = external({ memory, base, size, kernels, gpu: gpuOf({ ...line, endAfter: 300 }) });
     py.globals.set("OUTSIDE", outside);
     py.globals.set("OPTIONS", py.toPy(options));
     py.runPython(`from llama2_numpy import Llama\nllama = Llama(None, open("tokenizer.bin", "rb").read(), kernels="simdkernel.so", external=OUTSIDE, **OPTIONS)`);
@@ -472,7 +476,18 @@ if (isMainThread) {
       const stats = py.runPython("llama.stats").toJs({ dict_converter: Object.fromEntries });
       written.push({ sampled: stats.sampled, gpu: outside.engine.gpuSampled, prompt: stats.prompt_tokens, text: py.globals.get("text").length });
     }
-    py.runPython("llama.release()");
+    // T205's review: the release as the page's worker makes it (worker.js's load()): Llama.release() called from
+    // JavaScript hands forward.js's promise back through Python, and the next model is read once it settles. An await
+    // of anything else (None, a PyProxy) waits for nothing, and every other test here would still pass
+    const pythonLlama = py.globals.get("llama");
+    const releasedAt = performance.now(), released = pythonLlama.release?.();
+    const promised = typeof released?.then === "function";
+    const endedThrough = promised ? await released : undefined, releaseMs = performance.now() - releasedAt;
+    pythonLlama.destroy();
+    say(`T205: Llama.release() through Python: ${promised ? `a promise, ${endedThrough ? "its worker ended" : "not ended"} after ${releaseMs.toFixed(0)} ms` : `${released} (no promise)`}`);
+    if (!(promised && endedThrough === true && releaseMs >= 280)) {
+      failures.push(`Llama.release() through Python: ${promised ? `${endedThrough} after ${releaseMs.toFixed(0)} ms (its worker ends 300 ms after the stop)` : "no promise to wait for"}`);
+    }
     say(`Python's generate() on the made-up GPU: ${JSON.stringify(written)}; status ${outside.engine.gpuStatus}`);
     written.forEach(({ sampled, gpu, prompt, text }, i) => {
       if (!(sampled === 48 - prompt && gpu >= sampled - 2 && text > 0)) {
