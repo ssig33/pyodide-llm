@@ -17,7 +17,7 @@ const option = (name, value) => {
   const at = args.indexOf(name);
   return at >= 0 ? args.splice(at, 2)[1] : value;
 };
-const model = option("--model", "tiny-lm"), size = option("--size", "256"), sections = option("--run", "all");
+const model = option("--model", "llm-jp-3-150m"), size = option("--size", "256"), sections = option("--run", "all");
 const dist = args.includes("--dist") ? args.splice(args.indexOf("--dist"), 1) : null;
 let [site = "https://takano32.github.io/pyodide-llm/", ...engines] = dist ? [undefined, ...args] : args;
 let server;

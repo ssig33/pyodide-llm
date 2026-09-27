@@ -415,6 +415,10 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 入れたもの: `LICENSE`（mozilla.org の MPL-2.0 の本文、sha256 3f3d9e00…9d04）、README の「License」の節、`public/llama2_numpy.py` の頭に MIT の表示（tairov/llama2.py は MIT で LICENSE に著作権者の名が無い、karpathy/llama2.c は「Copyright (c) 2023 Andrej」、どちらも 2026-09-27 に GitHub の API で確かめた）。
 - **ファイルの頭には書かない**（2026-09-27、持ち主「ファイルの先頭にライセンスを書かなくてもよい」）: MPL の Exhibit A の表示は置かない（MPL は LICENSE があれば足りる）。`forward.js` のように llama2_numpy.py の計算を JS で書き直したファイルは、元の文を写していないので表示を置かない。写した行のあるファイル（`llama2_numpy.py`・`shaders.js`）だけが元の許諾文を持つ。
 
+### T176 [計測] ベンチの報告にサイトの版を入れ、既定のモデルを llm-jp-3 150M に — 状態: **済（2026-09-27、持ち主「ベンチマーク結果には、お前のバージョンもどこかに入れた方がよくない？」「ベンチマークで使う既定のモデル llm jp 3 くらいがよくない？ tiny は軽すぎて心配」）**（規模 小）
+- 入れたもの: 報告の頭の行（モデル・論理コア・メモリ・Pyodide の版の行）に「site <コミットの頭 7 字>」（`__BUILD__`、GitHub の `GITHUB_SHA`。手元のビルドは「dev」）。`/benchmark/` とモデルのページの `?bench=1` の両方。どのシェーダとカーネルで測った数字か、後から比べられるように。`/benchmark/` の既定のモデルを tiny-lm から llm-jp-3 150M に（`?model=` で替えられるのは同じ）。`bench-check.mjs` と `bench.yml` の既定も合わせた。
+- 確かめ: `node tests/bench.mjs`（版の文と、版の無いときに何も出ないこと。版の行を消すと落ちる）、build（既定の選択が llm-jp-3 150M）。
+
 ### T175 [性能] 1 トークンの層の行列を ORT DP4A small M の形に（T150 の融合を載せ替える） — 状態: 未着手（2026-09-27、持ち主の Android の報告から。T152 の前。規模 中）
 - 根拠: 持ち主の Android で、1 トークンの行列 × ベクトルは ORT DP4A small M が 1B の w1 で 38.6 GB/s（バッファの読みの 96.8%）なのに、T150 の層（分けた形も融合も）は llama.cpp の mul_mat_vec を土台にしていて 7.4 GB/s（18.5%）、融合は分けた形の 0.87〜0.99 倍（T150 の覆す条件に当たった）。1B の 1 トークンは今の形で約 150 ms（16 層）、DP4A の形なら重みの読みで約 29 ms（1.1 GB ÷ 38.6）の見込み。
 - 作るもの: `fusedMatVec` の行列の部分を ORT DP4A small M（T149 の `ortDp4aMatVec`、活性値を QUANTIZE してから `dot4I8Packed`）に載せ替えた形。norm・RoPE とキャッシュ・残差・SwiGLU の融合は、この形の上で残すか外すかを端末で測って決める（分けた形・norm を別にした形・融合を並べて交互に）。T151 のトークンを GPU で回す形（`generate`）もこの層を使う。元ネタ: ORT の `dp4a_matmul_nbits.cc` の small M（MIT）。

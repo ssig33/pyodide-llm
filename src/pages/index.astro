@@ -789,7 +789,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
           (data.perSecond ? ` · ${megabytes(data.perSecond)} MB/s` : "") + (converted ? ` · ${converted}` : "");
     } else if (data.type === "bench") {
       // T45 measured, T76 shows it: one bubble with the table, and under it the Markdown to copy or to report
-      const environment = environmentOf(navigator, { model: model.name, pyodide: data.pyodide, site: location.origin + location.pathname });
+      const environment = environmentOf(navigator, { model: model.name, pyodide: data.pyodide, build: __BUILD__, site: location.origin + location.pathname });
       const markdown = benchMarkdown(data.rows, environment);
       (window as any).__bench = { rows: data.rows, environment, markdown };
       benchmarking = false;

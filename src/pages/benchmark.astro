@@ -6,6 +6,9 @@
 import { MODELS } from "../models.js";
 // the models of the site itself: the model section loads one of them, and the line section fetches its first part
 const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
+// T176: the model the benchmark takes unless one is chosen: llm-jp-3 150M, heavy enough that a device's numbers mean
+// something (the owner, 2026-09-27: tiny-lm is too light); ?model= still picks another
+const BENCH_MODEL = "llm-jp-3-150m";
 ---
 <!doctype html>
 <html lang="en">
@@ -27,7 +30,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
       <div class="controls">
         <button id="run-all" type="button" class="primary">Run all</button>
         <label>model <select id="model">
-          {SITE_MODELS.map((entry) => <option value={entry.id}>{entry.name}</option>)}
+          {SITE_MODELS.map((entry) => <option value={entry.id} selected={entry.id === BENCH_MODEL}>{entry.name}</option>)}
         </select></label>
         <label>storage <select id="size">
           <option value="64">64 MB</option>
@@ -567,7 +570,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
   function report() {
     // the model and its table only when the model section measured: a report of the other sections names no model,
     // which tests/reports.mjs then leaves out (T134's review)
-    const environment = environmentOf(navigator, { model: measured?.name, pyodide: measured?.pyodide, site: location.origin + location.pathname });
+    const environment = environmentOf(navigator, { model: measured?.name, pyodide: measured?.pyodide, build: __BUILD__, site: location.origin + location.pathname });
     const TITLES: Record<Name, string> = { device: "This browser", cpu: "CPU", model: "Model", gpu: "GPU", storage: "Storage", line: "Line" };
     // the model section's table is the one on top; the section itself only where it did not measure
     const sections = SECTIONS.filter((name) => results[name] && (name !== "model" || results[name]!.status !== "ok"))

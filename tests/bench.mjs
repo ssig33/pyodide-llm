@@ -11,7 +11,7 @@ const rows = [
   { name: "without the kernels", without: ["kernels"], tokens: 64, speed: 44.81, seconds: 8.1, backend: "NumPy (without kernels)" },
 ];
 const environment = environmentOf({ hardwareConcurrency: 8, deviceMemory: 8, userAgent: "Mozilla/5.0 (X11)" },
-                                  { model: "tiny-lm 29M", pyodide: "314.0.7", site: "https://example.invalid/" });
+                                  { model: "tiny-lm 29M", pyodide: "314.0.7", build: "abc1234", site: "https://example.invalid/" });
 const markdown = benchMarkdown(rows, environment);
 
 // a table GitHub renders: a header, the separator, and one row per round
@@ -21,9 +21,11 @@ assert.ok(lines.some((line) => line.includes("|---|---|---|---|")), "the separat
 assert.ok(markdown.includes("| everything | 334.6 | 8.4 s | SIMD kernels, int8, relaxed SIMD |"), markdown);
 assert.ok(markdown.includes("8 logical cores") && markdown.includes("8 GB or more"), "what the browser told us");
 assert.ok(markdown.includes("Mozilla/5.0 (X11)"), "the user agent, for a report that means something");
+assert.ok(markdown.includes("Pyodide 314.0.7 · site abc1234"), "the site's version (T176), for which shaders and kernels ran");
 
 // a browser that says nothing about itself must not make anything up
 const bare = benchMarkdown(rows, environmentOf({}, {}));
+assert.ok(!bare.includes("site "), "no version, no word of it");
 assert.ok(!bare.includes("undefined") && !bare.includes("NaN"), bare);
 assert.ok(!bare.includes("cores"), "no invented core count");
 

@@ -41,6 +41,8 @@ export function benchMarkdown(rows, environment) {
     environment.threads !== undefined && `${environment.threads} logical cores`,
     environment.memory !== undefined && `${environment.memory} GB or more`,
     environment.pyodide && `Pyodide ${environment.pyodide}`,
+    // T176: the site's version (the commit it was built from), so that a report says which shaders and kernels ran
+    environment.build && `site ${environment.build}`,
     environment.site,
   ].filter(Boolean).join(" · ");
   // no rounds, no table: a /benchmark/ report without its model section (T134) is no row of reportsTable()
