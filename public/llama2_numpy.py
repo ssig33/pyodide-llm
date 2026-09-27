@@ -169,16 +169,15 @@ class Tokenizer:
         # as index finds it), and how long a piece that begins with two given characters can be (T200)
         self.pieces, self.reach = {}, {}
         if self.kind == "unigram":
-            for i, piece in enumerate(self.vocab):
-                if self.index[piece] != i or not self.scores[i] > self.UNMATCHABLE:
-                    continue
-                try:
-                    text = piece.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue  # no text encodes to it
-                self.pieces[text] = (i, self.scores[i])
-                if len(text) > 1:
-                    self.reach[text[:2]] = max(self.reach.get(text[:2], 0), len(text))
+            for piece, i in self.index.items():
+                if self.scores[i] > self.UNMATCHABLE:
+                    try:
+                        self.pieces[piece.decode("utf-8")] = (i, self.scores[i])
+                    except UnicodeDecodeError:
+                        pass  # no text encodes to it
+            for text in self.pieces:
+                if len(text) > 1 and self.reach.get(text[:2], 0) < len(text):
+                    self.reach[text[:2]] = len(text)
         self.unknown_score = min(score for score in self.scores if score > self.UNMATCHABLE) - 10.0
 
     def encode(self, text, specials=()):
@@ -228,18 +227,15 @@ class Tokenizer:
             else:
                 tokens.extend(self.byte_tokens[byte] for byte in piece)
 
-        # Merge the best consecutive pair each iteration, according to the scores in vocab_scores
-        return self.merged([self.vocab[token] for token in tokens], tokens, self.index, -1e10)
+        # Merge the best consecutive pair each iteration, according to the scores in vocab_scores (the first of equal
+        # scores). Only the pairs next to a merge change, so the others keep their scores from one merge to the next
+        # (T200: each merge had looked every pair up again, which made a prompt of 1000 tokens take 1.6 s).
+        pieces = [self.vocab[token] for token in tokens]
 
-    def merged(self, pieces, tokens, index, floor):
-        """Merge the adjacent pair whose joined piece index has and scores best (the first of equal scores; above
-        floor), until no pair is left to merge. pieces: the text of each symbol (bytes or str), tokens: its token or
-        None, both changed in place. Only the pairs next to a merge change, so the scores of the others are kept
-        from one merge to the next (T200: each merge had looked every pair up again)."""
         def pair(k):
             """the score and the token of the pieces k and k + 1 joined; minus infinity where they do not merge"""
-            id = index.get(pieces[k] + pieces[k + 1])
-            return (self.scores[id], id) if id is not None and self.scores[id] > floor else (-math.inf, -1)
+            id = self.index.get(pieces[k] + pieces[k + 1])
+            return (self.scores[id], id) if id is not None and self.scores[id] > -1e10 else (-math.inf, -1)
 
         ranks, joined = [], []
         for k in range(len(pieces) - 1):
@@ -249,11 +245,9 @@ class Tokenizer:
         while ranks:
             best = max(ranks)
             if best == -math.inf:
-                break
+                return tokens
             i = ranks.index(best)
-            pieces[i:i + 2] = [pieces[i] + pieces[i + 1]]
-            if tokens is not None:
-                tokens[i:i + 2] = [joined[i]]
+            tokens[i:i + 2], pieces[i:i + 2] = [joined[i]], [pieces[i] + pieces[i + 1]]
             del ranks[i], joined[i]  # the pair merged; the pairs after it move down by one
             for k in (i - 1, i):  # the pairs with the merged piece
                 if 0 <= k < len(ranks):
@@ -264,12 +258,21 @@ class Tokenizer:
         # The pre-tokenizer keeps merges inside a word: the pieces never cross from a word into the next.
         tokens = []
         for part in pretokenize(text, self.pretokenizer):
-            symbols = [BYTE_CHARS[byte] for byte in part.encode("utf-8")]
-            if self.ignore_merges and "".join(symbols) in self.text_index:
+            word = part.encode("utf-8").decode("latin-1").translate(BYTE_CHARS)  # each byte as its character
+            if self.ignore_merges and word in self.text_index:
                 # Llama 3: a piece the vocabulary has is that one token, whatever the merges would make of it
-                symbols = ["".join(symbols)]
-            # a merged symbol is the text of the joined piece (text_index maps each text to a piece of that text)
-            self.merged(symbols, None, self.text_index, self.UNMATCHABLE)
+                tokens.append(self.text_index[word])
+                continue
+            symbols = list(word)
+            while len(symbols) > 1:
+                best_score, best_id, best_idx = self.UNMATCHABLE, -1, -1
+                for i in range(len(symbols) - 1):
+                    id = self.text_index.get(symbols[i] + symbols[i + 1])
+                    if id is not None and self.scores[id] > best_score:
+                        best_score, best_id, best_idx = self.scores[id], id, i
+                if best_idx == -1:
+                    break
+                symbols[best_idx:best_idx + 2] = [self.vocab[best_id].decode("utf-8", "replace")]
             tokens += [self.text_index[symbol] for symbol in symbols]
         return tokens
 
