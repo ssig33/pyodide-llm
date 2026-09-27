@@ -5,7 +5,14 @@
 // public/llama2_convert.py converts in here as it arrives.
 // The page sends   {type: "init", search, model, load},  {type: "load", search, model, load},
 //                  {type: "generate", prompt, ...options}  and  {type: "stop"}
-// and receives     {type: "status" | "progress" | "ready" | "token" | "done" | "error", ...}
+// and receives     {type: "status" | "progress" | "ready" | "token" | "done" | "bench" | "error"
+//                         | "threads" | "threads-compared" | "gpu", ...}
+// Of these, only ready (a load, and each round of the benchmark), bench (the benchmark), done (a text, also one
+// stopped) and error (any of them) end a piece of this worker's work: the page reads them, and nothing else, as the
+// worker being idle (T172). status and progress come during a load, token during a text, threads and
+// threads-compared from the search for the number of threads, which runs inside a text, and gpu once the GPU is
+// ready or refused, whatever else is going on (T148). A new message is one of the ends or not, and the page's list
+// of the ends says so.
 // load is a number the page counts up: a newer load cancels the one that is going on, and whatever this worker
 // reports about a load carries its number, so that the page can tell a late report of a cancelled one.
 

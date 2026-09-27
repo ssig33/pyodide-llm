@@ -102,7 +102,7 @@ const rest = args.slice(1);
 
 // the lines of a workflow's logs worth reading when nothing else is asked for
 const LINES = {
-  "models.yml": "ready in|^then |^again|^offline|FAILED|timed out",
+  "models.yml": "ready in|^then |^again|^offline|thread reports during|FAILED|timed out",
   "bench.yml": "^### (chromium|firefox|webkit|chrome|msedge)$|^sections:|WRONG|^failed:",
   "browsers.yml": "ready in|FAILED|timed out",
   "preview.yml": "^sections:|FAILED|timed out",

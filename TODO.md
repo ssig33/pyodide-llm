@@ -374,7 +374,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 - レビュー（Opus xhigh、2026-09-27）: must-fix 0。書き直しの経路は Playwright で確かめた。1 トークンの換算は、a1-free で作り物を交互に測ると Llama 3.2 1B の形で実測の 0.99〜1.04、llm-jp-3 150M の形で 1.09〜1.21（CPU を速く見せる）。持ち主の端末の 4 本での差は未計測。should は 9（失ったデバイス・フォールバック・WRONG の比を空に、見出しの向き、本数、揺れ、表の `|`、古いコメント、bench-check の見張り）。
 - **本番の確認（2026-09-27、2e17b63 のデプロイの後）**: bench.yml（36274777116）は 3 つの OS × 5 ブラウザで通った（SwiftShader なので比の列は理由の 1 行で空）。
 - **文面は持ち主が決めた（2026-09-27）**: 1 トークンの表の上とプロンプトの説明は、どちらも案 2（レビューの案、いまページに入っている文）。
-### T172 [バグ] 生成の途中のスレッドの知らせで、送信ボタンが戻る — 状態: **本線に入れた（eabc16d、2026-09-27）。should 4 は残り**（2026-09-27、T148 のレビューが見つけた。T114（2026-09-25）から。T148 のデプロイの前か同時に。規模 小）
+### T172 [バグ] 生成の途中のスレッドの知らせで、送信ボタンが戻る — 状態: **本線に入れた（eabc16d、2026-09-27）。should 4 を直した、レビュー待ち**（ブランチ `t172-should`）（2026-09-27、T148 のレビューが見つけた。`threads` を文の途中に送るのは T93 の段階 2b（08ba18d、2026-09-25）から、T114 は `threads-compared` を足した。T148 のデプロイの前か同時に。規模 小）
 - 根拠: `src/pages/index.astro` が、生成の途中に Worker から届く `threads`・`threads-compared` の知らせを「Worker が空いた印」と読み、送信ボタンを Run に戻してモデルの選択も押せるようにする。押すと 2 本目の生成が同じエンジンで走り出す（Playwright の Chromium、llm-jp-3 150M の初めての訪問で、送って 1.0 秒で起きた。`.tmp/t148-review/button.mjs`）。スレッドの検索が走る生成のたび（初めての訪問の最初の答えと、8 回ごとの見直し）に出る。
 - 作るもの: 知らせが ready・done・bench・error のときだけ「空いた」と読む。生成中にモデルを替えた場合も確かめる。
 - 完了条件: `button.mjs` の形の試験（e2e に足す）で、スレッドの知らせの後もボタンが止めるボタンのまま。
@@ -388,11 +388,12 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   | `error` | どの仕事の失敗も | はい |
   | `status`・`progress` | 読み込みの途中 | いいえ |
   | `token` | 文の途中 | いいえ |
-  | `threads`・`threads-compared` | スレッドの本数の検索（文の途中で走る、T114） | いいえ（ここが直したところ） |
+  | `threads`・`threads-compared` | スレッドの本数の検索（文の途中で走る。`threads` は T93 の段階 2b から、`threads-compared` は T114 から） | いいえ（ここが直したところ） |
 
   T148 の `gpu` の知らせ（ブランチ `t148-default`）も「含む一覧」に無いので、そのまま「空いた」と読まれない（T148 が除く一覧に `gpu` を足した 1 行は、統合の時にこちらの形に吸われる）。**試験**: `tests/e2e.mjs` が送る前にボタンとモデルの選択を MutationObserver で見張り、答えの速さの行が出る前にボタンが Run に戻るかモデルの選択が押せるようになれば落とす。答えの間のスレッドの知らせの数も出す（0 なら見張りは空振り）。**直す前の形で落ちる**: llm-jp-3 150M（Playwright の Chromium、a1-free、初めての訪問）で「before the answer ended: the button went back to Run, the choice of model came back」（スレッドの知らせ 2）。直した後: llm-jp-3 150M ok（知らせ 2）、tiny-lm ok（知らせ 1、`E2E_THEN=llm-jp-3-150m` で替えた後も ok）。**生成中にモデルを替えた場合**（直した後は選択が止まっているので訪問者はできない。選択を無理に開けて、`.tmp/t172/switch.mjs`）: Worker が文を止めて `done` を送り、新しいモデルが準備完了になって、ボタンは Run、次の文も答えた。**残る小さなこと**: そのとき止まった文の速さの行は、`done` の時の `model.name`（新しいモデルの名前）で書かれる（前からの形。訪問者は今は届かない）。
 
 - **レビュー（Opus xhigh、2026-09-27）: must-fix 0。** 9 種類は worker.js の postMessage 全部と合う。a1-free の Chromium で e2e（llm-jp-3 150M と tiny-lm と then、知らせ 3）が通り、直す前の行では落ちた（知らせ 4）。`?hf=` の誤り・生成の失敗・停止・ロード中の替え・`?bench=1` で、ボタンは終わりの印でだけ戻った。直す前の行でも `?coi=off`（知らせ 0）なら e2e は通る。**should 4（未着手）**: 知らせの数を `E2E_RESULTS` の JSON と `tests/ci.mjs` の models.yml の既定の行に、見張りを答えごとに（送るときの `.meta` の数を基準に。今は最初の答えだけ）、`worker.js` の頭の知らせの一覧を 9 種類と終わりの印に、記録の起点は T114 でなく T93 の段階 2b（`threads` を文の途中に送るのは 08ba18d から、T114 は `threads-compared`）。
+- should 4 を直した（2026-09-27、Opus medium、ブランチ `t172-should`）: (1) 答えの間のスレッドの知らせの数を `E2E_RESULTS` の JSON（`threadReports`、`then` と `offline` の各項目にも）と `summary.mjs` の表の列「thread reports」（答えの順に「2, 0」）に、`tests/ci.mjs` の models.yml の既定の行に `thread reports during` を足した。(2) 見張りは答えごと（`watchAnswer()`: 送る前に `.model .meta` の数を基準にし、読み直した後のページには見張りを付け直す）。`E2E_TWICE` は読み直すだけで答えを送らないので見張るものが無い。(3) `worker.js` の頭の知らせの一覧を 10 種類（9 つと T148 の `gpu`）にし、終わりの印の 4 つを書いた。(4) 起点を T93 の段階 2b（08ba18d）に直した（AGENTS.md と上の表）。**確かめ**（a1-free の Playwright の Chromium、3GB の枠）: tiny-lm → `E2E_THEN=llm-jp-3-150m` で ok（知らせ 2 と 4、JSON に出る）、`E2E_OFFLINE` の tiny-lm で ok（2 と 0）。**直す前の判定（除く一覧）に戻すと 2 つ目の答えで落ちた**: 最初の答えは知らせ 0 で通り、`then llm-jp-3-150m: before the answer ended: the button went back to Run, the choice of model came back`（知らせ 2）。`summary-check` は列と空の欄を見る。`tests/ci.mjs` の単体の試験は無い。
 - **本番の確認（2026-09-27、eabc16d のデプロイの後）**: models.yml で WebKit の llm-jp-3 150M と tiny-lm（36284932725）、Firefox の llm-jp-3 150M（36284934169）、Chromium の tiny-lm → llm-jp-3 150M（36284935495）が通った。答えの間のスレッドの知らせは 1〜3 回で、ボタンは止めるボタンのままだった。
 ### T173 [調査・性能] メモリを言わない端末（iPhone の Safari）で、どこまで載せるかを決める — 状態: 未着手（2026-09-27、持ち主「ひとつの大きなタスクとして切り出す価値がありそう」。T148 の選び方と T156 に関わる。規模 中〜大）
 - **根拠**: T148 は GPU に重みを 2 重に持つモデルを「チェックポイント + `footprint()` + GPU の層が `deviceMemory` の半分を越えたら CPU」で決めるが、Safari は `navigator.deviceMemory` を持たないので 4 GB と見ている。この見方では iPhone の Llama 3.2 1B 以上はいつも CPU（見積もりの合計 2.86 GB、`.tmp/t148-review/room.mjs`）。6 ビットの判定（T98）も同じ `deviceMemory` に頼っている。

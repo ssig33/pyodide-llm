@@ -225,20 +225,36 @@ if (!process.env.E2E_LONG) await page.evaluate(() => {
 if (process.env.E2E_LONG) {
   await page.fill("#prompt", Array.from({ length: Number(process.env.E2E_LONG) }, (_, i) => i + 1).join(" "));
 }
-// T172: until the answer's speed line is there, the button stays the stop button and the model stays chosen. The
-// worker's reports in the middle of a text (the search for the number of threads, T114) once read as "the worker is
-// idle": the button went back to Run, and a press started a second text on the same engine. Whether such a report
-// came is in the console ("threads:"), so that a pass without one is not taken for a pass with one
-await page.evaluate(() => {
-  const run = document.getElementById("run"), select = document.getElementById("model");
-  const answered = () => document.querySelectorAll(".model .meta").length > 0;
-  window.__early = [];
-  new MutationObserver(() => {
-    if (!answered() && run.getAttribute("aria-label") === "Run") window.__early.push("the button went back to Run");
-    if (!answered() && !select.disabled) window.__early.push("the choice of model came back");
-  }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ["aria-label", "disabled"] });
-});
-const threadsBefore = threadReports;
+// T172: until an answer's speed line is there, the button stays the stop button and the model stays chosen. The
+// worker's reports in the middle of a text (the search for the number of threads, which runs inside a text since T93's
+// stage 2b) once read as "the worker is idle": the button went back to Run, and a press started a second text on the
+// same engine. Every answer is watched (the first, E2E_THEN's, the offline one): the count of speed lines as it is
+// sent is the mark of "not answered yet". Whether a report came during the answer is in the console ("threads:") and
+// in the record, so that a pass without one is not taken for a pass with one.
+async function watchAnswer() {
+  await page.evaluate(() => {
+    window.__answered = document.querySelectorAll(".model .meta").length;
+    window.__early = [];
+    if (window.__watching) return;
+    window.__watching = true;
+    const run = document.getElementById("run"), select = document.getElementById("model");
+    const answered = () => document.querySelectorAll(".model .meta").length > window.__answered;
+    new MutationObserver(() => {
+      if (!answered() && run.getAttribute("aria-label") === "Run") window.__early.push("the button went back to Run");
+      if (!answered() && !select.disabled) window.__early.push("the choice of model came back");
+    }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ["aria-label", "disabled"] });
+  });
+  const before = threadReports;
+  return async (name) => {
+    const early = await page.evaluate(() => window.__early);
+    if (early.length) failures.push(`${name}before the answer ended: ${[...new Set(early)].join(", ")}`);
+    const count = threadReports - before;
+    console.log(`${name}thread reports during the answer: ${count}`);
+    return count;
+  };
+}
+const failures = [];
+const answerWatched = await watchAnswer();
 // Enter alone breaks the line
 await page.press("#prompt", "Control+Enter");
 await page.waitForFunction(() => document.querySelector(".model .meta") || document.querySelector(".error"), null, { timeout: 0 });
@@ -254,14 +270,11 @@ const result = await page.evaluate(() => ({
   pageScrolls: document.documentElement.scrollHeight > innerHeight,
   // T93: whether the service worker made the page cross-origin isolated (the software threads need it)
   isolated: self.crossOriginIsolated,
-  early: window.__early,
 }));
-const failures = [];
 if (result.error) failures.push(`the page reported: ${result.error}`);
 if (errors.length) failures.push(`console errors: ${errors.join(" | ")}`);
 if (!/tok\/s/.test(result.meta)) failures.push("no speed line under the answer");
 if (result.pageScrolls) failures.push("the page itself scrolls");
-if (result.early.length) failures.push(`before the answer ended: ${[...new Set(result.early)].join(", ")}`);
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
 if (gpuTest && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
 // (refused as a fallback adapter, or before that for another reason: a page that is not cross-origin isolated)
@@ -271,7 +284,7 @@ if (swiftShader && !gpuTest && (!/prompts on the CPU \(/.test(gpuVerdict?.status
 console.log(`${engine} ${browserVersion}, ${model}: ready in ${readySeconds.toFixed(1)}s, ${result.meta}`);
 console.log(`status: ${result.status}${result.isolated ? "" : " (not cross-origin isolated)"}`);
 if (result.prompt) console.log(result.prompt);
-console.log(`thread reports during the answer: ${threadReports - threadsBefore}`);
+const threadReportsSeen = await answerWatched("");
 console.log(result.text.slice(0, 160).replace(/\n/g, " / "));
 const then = [];
 for (const next of (process.env.E2E_THEN ?? "").split(/\s+/).filter(Boolean)) {
@@ -286,6 +299,7 @@ for (const next of (process.env.E2E_THEN ?? "").split(/\s+/).filter(Boolean)) {
   // the URL names the model now open, and no other (a reload, or a switch of the panel, opens what it names)
   const named = await page.evaluate(() => Object.fromEntries(new URL(location.href).searchParams));
   if (named.model !== next || named.hf || named.checkpoint) failures.push(`then ${next}: the URL names ${named.hf ?? named.checkpoint ?? named.model}`);
+  const watched = await watchAnswer();
   await page.press("#prompt", "Control+Enter");
   await page.waitForFunction((count) => document.querySelectorAll(".model .meta").length > count || document.querySelector(".error"), answered, { timeout: 0 });
   const last = await page.evaluate(() => {
@@ -293,9 +307,9 @@ for (const next of (process.env.E2E_THEN ?? "").split(/\s+/).filter(Boolean)) {
     return { meta: final(".model .meta summary"), text: final(".model .bubble"), error: final(".error .bubble"),
              status: document.getElementById("status-text")?.textContent ?? "", heap: window.__ready?.heap ?? null };
   });
-  then.push({ model: next, readySeconds, ...last });
   console.log(`then ${next}: ready in ${readySeconds.toFixed(1)}s, ${last.meta || last.error}`);
   console.log(`status: ${last.status}`);
+  then.push({ model: next, readySeconds, ...last, threadReports: await watched(`then ${next}: `) });
   console.log(last.text.slice(0, 160).replace(/\n/g, " / "));
   if (last.error || !/tok\/s/.test(last.meta)) failures.push(`then ${next}: ${last.error || "no answer"}`);
 }
@@ -330,12 +344,14 @@ if (process.env.E2E_OFFLINE && !failures.length) {
     await acrossReload(() => page.waitForFunction(() => window.__ready || document.querySelector(".error"), null, { timeout: 0 }));
     await idle();
     const readyOffline = (Date.now() - reloaded) / 1000;
+    const watched = await watchAnswer();
     await page.press("#prompt", "Control+Enter");
     await page.waitForFunction(() => document.querySelectorAll(".model .meta").length || document.querySelector(".error"), null, { timeout: 0 });
     offline = await page.evaluate(() => ({ meta: document.querySelector(".model .meta summary")?.textContent ?? "",
       text: document.querySelector(".model .bubble")?.textContent ?? "", error: document.querySelector(".error .bubble")?.textContent ?? "" }));
     offline.readySeconds = readyOffline;
     console.log(`offline: ready in ${readyOffline.toFixed(1)}s, ${offline.meta || offline.error}`);
+    offline.threadReports = await watched("offline: ");
     if (offline.error || !/tok\/s/.test(offline.meta)) failures.push(`offline: ${offline.error || "no answer"}`);
   }
   await page.context().setOffline(false);
@@ -344,6 +360,7 @@ const speed = Number(result.meta.match(/([\d.]+) tok\/s/)?.[1]);
 record({ ok: !failures.length, timedOut: false, readySeconds, tokPerSecond: Number.isFinite(speed) ? speed : null,
          backend: result.status, meta: result.meta, failures, isolated: result.isolated, load: reported?.seconds ?? null,
          heapMB: reported?.heap ? Math.round(reported.heap / 1e6) : null, notKept: reported?.notKept ?? null, again, offline, gpuVerdict,
+         threadReports: threadReportsSeen,
          ...(then.length ? { then } : {}) });
 if (failures.length) await keepArtifacts(failures.join("; "));
 clearTimeout(watchdog);
