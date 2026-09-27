@@ -191,3 +191,7 @@ Downloading the model in parts of 8 MiB over several connections at once is abou
 - [tiny-lm](https://huggingface.co/sbintuitions/tiny-lm) by SB Intuitions (MIT License) for the Japanese / English model; its license is deployed next to the converted file.
 - [TinyLlamas](https://huggingface.co/karpathy/tinyllamas) by Andrej Karpathy and [ellishg/tinyllamas](https://huggingface.co/ellishg/tinyllamas) for the compact TinyStories checkpoints.
 - [llama2.c](https://github.com/karpathy/llama2.c) for the inspiration and model format.
+
+## License
+
+[Mozilla Public License 2.0](LICENSE), the same as Pyodide's. Some files carry code from other projects under their own licenses, and keep those notices where the code is: `public/llama2_numpy.py` (tairov/llama2.py and karpathy/llama2.c, MIT) and `public/shaders.js` (llama.cpp and ONNX Runtime, MIT; TensorFlow.js, Apache-2.0). The models are not in this repository and each keeps its own license (see the model list).

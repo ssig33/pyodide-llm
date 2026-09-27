@@ -388,6 +388,11 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 - **作るもの（案）**: (1) 持ち主の iPhone で、`/benchmark/` に「このページがどこまで持てるか」を安全に測る段を足せるか調べる（jetsam は例外を出さないので、段階を小さく刻み、各段の前に `sessionStorage` に印を書き、落ちて読み直されたら前の段を上限とする形。文面は持ち主）。(2) `maxBufferSize` を古い iPhone で GPU を断る目安に足す。(3) 載せる線（今の 4 GB と見る）を、(1) の数字と T156（重みを 2 重に持たない。入れば 1B の合計は約 1.8 GB）の後で見直す。
 - **完了条件**: 持ち主の iPhone で、既定のページが落ちずに、載せられるモデルは GPU に載る線が数字つきで決まる。
 
+### T174 [文書] ライセンスを MPL-2.0 にする — 状態: **済（2026-09-27、持ち主「MPL-2.0 がいいかなって」「提案通りにライセンスファイル置いてほしい」）**（規模 小）
+- 決めたこと: リポジトリは MPL-2.0（Pyodide と同じ）。ファイル単位のコピーレフトで、写した MIT と Apache-2.0 のコードとは両立する（写した行は元の許諾文をそのファイルのコメントに残す: `public/shaders.js` の llama.cpp・ONNX Runtime（MIT）と TensorFlow.js（Apache-2.0）。clpeak（GPL-3.0）は形だけで行は写していない、T168）。
+- 入れたもの: `LICENSE`（mozilla.org の MPL-2.0 の本文、sha256 3f3d9e00…9d04）、README の「License」の節、`public/llama2_numpy.py` の頭に MIT の表示（tairov/llama2.py は MIT で LICENSE に著作権者の名が無い、karpathy/llama2.c は「Copyright (c) 2023 Andrej」、どちらも 2026-09-27 に GitHub の API で確かめた）。
+- 残り（未着手、要るときに）: 各ファイルの頭の MPL の Exhibit A の表示（任意）。`forward.js` など、llama2_numpy.py から JS に移した forward にも同じ表示を置くか。
+
 ### T169 [文書] README を書き直し、しくみと計測の記録を docs/ に分ける — 状態: 未着手（2026-09-27、持ち主「採番せよ」。外からの設計の意見を持ち主が持ち込み、そのうち採るものを 3 つに分けた。規模 小〜中）
 - 根拠: README の冒頭が古い（「Python が層を順に呼び、ctypes でカーネルを呼ぶ」は T93 の前の形。いまの forward は JS と WASM で、GPU もある）。初めての人の「これは何か・どう使うか・どのブラウザで・何 MB か・自分のモデルは」が探しにくい。
 - 作るもの: README の頭を短い説明と構成図（ブラウザ → Worker → Pyodide → 実行エンジン → WASM SIMD の CPU と WebGPU の GPU）に。しくみ・量子化・計測・WebGPU・開発の記録を docs/ の別のファイルに分ける。訪問者に見える文なので、文面は持ち主に先に見せる。
