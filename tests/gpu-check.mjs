@@ -820,6 +820,18 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
 }
 process.exit(failed ? 1 : 0);
 
+// T213: the first matrix a token's layer would bind inside a joined buffer (q, k and v as one, gate and up as one,
+// in gpu.js's tokensLayout's order; each after the ones before it) whose values or scales would not start where a device binds a buffer, or null where every
+// one does (the model's steps then belong on the GPU). The device's alignment is WebGPU's default of 256 bytes
+// (gpu.js asks for no other), the scales 4 bytes a group of 32: stories15M's k starts at 288 × 288 weights, whose
+// scales, 10368 bytes, are not a multiple of 256 (T150's (b))
+function unbound(c) {
+  const [dim, hidden, , heads, kvHeads] = c.reference.header, head = c.headDim || dim / heads, ALIGN = 256, GROUP = 32;
+  const joined = { wk: head * heads * dim, wv: head * (heads + kvHeads) * dim, w3: hidden * dim };
+  for (const [name, values] of Object.entries(joined)) if (values % ALIGN || (values / GROUP) * 4 % ALIGN) return name;
+  return null;
+}
+
 // T152: the steps of a generation on the GPU against NumPy's greedy continuation (see the head of this file): a line
 // "  a token by <form>: ..." and whether it is right
 function stepsRight(c, steps, { e16s, q8s, kvDim, prompt }) {
@@ -833,7 +845,8 @@ function stepsRight(c, steps, { e16s, q8s, kvDim, prompt }) {
     // logits hold its size: vocabulary × dim)
     const table = floats(ref.logits).length * ref.header[0];
     const right = steps.planned === false || (c.force?.pieceBytes && !steps.forced && /past a buffer/.test(steps.why)) ||
-      (/^the (classifier|embedding) is past a buffer/.test(steps.why ?? "") && table > steps.binds);
+      (/^the (classifier|embedding) is past a buffer/.test(steps.why ?? "") && table > steps.binds) ||
+      steps.why === `${unbound(c)} would not start where this GPU binds a buffer`;
     console.log(`  a token: on the CPU (${steps.why})${right ? "" : " — FAILED"}`);
     return right;
   }
