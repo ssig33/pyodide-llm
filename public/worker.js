@@ -1330,11 +1330,12 @@ function warmUp(prompt) {
 
 // T184: the model page's own path on the model loaded now (src/bench.js's pathTable() writes it). The GPU is waited for
 // first, GPU_WAIT_S at most (the page does not wait: its first prompts go on the CPU meanwhile; a GPU not ready by then
-// is said as such), then the threads' search is let finish on a few runs and stopped there, so that every side is timed
-// on one number of threads (the CPU's times, and so the choice, are per number of threads). The prompts:
+// is said as such), then the number of threads is the model page's (T190: the count the model page remembers, which
+// /benchmark/ passes as the model page does, or else the search run to its end: forward.js's endSearch()), and every
+// side is timed on it (the CPU's times, and so the choice, are per number of threads). The prompts:
 // forward.js's timePrompts(). The writing: sampled tokens after the prompt at the tok/s the page's status line says
 // (the engine's stats), on the CPU alone until T152 puts a token on the GPU (its cell then is the GPU's).
-const GPU_WAIT_S = 240, SEARCH_RUNS = 8, WRITING_RUNS = 3;
+const GPU_WAIT_S = 240, WRITING_RUNS = 3;
 async function timedPaths({ prompt, counts, sampled }) {
   const engine = outsideNow?.engine;
   if (!engine) return { error: `${llama.backend} runs this model here: the page's path is the NumPy engine's` };
@@ -1348,8 +1349,13 @@ async function timedPaths({ prompt, counts, sampled }) {
   const gpu = chosen ? { seconds: chosen.seconds, matrices: chosen.matrices, attention: chosen.attention }
     : { why: engine.gpuWhyNot ?? `not ready after ${GPU_WAIT_S} s` };
   postMessage({ type: "status", text: "the software threads" });
-  for (let i = 0; i < SEARCH_RUNS && engine.searching; i++) timedGeneration(prompt, 64);
-  const threads = await engine.setThreads(engine.threads);  // the search ends here, where it has come to
+  const { threads, found, ended } = await forwardModule.endSearch(engine, () => timedGeneration(prompt, 64));
+  // how the count came about, for the table's head (T190): src/bench.js's pathTable() says it
+  const how = !weightsPool?.shared ? { alone: "no shared memory here" }
+    : threads < found ? { alone: `not the ${found} asked for: a software thread stopped` }
+    : !ended ? { unfinished: forwardModule.SEARCH_SECONDS }
+    : threadsRequest?.remembered ? { remembered: true }
+    : { searched: engine.searchLog.map(({ best, candidate, faster }) => [best, candidate, faster ? candidate : best]) };
   const encoded = llama.tokenizer.encode(prompt);
   const words = encoded.toJs();
   encoded.destroy();
@@ -1375,7 +1381,7 @@ async function timedPaths({ prompt, counts, sampled }) {
               gpu: { skip: chosen ? "not on the GPU yet" : gpu.why } });
   // whatever stopped the GPU while the sides were timed (a failure, a lost device): its cells are empty (timePrompts)
   if (chosen && engine.gpuWhyNot) gpu.lost = engine.gpuWhyNot;
-  return { threads, gpu, status: engine.gpuStatus, rows };
+  return { threads, how, gpu, status: engine.gpuStatus, rows };
 }
 
 // the run that is going on, and whether the page asked it to stop

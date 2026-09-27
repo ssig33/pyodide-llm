@@ -303,7 +303,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
 
 <script>
   import { GROUPS, MODELS, filled, memoryFailure, memoryWarning, weightsFor } from "../models.js";
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, environmentOf, reportUrl } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, environmentOf, reportUrl, threadsKey as sharedThreadsKey } from "../bench.js";
 
   declare const __BUILD__: string;
   const $ = (id: string) => document.getElementById(id)!;
@@ -381,7 +381,8 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
   // T93: the number of threads. ?threads=N fixes it (for measuring); else the worker finds it for this device and
   // model and this page remembers the answer, so that the next visit starts with it.
   const fixedThreads = Math.max(0, Math.floor(Number(parameters.get("threads")) || 0));
-  const threadsKey = (id: string) => `threads:${id}:${navigator.hardwareConcurrency}:${(navigator as any).deviceMemory ?? ""}:${navigator.userAgent}`;
+  // (/benchmark/ reads the same key: T190)
+  const threadsKey = (id: string) => sharedThreadsKey(id, navigator);
   // T98: ?bits=6 converts a model of Hugging Face to six bits a weight, ?bits=8 to int8; without it, six bits only
   // where int8 would not fit (weightsFor). What the worker gets is the entry with that in its conversion.
   const weighed = (entry: any) => {

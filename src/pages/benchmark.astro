@@ -139,7 +139,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 
 <script>
   import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
-    matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+    matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -400,8 +400,16 @@ const BENCH_MODEL = "llm-jp-3-150m";
         w.postMessage(message);
       });
       // ?gpuTest=on (tests only, as on the model page: T148): CI's fallback adapter taken as a GPU, to see the GPU's side
+      // T190: the number of threads the model page remembers for this model here (it reads it the same way), else a
+      // search from the logical cores that the page path lets end (worker.js); nothing is remembered from here
+      let remembered = 0;
+      try {
+        remembered = Number(localStorage.getItem(threadsKey(entry.id, navigator))) || 0;
+      } catch {
+        // no storage here: searched
+      }
       const loaded = await request({ type: "init", search: parameters.get("gpuTest") === "on" ? "?gpuTest=on" : "", model: entry, load: 1,
-        threads: { remembered: 0, hint: navigator.hardwareConcurrency || 1 } });
+        threads: { remembered, hint: navigator.hardwareConcurrency || 1 } });
       if (loaded.error) return { status: "error", markdown: loaded.error };
       pathing = true;
       staged("model", { stage: "the page's path", at: 2, of: stages });

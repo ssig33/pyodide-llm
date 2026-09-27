@@ -13,6 +13,8 @@
 // T184 (the review's must-fix): /benchmark/'s page path (forward.js's timePrompts, src/bench.js's pathTable) on the same
 // made-up GPU: far faster, every block of the GPU's side on it and a ratio; failing on its sixth block, the GPU's cells
 // empty with why and no ratio anywhere (its time was the CPU's: 0.90× before); no GPU, the CPU's side alone.
+// T190: the page path's number of threads: a search run to its end (forward.js's endSearch) and timed on the count it
+// chose; a count the model page remembers taken with no search.
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -71,7 +73,7 @@ if (isMainThread) {
   process.exit(code);
 } else {
   const { memory, base, size, plan, forwardFile } = workerData;
-  const { compileKernels, createForward, timePrompts } = await import(forwardFile);
+  const { compileKernels, createForward, endSearch, timePrompts } = await import(forwardFile);
   const { pathTable } = await import(path.join(root, "src/bench.js"));
   const kernels = compileKernels(fs.readFileSync(path.join(root, "public/simdkernel_shared.wasm")), fs.readFileSync(path.join(root, "public/simdkernel_relaxed_shared.wasm")));
   const spawn = (data) => new Promise((resolve) => {
@@ -182,6 +184,31 @@ if (isMainThread) {
     engine.release();
     say(table);
     expect("no GPU: the CPU's side alone", rows.map((row) => [row.chosen.same, row.gpu.skip]), [["cpu", "no WebGPU in a worker here"], ["cpu", "no WebGPU in a worker here"]]);
+  }
+  // T190: the page path is timed on the model page's number of threads. A search from the logical cores runs to its end
+  // (endSearch), on generations of few logits each (the owner's Android timed it on 1 thread where the page runs 4:
+  // T184 stopped the search after 8 generations); a count the model page remembers is taken as is, with no search
+  {
+    const engine = createForward({ memory, base, size, kernels, plan, spawn });
+    let chose = 0, tokens = 0;
+    await engine.findThreads({ from: 2, chose: (count) => (chose = count) });
+    // a generation of 6 tokens with logits: a comparison takes 20 of them, so more than 3 generations
+    const write = () => { for (let pos = 0; pos < 6; pos++, tokens++) engine.forward(100 + pos, pos, true); };
+    const ended = await endSearch(engine, write);
+    const log = engine.searchLog.map(({ best, candidate, faster }) => `${best} or ${candidate}: ${faster ? candidate : best}`);
+    engine.release();
+    say(`the search to its end: ${ended.threads} threads after ${ended.generations} generations of 6 tokens (${log.join(", ")}), the search chose ${chose}`);
+    expect("the search ended", [ended.ended, engine.searching], [true, false]);
+    expect("timed on the count the search chose", ended.threads, chose);
+    if (!log.length) failures.push("the search to its end: no comparison made");
+  }
+  {
+    const engine = createForward({ memory, base, size, kernels, plan, spawn });
+    let tokens = 0;
+    await engine.findThreads({ from: 2, remembered: 3 });
+    const ended = await endSearch(engine, () => tokens++);
+    engine.release();
+    expect("a count the model page remembers: no search, that count", [ended.threads, ended.generations, tokens], [3, 0, 0]);
   }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");

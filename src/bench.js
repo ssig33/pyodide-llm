@@ -448,6 +448,20 @@ export function generateTable(step, check, gpu = {}) {
 // round of its searches: T151)
 const samplingCell = (s) => `${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}`;
 
+/** T93: where the model page remembers the number of threads it found for a model on this device (localStorage).
+ * T190: /benchmark/ reads the same, so that the page path is timed on the model page's count. nav: the navigator */
+export const threadsKey = (id, nav) => `threads:${id}:${nav.hardwareConcurrency}:${nav.deviceMemory ?? ""}:${nav.userAgent}`;
+
+/** T190: how the page path's number of threads came about (worker.js's timedPaths), in a few words */
+export function threadsHow(how) {
+  if (!how) return "";
+  if (how.alone) return `: ${how.alone}`;
+  if (how.unfinished) return `: the search had not ended after ${how.unfinished} s`;
+  if (how.remembered) return ", as the model page remembers";
+  const verdicts = (how.searched ?? []).map(([best, candidate, kept]) => `${best} or ${candidate}: ${kept}`);
+  return verdicts.length ? `, searched here (${verdicts.join(", ")})` : "";
+}
+
 /** T184: the prompts the model page's path is timed on: one block of the GPU's (forward.js's GPU_BLOCK) and four; and
  * the tokens it writes after a prompt */
 export const PATH_PROMPTS = [64, 256];
@@ -474,7 +488,7 @@ export function pathTable(paths, name = "") {
   const title = `**The model page's path**${name ? ` (${name})` : ""}`;
   if (!paths || paths.error) return `${title}: failed: ${tableCell(paths?.error ?? "no answer")}`;
   const { gpu = {}, rows = [] } = paths;
-  const facts = [paths.threads !== undefined && `${paths.threads} software thread${paths.threads === 1 ? "" : "s"}`];
+  const facts = [paths.threads !== undefined && `${paths.threads} software thread${paths.threads === 1 ? "" : "s"}${threadsHow(paths.how)}`];
   if (gpu.why !== undefined) facts.push(`WebGPU: ${tableCell(gpuSkipped(gpu.why))}`);
   else if (gpu.lost) facts.push(`WebGPU stopped while timed: ${tableCell(gpu.lost)}`);
   else {

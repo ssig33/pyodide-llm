@@ -139,6 +139,25 @@ export function timedCell(runs, count) {
            unsteady: sorted.at(-1).ms * BETTER > sorted[0].ms };
 }
 
+// T190: the number of threads the page path is timed on is the model page's own. findThreads() started from the count
+// the model page remembers for this device and model (then there is no search), or from the logical cores; a search is
+// run here to its end on generations (write(): one of them, synchronous), as the model page ends it on its first texts.
+// T184 stopped it after 8 generations wherever it had come to: the owner's Android timed the path on 1 thread, where the
+// model page runs 4. A turn of the event loop between generations: the helpers a larger count needs start meanwhile.
+// SEARCH_SECONDS at most; ended says whether the search came to its end.
+export const SEARCH_SECONDS = 120;
+export async function endSearch(engine, write, { seconds = SEARCH_SECONDS } = {}) {
+  const until = performance.now() + seconds * 1000;
+  let generations = 0;
+  while (engine.searching && performance.now() < until) {
+    write();
+    generations += 1;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const ended = !engine.searching, found = engine.threads;
+  return { threads: await engine.setThreads(found), found, ended, generations };
+}
+
 /** The kernels as WebAssembly modules. The relaxed one fails to compile where relaxed SIMD is missing (Safari):
  * then int8 runs on matmul_q8. wide (T101): the build for a 64-bit memory (simdkernel_*64.wasm). */
 export function compileKernels(plain, relaxed, wide = false) {

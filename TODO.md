@@ -852,9 +852,12 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 
 - **持ち主の判断（2026-09-27）: 完了**（「完了にする」）。arm64 の DRAM の大きさで 1.26 倍と 1.3 倍にわずかに届かないが、x86 は 1.64 倍、出力はビット単位で同じ。差分は本会話が確かめた（カーネルの小さな直し）。本線に入れた。
 ### T190 [調査] ベンチのモデルの節が「1 software thread」で測っている — 状態: **レビュー中**（Opus xhigh、ブランチ `t190-bench-threads`）
+### T190 [調査] ベンチのモデルの節が「1 software thread」で測っている — 状態: **レビュー待ち**（ブランチ `t190-bench-threads`、Opus medium。2026-09-27、持ち主の Android の /benchmark/（site 61c9219）から。規模 小）
 - 見たもの: モデルの節のページの経路の表の頭が「1 software thread」。同じ報告の CPU の節では 4 本が最速（1 トークン 8.8 ms・113 tok/s。1 本は 16.4 ms・61 tok/s）。「CPU only」の書くことは 107 tok/s、プロンプトは 232 tok/s。T184 のベンチはスレッドの検索を最大 8 回の生成で止めるので、検索が 1 本のまま止まった見込み（未確認）。
 - 調べること: (1) モデルのページでも同じ端末で 1 本を選んでいるか（コンソールの `threads:` の行）。(2) ベンチの 8 回で検索が終わらないなら、終わるまで待つか、表の頭に「検索の途中」と書く。(3) 1 本が本当に速いなら理由。
 - **持ち主の端末の答え（2026-09-27）**: モデルのページのステータス行は「llm-jp-3 150M · SIMD kernels, int8, relaxed SIMD, 4 threads, prompts on WebGPU where it is faster than the CPU」。ページは 4 本を選んでいるので、1 本はベンチ（T184 の経路の表）だけの誤り。ベンチの表を、ページが選ぶ本数で測るように直す。
+- **入れたもの（2026-09-27、Opus medium）**: 元ネタは無い（シェーダではない）。(1) `/benchmark/` のモデルの節は、モデルのページが覚えた本数（`localStorage` の `threads:<モデル>:<論理コア>:<メモリ>:<UA>`、鍵は `src/bench.js` の `threadsKey()` を両ページで共有）を `remembered` で Worker に渡す（モデルのページと同じ形。検索しない。T45 のラウンドも同じ本数になる）。ベンチは本数を書かない。(2) 覚えていなければ、ページの経路の前に検索を最後まで進める（`forward.js` の `endSearch()`: 64 ステップの生成を繰り返し、間にイベントループを返す。上限 120 秒）。8 回で止める形は外した。(3) 表の頭に本数の出どころ（`threadsHow()`）: 「4 software threads, as the model page remembers」「4 software threads, searched here (8 or 4: 4, 4 or 2: 4)」「…: the search had not ended after 120 s」、1 本の訳「1 software thread: no shared memory here」「…: not the 4 asked for: a software thread stopped」。持ち主の Android の 1 本の訳は、次の報告の頭で分かる。`forward.js` は `endSearch()` を `timePrompts()` の隣に足しただけ（GPU の部分は触っていない）。
+- **確かめ**（T188: 手元は `node --check` だけ）: CI の `tests.yml --ref t190-bench-threads`（`bench.mjs` の頭の文と鍵、`gpu-default-check.mjs` の検索の終わりと覚えた本数）、`extra=` でわざと壊した forward.js（`endSearch` を 1 回の生成で止める）で gpu-default-check が落ちること。画面は `preview.yml`（`model=stories15M`。preview.yml が組むのは stories260K と stories15M だけで llm-jp-3 150M は無い）で表の頭の本数が 1 でなく、出どころの文があること。持ち主の端末: `/benchmark/` のモデルの節（llm-jp-3 150M）で頭が「4 software threads, as the model page remembers」になるか。
 
 ### T192 [運用] レビューを付けずに本線に入れたものを、後でまとめてレビューする — 状態: 未着手（2026-09-27、持ち主「将来レビューすることにしない？」。規模 中）
 - 対象: T145（道具・試験・画面の文）、T177（ベンチの進みの表示）、T183（WebGPU の試験を CI で）、T185（報告の要約）、T186（ベンチの小さな直し）。どれも本線にあり、台帳に Opus xhigh のレビューの行が無い。

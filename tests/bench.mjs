@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, PASTE, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, gpuSummary, lineSummary,
          loginUrl, parseReport, reportBody, shortReport, storageSummary,
-         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -331,6 +331,21 @@ assert.ok(float32.includes("WebGPU: float32 weights are not on the GPU yet") && 
 assert.equal(pathTable({ error: "a | b" }, "x"), "**The model page's path** (x): failed: a \\| b");
 assert.ok(!pathTable(undefined).includes("undefined"));
 for (const text of [pathTable(real), stopped, onFallback, float32]) assert.ok(!text.includes("undefined") && !text.includes("NaN"), text);
+// T190: the page path's threads are the model page's: the count it remembers (same key on both pages), or the search's
+// verdicts here, or why there is one thread
+const nav = { hardwareConcurrency: 8, deviceMemory: 8, userAgent: "Mozilla/5.0 (Linux; Android 15)" };
+assert.equal(threadsKey("llm-jp-3-150m", nav), "threads:llm-jp-3-150m:8:8:Mozilla/5.0 (Linux; Android 15)");
+assert.equal(threadsKey("x", { hardwareConcurrency: 4, userAgent: "u" }), "threads:x:4::u", "no deviceMemory (Safari, Firefox)");
+for (const page of ["index.astro", "benchmark.astro"]) {
+  assert.ok(/threadsKey as sharedThreadsKey|threadsKey\(entry\.id, navigator\)/.test(fs.readFileSync(new URL(`../src/pages/${page}`, import.meta.url), "utf8")),
+    `${page} keys the remembered threads with src/bench.js's threadsKey`);
+}
+const headOf = (how, threads = 4) => pathTable({ ...real, threads, how }).split("\n")[0];
+assert.ok(headOf({ remembered: true }).includes("4 software threads, as the model page remembers ·"), headOf({ remembered: true }));
+assert.ok(headOf({ searched: [[8, 4, 4], [4, 2, 4]] }).includes("4 software threads, searched here (8 or 4: 4, 4 or 2: 4) ·"));
+assert.ok(headOf({ unfinished: 120 }).includes("4 software threads: the search had not ended after 120 s ·"));
+assert.ok(headOf({ alone: "no shared memory here" }, 1).includes("1 software thread: no shared memory here ·"));
+assert.ok(headOf({ searched: [] }).includes("4 software threads ·"), "no search: nothing more");
 assert.deepEqual(PATH_PROMPTS, [64, 256]);
 assert.equal(PATH_WRITES, 64);
 // in the report, under the rounds' table: parseReport() still reads the rounds alone
