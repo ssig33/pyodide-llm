@@ -349,7 +349,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
       const r = answer.result;
       if (r.none) return { status: "none", markdown: r.none };
       const c = r.ceilings ?? {};
-      const cutShort = [...(c.read ?? []), c.dot, c.fma].some((one: any) => one?.cutShort);
+      const cutShort = [...(c.read ?? []), c.dot, c.dotRegisters, c.fma].some((one: any) => one?.cutShort);
       const notFinite = r.rows.some((row: any) => row.finite === false);
       const lines = cpuTable(r);
       if (notFinite) lines.push("", "**The logits were not finite numbers: the forward pass computed something wrong.**");

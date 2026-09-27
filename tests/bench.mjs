@@ -116,27 +116,30 @@ assert.equal(cpuBaseline({ status: "error", markdown: "stopped" }).why, "the CPU
 assert.equal(cpuBaseline({ status: "wrong", data: cpuSection.data }).why, "the CPU section computed something wrong");
 assert.equal(cpuBaseline({ status: "none", markdown: "no WebAssembly SIMD" }).why, "the CPU section found nothing to run on here");
 assert.ok(cpuBaseline({ status: "ok", data: { rows: [{ asked: 1, none: "x" }] } }).why);
-// T163: the CPU section's table with the ceilings beside it: a token's GB/s against reading alone with as many threads,
-// the prompt's G MAC/s with one thread against relaxed_dot (125.8 M weights in the layers: 5.80 ms a token is 21.7)
-const ceilingsOf = (read, extra = {}) => ({ read, dot: { GMACs: 43.4 }, fma: { GMACs: 12.1 }, ...extra });
-const cpuResult = { backend: "SIMD kernels", shared: true, megabytes: 211, layerWeights: 125829120, rows: cpuSection.data.rows,
+// T163: the CPU section's table with the ceilings beside it: a token's reads against reading alone with as many threads
+// (211 MB of checkpoint and 23.4 MB of corrections: 18.9 GB/s of checkpoint reads 21.0, 56% of 37.8), the prompt's
+// G MAC/s with one thread against relaxed_dot with its loads (121.6 M weights in the layers: 5.80 ms a token is 21.0)
+const ceilingsOf = (read, extra = {}) => ({ read, dot: { GMACs: 43.4 }, dotRegisters: { GMACs: 67.9 }, fma: { GMACs: 8.3 }, ...extra });
+const cpuResult = { backend: "SIMD kernels", shared: true, megabytes: 211, tokenMegabytes: 234.4, layerWeights: 121634816, rows: cpuSection.data.rows,
   ceilings: ceilingsOf([{ threads: 1, GBps: 37.8 }, { threads: 2, GBps: 41 }, { threads: 4, GBps: 57.4, unsteady: true }, { threads: 8, error: "x | y" }]) };
 const cpuLines = cpuTable(cpuResult);
-assert.ok(cpuLines.includes("| 1 | 11.2 | 18.9 (50%) | 89.3 | 5.80 | 21.7 (50%) |"), cpuLines.join("\n"));
-assert.ok(cpuLines.includes("| 2 | 10.3 | 20.5 (50%) | 97.1 | 4.50 | 28.0 |"), "no share for the prompt past one thread");
-assert.ok(cpuLines.includes("| 4 | 7.3 | 28.7 | 137.0 | 2.77 | 45.4 |"), "no share against an unsteady ceiling");
+assert.ok(cpuLines.includes("| 1 | 11.2 | 18.9 (56%) | 89.3 | 5.80 | 21.0 (48%) |"), cpuLines.join("\n"));
+assert.ok(cpuLines.includes("| 2 | 10.3 | 20.5 (56%) | 97.1 | 4.50 | 27.0 |"), "no share for the prompt past one thread");
+assert.ok(cpuLines.includes("| 4 | 7.3 | 28.7 | 137.0 | 2.77 | 43.9 |"), "no share against an unsteady ceiling");
 assert.ok(cpuLines.includes("| 8 | the browser did not start that many software threads | | | | |"));
 assert.ok(cpuLines.includes("| reading alone | 4 | unsteady: 57.4 GB/s |"));
 assert.ok(cpuLines.includes("| reading alone | 8 | failed: x \\| y |"), "a | in a cell");
 assert.ok(cpuLines.includes("| relaxed_dot with its two loads (int8) | 1 | 43.4 G MAC/s |"));
-assert.ok(cpuLines.includes("| f32 multiply + add, registers only | 1 | 12.1 G MAC/s |"));
-// Safari: no relaxed SIMD, so no dot ceiling and no share for the prompt
-const safari = cpuTable({ ...cpuResult, ceilings: ceilingsOf([{ threads: 1, GBps: 37.8 }], { dot: { none: "no relaxed SIMD in this browser" } }) });
+assert.ok(cpuLines.includes("| relaxed_dot, registers only | 1 | 67.9 G MAC/s |"));
+assert.ok(cpuLines.includes("| f32 multiply + add, registers only | 1 | 8.3 G MAC/s |"));
+// Safari: no relaxed SIMD, so no dot ceilings, no share for the prompt, and no corrections read (matmul_q8)
+const safari = cpuTable({ ...cpuResult, tokenMegabytes: 211, ceilings: ceilingsOf([{ threads: 1, GBps: 37.8 }], { dot: { none: "no relaxed SIMD in this browser" }, dotRegisters: { none: "no relaxed SIMD in this browser" } }) });
+assert.ok(safari.includes("| relaxed_dot, registers only | 1 | not in this browser |"));
 assert.ok(safari.includes("| relaxed_dot with its two loads (int8) | 1 | not in this browser |"));
-assert.ok(safari.includes("| 1 | 11.2 | 18.9 (50%) | 89.3 | 5.80 | 21.7 |"), safari.join("\n"));
+assert.ok(safari.includes("| 1 | 11.2 | 18.9 (50%) | 89.3 | 5.80 | 21.0 |"), safari.join("\n"));
 // the ceilings could not start: the forward pass stands, the ceilings say why
 const unstarted = cpuTable({ ...cpuResult, ceilings: { error: "Error: the ceilings' loops could not be fetched" } });
-assert.ok(unstarted.includes("| 1 | 11.2 | 18.9 | 89.3 | 5.80 | 21.7 |") && unstarted.at(-1).startsWith("Not measured: Error"), unstarted.join("\n"));
+assert.ok(unstarted.includes("| 1 | 11.2 | 18.9 | 89.3 | 5.80 | 21.0 |") && unstarted.at(-1).startsWith("Not measured: Error"), unstarted.join("\n"));
 // a report from before T163 (no ceilings, no layerWeights) still makes a table
 assert.ok(cpuTable({ ...cpuResult, layerWeights: undefined, ceilings: undefined }).includes("| 1 | 11.2 | 18.9 | 89.3 | 5.80 | ? |"));
 // the counts of threads: doubling up to the logical cores, and the cores themselves

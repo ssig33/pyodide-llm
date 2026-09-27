@@ -197,21 +197,30 @@ async function cpu(counts = [1, 2, 4]) {
       blocks.sort((a, b) => a - b);
       rows.push({ asked, threads, msPerToken: ms, GBps: model.size / (ms / 1000) / 1e9,
                   promptMsPerToken: blocks[blocks.length >> 1] / PROMPT.length, finite: logits.every(Number.isFinite) });
-      // T163: the reading ceiling at the same count, right after it (a phone that warms up slows both alike)
+      // T163: the ceilings right after the row they are held against (a phone that warms up slows both alike): reading
+      // at the same count, and the compute loops after the row of one thread
       if (ceilings) ceilings.read.push({ threads, ...(await attempt(() => ceilings.reading(threads))) });
-    }
-    if (ceilings) {
-      ceilings.dot = ceilings.relaxed ? await attempt(ceilings.dotting) : { none: "no relaxed SIMD in this browser" };
-      ceilings.fma = await attempt(ceilings.fmaing);
+      if (ceilings && threads === 1) {
+        const none = { none: "no relaxed SIMD in this browser" };
+        ceilings.dot = ceilings.relaxed ? await attempt(ceilings.dotting) : none;
+        ceilings.dotRegisters = ceilings.relaxed ? await attempt(ceilings.dottingRegisters) : none;
+        ceilings.fma = await attempt(ceilings.fmaing);
+      }
     }
   } finally {
     engine.release();
     ceilings?.stop();
   }
-  const { read, dot, fma } = ceilings ?? {};
-  return { backend: engine.backend, shared, megabytes: model.size / 1e6, layerWeights: layerWeights(model),
-           rows, ceilings: ceilings ? { read, dot, fma } : { error: ceilingsFailed } };
+  const { read, dot, dotRegisters, fma } = ceilings ?? {};
+  return { backend: engine.backend, shared, megabytes: model.size / 1e6, tokenMegabytes: tokenBytes(model, kernels) / 1e6,
+           layerWeights: layerWeights(model), rows, ceilings: ceilings ? { read, dot, dotRegisters, fma } : { error: ceilingsFailed } };
 }
+
+// what a token reads: the checkpoint, and with relaxed SIMD matmul_q8r's corrections too (a float32 for each group of
+// every int8 matrix: 23.4 MB here). The GB/s column stays the checkpoint's (T157 turns it into other models' speeds);
+// its share of reading alone counts these bytes (T163's review). Safari's matmul_q8 reads no corrections.
+const tokenBytes = ({ plan, size }, kernels) => size + (kernels.relaxed ? Object.values(plan.tensors)
+  .filter((t) => t.kind === "int8").reduce((sum, t) => sum + (t.shape.reduce((a, b) => a * b, 1) / t.group) * 4, 0) : 0);
 
 // the weights of the layers' matrices: a multiply-add each for every token of a prompt (no classifier there)
 const layerWeights = ({ plan }) => ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
@@ -222,9 +231,10 @@ const layerWeights = ({ plan }) => ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
 // (the bytes a token reads); relaxed_dot with its two loads from L1 and f32 multiply + add on registers (G MAC/s), one
 // thread. Timed as the GPU section's ceilings are (T168): passes doubled until one run takes PAIR_MS, then PAIRS runs of
 // n and of 2n passes, the median of the differences; a ratio of 2n to n past STEADY takes the pairs once more, then is
-// unsteady. The watch on a loop the compiler cut short: its checksum of n passes must be the one computed here, and it
-// must take PAIR_MS by MOST_PASSES (cutShort: the section is then wrong, as for logits that are not finite).
-const PAIR_MS = 20, PAIRS = 5, STEADY = [1.6, 2.2], MOST_PASSES = 2 ** 30;
+// unsteady. The watch on a loop the compiler cut short: its checksum of n passes must be the one computed here, it
+// must take PAIR_MS by MOST_PASSES, and 2n passes must take at least SHORT times n (a loop whose passes were dropped
+// takes the same time for any count: T163's review). cutShort: the section is then wrong, as for logits not finite.
+const PAIR_MS = 20, PAIRS = 5, STEADY = [1.6, 2.2], SHORT = 1.3, MOST_PASSES = 2 ** 30;
 const cutShort = (message) => Object.assign(new Error(message), { cutShort: true });
 const middle = (values) => [...values].sort((a, b) => a - b)[values.length >> 1];
 // run(n): the ms of n passes; right(n): whether the loop's checksum of n passes is the one computed here
@@ -244,7 +254,7 @@ function paired(run, right) {
     const ratio = middle(ratios), took = middle(differences), steady = took > 0 && ratio >= STEADY[0] && ratio <= STEADY[1];
     if (steady) return { ms: took, passes: n, ratio };
     if (tries) {
-      if (!(took > 0)) throw cutShort(`${2 * n} passes took no longer than ${n}: the loop was compiled away, or the load moved`);
+      if (!(took > 0) || ratio < SHORT) throw cutShort(`${2 * n} passes took ${ratio.toFixed(2)} times as long as ${n}: the loop does not do its passes`);
       return { ms: took, passes: n, ratio, unsteady: true };
     }
   }
@@ -265,11 +275,14 @@ const rate = (work, r) => ({ rate: (work * r.passes) / (r.ms / 1000) / 1e9, pass
 // the checksum of the int loops: the lane j of their sum is n times one pass's (lanes[j]), wrapped to 32 bits
 const xorOf = (lanes, n) => lanes.reduce((x, lane) => x ^ Math.imul(n, lane), 0);
 
-// the control words of the reading threads, on a SharedArrayBuffer of their own (not a WebAssembly memory: T96)
-const GO = 0, DONE = 1, COUNT = 2, PASSES = 3, STOP = 4;
+// the control words of the reading threads, on a SharedArrayBuffer of their own (not a WebAssembly memory: T96): as
+// forward.js cuts a matrix's rows (T93), the weights are read a CHUNK at a time, each thread taking the next one from
+// NEXT until TOTAL (passes × chunks), so that a slow core (a little one of a big.LITTLE phone) takes fewer instead of
+// holding the others back (T163's review: equal parts read at the slowest thread's speed)
+const GO = 0, DONE = 1, COUNT = 2, TOTAL = 3, STOP = 4, NEXT = 5, CHUNK = 1 << 20, STARTING_MS = 30_000;
 
-// The loops on the memory of the made-up model, its weights at base (size bytes): nothing new is reserved (T96). The
-// forward pass must be done with the weights before dotting(), which makes 4 KB of them 7-bit (see ceilings_relaxed.ts).
+// The loops on the memory of the made-up model, its weights at base (size bytes): nothing new is reserved (T96).
+// dotting() makes 4 KB of them 7-bit for its loop (see ceilings_relaxed.ts) and puts them back after.
 async function ceilingsOf(memory, base, size, shared) {
   const kind = shared ? "shared" : "plain";
   const [plain, relaxed] = await Promise.all([`ceilings_${kind}.wasm`, `ceilings_relaxed_${kind}.wasm`].map((name) =>
@@ -277,63 +290,85 @@ async function ceilingsOf(memory, base, size, shared) {
   if (!plain) throw new Error("the ceilings' loops could not be fetched");
   const module = new WebAssembly.Module(plain);
   const loops = new WebAssembly.Instance(module, { env: { memory } }).exports;
-  let dot = null;
+  let dot = null, dotRegisters = null;
   try {
-    dot = relaxed && new WebAssembly.Instance(new WebAssembly.Module(relaxed), { env: { memory } }).exports.dot;
+    if (relaxed) ({ dot, dotRegisters } = new WebAssembly.Instance(new WebAssembly.Module(relaxed), { env: { memory } }).exports);
   } catch {
     // no relaxed SIMD here (Safari): the row says so
   }
-  // the weights, cut into equal parts of whole 64-byte steps, one for each thread
-  const partOf = (count) => Math.floor(size / count / 64) * 64;
+  const chunks = Math.floor(size / CHUNK), bytes = chunks * CHUNK;
   const control = shared ? new Int32Array(new SharedArrayBuffer(8 * 4)) : null;
   const readers = [];
+  let unstarted;  // a reading thread that did not start: no count past it can be read
   const started = async (count) => {
+    if (unstarted && count > readers.length) throw unstarted;
     while (readers.length < count - 1) {
       const worker = new Worker(at("benchmark/reader.js"), { type: "module" });
-      await new Promise((resolve, reject) => {
+      readers.push(worker);  // stop() ends it even where it never answers
+      let timer;
+      await Promise.race([new Promise((resolve, reject) => {
         worker.onmessage = resolve;
         worker.onerror = (event) => reject(new Error(event.message ?? "a reading thread did not start"));
-        worker.postMessage({ module, memory, control: control.buffer, base, size, share: readers.length + 1 });
-      });
-      readers.push(worker);
+        worker.postMessage({ module, memory, control: control.buffer, base, chunk: CHUNK, chunks, share: readers.length });
+      }), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`a reading thread did not start in ${STARTING_MS / 1000} seconds`)), STARTING_MS);
+      })]).catch((error) => {
+        unstarted = error;
+        throw error;
+      }).finally(() => clearTimeout(timer));
     }
   };
+  // one pass's sums of the int32 lanes of the weights read, for the checksum of the reading loop
+  const lanes = [0, 0, 0, 0];
+  const ints = new Int32Array(memory.buffer, base, bytes / 4);
+  for (let i = 0; i < ints.length; i++) lanes[i & 3] = (lanes[i & 3] + ints[i]) | 0;
   return {
     relaxed: Boolean(dot),
     read: [],
-    // reading alone with count threads: this worker reads the first part, the reading threads the others (the same
-    // loop: the checksum of this worker's part stands for them)
+    // reading alone with count threads, CHUNKs taken in turn (this worker and the reading threads); the checksum is of
+    // this worker's loop over all of them (the reading threads run the same loop)
     async reading(count) {
       await started(count);
-      const part = partOf(count);
-      const ints = new Int32Array(memory.buffer, base, part / 4), lanes = [0, 0, 0, 0];
-      for (let i = 0; i < ints.length; i++) lanes[i & 3] = (lanes[i & 3] + ints[i]) | 0;
       const r = paired((n) => {
-        if (count > 1) {
+        const began = performance.now();
+        if (count === 1) {
+          loops.read(base, bytes, n);
+        } else {
           Atomics.store(control, DONE, 0);
+          Atomics.store(control, NEXT, 0);
+          Atomics.store(control, TOTAL, n * chunks);
           Atomics.store(control, COUNT, count);
-          Atomics.store(control, PASSES, n);
           Atomics.add(control, GO, 1);
           Atomics.notify(control, GO);
+          for (let k; (k = Atomics.add(control, NEXT, 1)) < n * chunks;) loops.read(base + (k % chunks) * CHUNK, CHUNK, 1);
+          for (let done; (done = Atomics.load(control, DONE)) < count - 1;) Atomics.wait(control, DONE, done);
         }
-        const began = performance.now();
-        loops.read(base, part, n);
-        for (let done; count > 1 && (done = Atomics.load(control, DONE)) < count - 1;) Atomics.wait(control, DONE, done);
         return performance.now() - began;
-      }, (n) => loops.read(base, part, n) === xorOf(lanes, n));
-      const { rate: GBps, ...rest } = rate(part * count, r);
+      }, (n) => loops.read(base, bytes, n) === xorOf(lanes, n));
+      const { rate: GBps, ...rest } = rate(bytes, r);
       return { GBps, ...rest };
     },
     dotting() {
       const w = new Int8Array(memory.buffer, base, 4096), x = new Uint8Array(memory.buffer, base + 4096, 4096);
-      for (let i = 0; i < x.length; i++) x[i] &= 0x7f;
-      const lanes = [0, 0, 0, 0];
-      for (let i = 0; i < w.length; i++) lanes[(i >> 2) & 3] += w[i] * x[i];
-      const { rate: GMACs, ...rest } = rate(4096, paired(timed((n) => dot(base, n)), (n) => dot(base, n) === xorOf(lanes, n)));
+      const kept = x.slice();
+      try {
+        for (let i = 0; i < x.length; i++) x[i] &= 0x7f;
+        const sums = [0, 0, 0, 0];
+        for (let i = 0; i < w.length; i++) sums[(i >> 2) & 3] += w[i] * x[i];
+        const { rate: GMACs, ...rest } = rate(4096, paired(timed((n) => dot(base, n)), (n) => dot(base, n) === xorOf(sums, n)));
+        return { GMACs, ...rest };
+      } finally {
+        x.set(kept);
+      }
+    },
+    dottingRegisters() {
+      const loop = (n) => dotRegisters(n, 3, 5, 1);
+      const { rate: GMACs, ...rest } = rate(128, paired(timed(loop), (n) => loop(n) === dotRegistersSum(n)));
       return { GMACs, ...rest };
     },
     fmaing() {
-      const { rate: GMACs, ...rest } = rate(32, paired(timed((n) => loops.fma(n)), (n) => loops.fma(n) === fmaSum(n)));
+      const loop = (n) => loops.fma(n, 1, 0.9999, 1e-7);
+      const { rate: GMACs, ...rest } = rate(32, paired(timed(loop), (n) => loop(n) === fmaSum(n)));
       return { GMACs, ...rest };
     },
     stop() {
@@ -347,20 +382,33 @@ async function ceilingsOf(memory, base, size, shared) {
   };
 }
 
-// ceilings.ts's fma(n) in float32, one lane (the four are alike) of the 8 accumulators, which start at 0 to 7, rounded
-// as WebAssembly rounds each step
+// ceilings.ts's fma(n, 1, 0.9999, 1e-7) in float32, one lane (the four are alike) of the 8 accumulators, which start at
+// 0 to 7, rounded as WebAssembly rounds each step
 function fmaSum(n) {
-  const f = Math.fround, d = f(1e-7);
-  let w = f(1.0001), x = f(0.9999);
+  const f = Math.fround, d = f(1e-7), w = [1, 1.0009765625, 1.001953125, 1.0029296875];
+  let x = f(0.9999), y = f(x + 0.25);
   const a = [0, 1, 2, 3, 4, 5, 6, 7];
   for (let i = 0; i < n; i++) {
-    const p = f(w * x);
-    for (let k = 0; k < 8; k++) a[k] = f(a[k] + p);
-    w = f(w + d);
+    for (let k = 0; k < 4; k++) {
+      a[k] = f(a[k] + f(w[k] * x));
+      a[4 + k] = f(a[4 + k] + f(w[k] * y));
+    }
     x = f(x - d);
+    y = f(y - d);
   }
   const lane = f(f(f(a[0] + a[1]) + f(a[2] + a[3])) + f(f(a[4] + a[5]) + f(a[6] + a[7])));  // as the loop sums them
   return f(f(f(lane + lane) + lane) + lane);
+}
+
+// ceilings_relaxed.ts's dotRegisters(n, 3, 5, 1): a lane of each dot adds 4 × a × 5, a running 3, 4, 5, … as int8
+// (wrapping at 127); the 8 accumulators start at lanes 1000k + j, and the checksum sums the 4 lanes of all 8
+function dotRegistersSum(n) {
+  const int8 = (v) => ((v + 128) % 256 + 256) % 256 - 128;
+  // the sum of a over n passes: whole turns of 256 values add -128 each
+  let sum = Math.floor(n / 256) * -128;
+  for (let i = 0; i < n % 256; i++) sum += int8(3 + i);
+  const start = 4 * 28000 + 8 * 6;  // the accumulators' lanes: 1000k + j, k 0 to 7, j 0 to 3
+  return (start + Math.imul(32 * 20, sum | 0)) | 0;
 }
 
 // ---- the line. A fetch read to its end, or read no faster than rate (MB/s): each piece is taken only when the bytes

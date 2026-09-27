@@ -24,23 +24,26 @@ export function read(p: usize, bytes: usize, passes: i32): i32 {
   return i32x4.extract_lane(s, 0) ^ i32x4.extract_lane(s, 1) ^ i32x4.extract_lane(s, 2) ^ i32x4.extract_lane(s, 3);
 }
 
-// f32x4 mul + add on registers only, 8 accumulators (the form of matmul_f32 and of attention's scores; T158 found
-// relaxed_madd no faster under V8, so the page's kernels do not use it). 32 multiply-adds a pass. w and x move a
-// little each pass so that nothing is hoisted out of the loop. The checksum is the sum of the lanes of the sum of the
-// accumulators: the page repeats the passes in float32 (Math.fround) to the same bits.
-export function fma(passes: i32): f32 {
-  let w = f32x4.splat(1.0001), x = f32x4.splat(0.9999);
-  const d = f32x4.splat(1e-7);
-  // accumulators that start apart, so that the checksum sees each (one dropped would change it)
+// f32x4 mul + add on registers only, 8 accumulators (the form of matmul_f32 and of attention's scores): 32 multiplies
+// and 32 adds a pass, and two subtracts that move x and y (so that nothing is hoisted out of the loop). Each
+// accumulator has a product of its own (w0 to w3 times x or y): with one w and one x for all 8, Binaryen merged the
+// equal f32x4.mul into one and the loop measured 1 multiply and 8 adds (T163's review; T158's 12.1 G MAC/s was that
+// loop). w, x and the step come from the caller: V8 made every constant splat again inside the loop (movz, movk, dup
+// before each multiply). 15 registers, so that x86's 16 hold them all. The accumulators start apart (0 to 7) so that the checksum
+// (the sum of the lanes of their sum) sees each: the page repeats the passes in float32 (Math.fround) to the same bits.
+export function fma(passes: i32, w: f32, x0: f32, step: f32): f32 {
+  const w0 = f32x4.splat(w), w1 = f32x4.splat(w + 0.0009765625), w2 = f32x4.splat(w + 0.001953125), w3 = f32x4.splat(w + 0.0029296875);
+  let x = f32x4.splat(x0), y = f32x4.splat(x0 + 0.25);
+  const d = f32x4.splat(step);
   let a0 = f32x4.splat(0), a1 = f32x4.splat(1), a2 = f32x4.splat(2), a3 = f32x4.splat(3);
   let a4 = f32x4.splat(4), a5 = f32x4.splat(5), a6 = f32x4.splat(6), a7 = f32x4.splat(7);
   for (let i = 0; i < passes; i++) {
-    a0 = f32x4.add(a0, f32x4.mul(w, x)); a1 = f32x4.add(a1, f32x4.mul(w, x));
-    a2 = f32x4.add(a2, f32x4.mul(w, x)); a3 = f32x4.add(a3, f32x4.mul(w, x));
-    a4 = f32x4.add(a4, f32x4.mul(w, x)); a5 = f32x4.add(a5, f32x4.mul(w, x));
-    a6 = f32x4.add(a6, f32x4.mul(w, x)); a7 = f32x4.add(a7, f32x4.mul(w, x));
-    w = f32x4.add(w, d);
+    a0 = f32x4.add(a0, f32x4.mul(w0, x)); a1 = f32x4.add(a1, f32x4.mul(w1, x));
+    a2 = f32x4.add(a2, f32x4.mul(w2, x)); a3 = f32x4.add(a3, f32x4.mul(w3, x));
+    a4 = f32x4.add(a4, f32x4.mul(w0, y)); a5 = f32x4.add(a5, f32x4.mul(w1, y));
+    a6 = f32x4.add(a6, f32x4.mul(w2, y)); a7 = f32x4.add(a7, f32x4.mul(w3, y));
     x = f32x4.sub(x, d);
+    y = f32x4.sub(y, d);
   }
   const s = f32x4.add(f32x4.add(f32x4.add(a0, a1), f32x4.add(a2, a3)), f32x4.add(f32x4.add(a4, a5), f32x4.add(a6, a7)));
   return f32x4.extract_lane(s, 0) + f32x4.extract_lane(s, 1) + f32x4.extract_lane(s, 2) + f32x4.extract_lane(s, 3);
