@@ -330,7 +330,9 @@ kernel["attention_f16"](out16.ctypes.data, q.ctypes.data, keys.ctypes.data, valu
                         count - 1, heads, kv_heads, head_size, 3, heads)
 assert np.array_equal(out32, out16), "attention_f16 is not attention over the widened cache"
 # T160: every one of the 65536 halves widened, four at a time (one head of 65536) and one at a time (65536 heads of
-# one), keys and values: an infinity reads 65536 and a NaN 65536 times (1 + mantissa / 1024), as the kernel says
+# one): an infinity reads 65536 and a NaN 65536 times (1 + mantissa / 1024), as the kernel says. What shows is the
+# values' path: with one position a key's score does not reach the output (its weight is 1 whatever it is, NaN and
+# infinity aside), and neither does -0 (the output is summed from +0); the keys go through the same halves4 and half
 every = np.arange(65536, dtype=np.uint32).astype(np.uint16)
 top = (every & 0x7c00) == 0x7c00
 stand = np.where(top, np.where(every & 0x8000, -1.0, 1.0) * 65536.0 * (1 + (every & 0x3ff) / 1024.0),

@@ -98,8 +98,12 @@ bandwidth is full:
   in the cache. On one thread that is 1.16 times; with threads it is more (llm-jp-3-150m's prompt, 4 threads,
   2.91 times, the first development machine).
 - With threads, the KV cache is kept in float16: half the reads, which is faster when memory is the limit (4
-  threads at position 4000: 44 → 52-55 tok/s) and slower on one thread (38 → 21). Its quality cannot be told from
-  float32 (perplexity 29.957 against 30.094).
+  threads at position 4000: 44 → 52-55 tok/s) and slower on one thread (38 → 21), on the first development machine.
+  Its quality cannot be told from float32 (perplexity 29.957 against 30.094). Since T160 a float16 number is widened
+  in four instructions instead of seven (at position 4000, 1.14 to 1.35 times the tokens per second on the CI
+  runners), yet on those runners a float32 cache is still as fast or faster at 1, 2 and 4 threads, and 1.15 to 1.44
+  times faster for a model with grouped-query attention (Qwen2.5 0.5B at position 2000), which widens each key and
+  value once for every query head that shares it.
 
 The owner's Android (`/benchmark/`): one thread reads 12.9 to 18.9 GB/s for a token, 4 threads 27.6 to 28.7 GB/s;
 a prompt on 4 threads reaches 30.8 to 43.9 G multiply-adds per second.
