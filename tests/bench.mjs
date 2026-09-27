@@ -327,6 +327,34 @@ assert.ok(!layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" 
 assert.ok(layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" }).some((line) => line.includes("the device was lost")));
 assert.ok(layerStepsTable(stepsStep, layerWrong, layerCeilings).join("\n").includes('in "DP4A, fused (T175)" (WRONG in the check), µs a layer'));
 assert.deepEqual(layerStepsTable({ name: "the steps of a layer", error: "no | here" }), ["**Where a layer's time goes**: no \\| here"]);
+// T208: the forms chosen by the layer table's fastest (named in the head, with the partner's norms), or by the packed
+// int8 dot where it gave none (and why); the attention alone on its caches; the spares; the whole layer by timestamps
+// in one line, or why not
+const chosenStep = { ...stepsStep, result: { ...stepsStep.result, chosen: { by: "layer", fastest: "DP4A, fused (T175)" }, spares: 2, cycleMB: 137.2,
+  caches: { count: 512, MB: 134.2 }, timestamps: { layers: 32, rounds: 5, forms: [{ form: "DP4A, fused (T175), the norms apart", ms: 3.125 }, { form: "DP4A, fused (T175)", ms: 3.375 }] } } };
+const chosenLines = layerStepsTable(chosenStep, layerRight, layerCeilings), chosenText = chosenLines.join("\n");
+assert.ok(chosenLines[0].includes('the fastest fused layer of the table above that the check found right, "DP4A, fused (T175)", as the engine chooses it (T152), ' +
+  'and beside it the same with its norms apart: "DP4A, fused (T175), the norms apart" and "DP4A, fused (T175)"'), chosenLines[0]);
+assert.ok(chosenLines[0].includes("and of 2 spare matrices of random weights (none read again before 137 MB of other weights"), chosenLines[0]);
+assert.ok(chosenLines[0].includes("The attention alone reads 512 copies of the cache"), chosenLines[0]);
+assert.ok(chosenText.includes('The whole layer by the GPU\'s own clock (timestamp-query), a check of the times above: "DP4A, fused (T175), the norms apart" 3.13 ms (above: 3.25), ' +
+  '"DP4A, fused (T175)" 3.38 ms (above: 3.50) a layer, each the median of 5 submissions of 32 layers'), chosenText);
+const oneForm = { ...chosenStep, result: { ...chosenStep.result, chosen: { by: "layer", fastest: "llama.cpp, fused (T150), subgroups" },
+  forms: [{ ...stepsStep.result.forms[1], form: "llama.cpp, fused (T150), subgroups", check: "a layer, llama.cpp, fused (T150), subgroups" }], timestamps: { none: "no | clock" } } };
+const oneFormLines = layerStepsTable(oneForm, layerRight, layerCeilings);
+assert.ok(oneFormLines[0].includes('as the engine chooses it (T152): "llama.cpp, fused (T150), subgroups")'), oneFormLines[0]);
+assert.ok(oneFormLines.includes("The whole layer by the GPU's own clock (timestamp-query), a check of the times above: not here: no \\| clock."), oneFormLines.join("\n"));
+const byPacked = layerStepsTable({ ...stepsStep, result: { ...stepsStep.result, chosen: { by: "packed", why: "no layer table was timed before" } } }, layerRight, layerCeilings);
+assert.ok(byPacked[0].includes("by the packed int8 dot alone (no layer table was timed before: ONNX Runtime's DP4A, the packed int8 dot is here)"), byPacked[0]);
+assert.ok(layerStepsTable({ ...chosenStep, result: { ...chosenStep.result, timestamps: { error: "refused" } } }, layerRight, layerCeilings)
+  .some((line) => line.endsWith("a check of the times above: failed: refused.")));
+assert.ok(!stepsText.includes("GPU's own clock"), "no line where no timestamps were taken (a result before T208)");
+for (const [label, lines] of [["chosen", chosenLines], ["one form", oneFormLines], ["by packed", byPacked],
+  ["timestamps lost", layerStepsTable({ ...chosenStep, result: { ...chosenStep.result, timestamps: { layers: 32, rounds: 5, forms: [{ form: "DP4A, fused (T175)", ms: NaN }] } } }, layerRight, layerCeilings)]]) {
+  const rowsOf = lines.filter((line) => line.startsWith("|"));
+  for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
+  assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), `${label}: ${lines.join("\n")}`);
+}
 const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.form === "llama.cpp, fused (T150)" ? { ...row, unsteady: true } : row)) } };
 assert.ok(layerTable(unsteadyStep, layerRight).includes("| llama.cpp, fused (T150) | 5 | unsteady: 2.10 | 32.6 | 33.6 |  |"));
 // a fallback adapter's few hundredths of a GB/s still show

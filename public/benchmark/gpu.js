@@ -18,7 +18,8 @@
 //                                         quantized before each matrix
 //   { step: "layer steps" }               T202: where the time of a layer goes: each step of the fused forms a token
 //                                         would run here alone, the matrices alone, a dispatch that does next to
-//                                         nothing, and the whole layer, timed in turn, ms each
+//                                         nothing, and the whole layer, timed in turn, ms each (T208: the forms the
+//                                         layer table's fastest, and the whole layer by timestamps where they are)
 //   { step: "generate" }                  T151: tokens generated on the GPU (the sampling too), each read back as it
 //                                         comes against 4, 8 and 16 a submission read back once, ms a token; T191:
 //                                         each also with the sampling in chunks (many workgroups), and the sampling
@@ -75,7 +76,7 @@ async function gpu() {
   // as much of a buffer and of a binding as the adapter allows: the weights are the point. T146's tiled shaders use
   // shader-f16 and subgroups where the adapter has them (asked for only then: a device refuses a feature it lacks)
   device = await adapter.requestDevice({
-    requiredFeatures: ["shader-f16", "subgroups"].filter((name) => adapter.features.has(name)),
+    requiredFeatures: ["shader-f16", "subgroups", "timestamp-query"].filter((name) => adapter.features.has(name)),
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -752,6 +753,8 @@ const layerForms = () => {
 // ran in this worker and its verdict is ok: T175's review), else T150's fused one (generate() builds the fused forms
 // only; which is fastest on the device is the layer table's, and the engine's choice is T152's)
 let layerVerdicts;
+// T208: the layer table's rows (layer()), for the steps' table to break down the layer a token would run here
+let layerTimes;
 const DP4A_TOKEN = "DP4A, fused (T175)";
 const tokenForm = () => {
   const dp4a = packed && layerVerdicts?.[`a layer, ${DP4A_TOKEN}`]?.ok === true;
@@ -779,7 +782,7 @@ const quantizing = (pipes, group, x, into, uniform, n, step) => [pipes.quantize,
 // quantization, q, k and v's, o's, gate and up's, down's); u: the uniforms (step, flash, the matrices' Params, the norms'
 // attentionNorm and ffnNorm, and quantize: QUANTIZE's of dim and of hidden); group(pipeline, entries): a bind group
 function fusedLayer(form, pipes, { dim, hidden, heads }, m, cache, v, u, group) {
-  const attention = named("the attention (flash attention's tile)", "attention", [pipes.flash, group(pipes.flash, [[0, v.q], [1, cache.keys], [2, cache.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1]);
+  const attention = attentionStep(pipes, heads, cache, v, u, group);
   const rope = [[5, v.q], [6, cache.keys], [7, cache.values], [8, v.angles], [9, u.step]];
   // RMSNORM of the stream into xb (the forms with the norms apart)
   const norm = (params) => named("the norm (RMSNORM)", "small", [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1]);
@@ -808,6 +811,10 @@ function fusedLayer(form, pipes, { dim, hidden, heads }, m, cache, v, u, group) 
     attention, quantized(v.att, oIn, u.quantize[0], dim), product("o with the residual's add", "o", pipes.add, m.o, oIn, u.o, dim, [[5, v.h]]),
     ...normed(u.ffnNorm, gluIn), product("gate and up with SwiGLU", "gateUp", pipes.glu, m.gateUp, gluIn, u.gateUp, hidden, [[5, v.g]]),
     quantized(v.g, downIn, u.quantize[1], hidden), product("down with the residual's add", "down", pipes.add, m.down, downIn, u.down, dim, [[5, v.h]])];
+}
+// the attention of a fused layer (flash attention's tile) on cache ({ keys, values }: buffers, or T208's ranges of one)
+function attentionStep(pipes, heads, cache, v, u, group) {
+  return named("the attention (flash attention's tile)", "attention", [pipes.flash, group(pipes.flash, [[0, v.q], [1, cache.keys], [2, cache.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1]);
 }
 // T202: a dispatch of a fused layer with what it is (run() reads only its first five): step, its name in the steps'
 // table (the same name where two dispatches cost the same: the two norms, the quantizing of a vector of dim); kind,
@@ -839,8 +846,10 @@ async function layerPipes(shape, form) {
 }
 // A layer's buffers: copies of its four matrices (data: the check's weights, else random), the vectors, the norms'
 // weights, the angles of the position, the cache (positions up to pos), and the uniforms. owned: where they go to be
-// destroyed. dispatches(form, pipes, copy): one layer's, [pipeline, bind group, x, y] each.
-function layerParts(shape, pos, copies, owned, data) {
+// destroyed. dispatches(form, pipes, copy): one layer's, [pipeline, bind group, x, y] each. reach (T208, the steps'
+// table): the bytes every matrix's ranges (ranges()) make at the least, spare buffers of random weights beside the
+// copies where they fall short, and the attention's caches (caches()) as many.
+function layerParts(shape, pos, copies, owned, data, reach = 0) {
   const { dim, hidden, heads, kvHeads, headSize, kvDim } = shape;
   const make = (bytes, usage = STORAGE | COPY_DST | COPY_SRC) => {
     const b = buffer(bytes, usage);
@@ -852,22 +861,22 @@ function layerParts(shape, pos, copies, owned, data) {
     device.queue.writeBuffer(b, 0, bytes);
     return b;
   };
+  // a matrix's weights and scales, the check's (given) or random
+  const matrixOf = (key, [rows, n], given) => {
+    if (rows * n > device.limits.maxStorageBufferBindingSize) throw new Error(`${key} is past a binding of this device`);
+    const w = make(rows * n), s = make((rows * n / GROUP) * 4);
+    if (given) {
+      device.queue.writeBuffer(w, 0, given.w);
+      device.queue.writeBuffer(s, 0, given.s);
+    } else {
+      fill(w, rows * n);
+      device.queue.writeBuffer(s, 0, floats(rows * n / GROUP, 0.002));
+    }
+    return { w, s, rows, n };
+  };
   const copiesOf = [];
   for (let c = 0; c < copies; c++) {
-    const one = {};
-    for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
-      if (rows * n > device.limits.maxStorageBufferBindingSize) throw new Error(`${key} is past a binding of this device`);
-      const w = make(rows * n), s = make((rows * n / GROUP) * 4);
-      if (data) {
-        device.queue.writeBuffer(w, 0, data[key].w);
-        device.queue.writeBuffer(s, 0, data[key].s);
-      } else {
-        fill(w, rows * n);
-        device.queue.writeBuffer(s, 0, floats(rows * n / GROUP, 0.002));
-      }
-      one[key] = { w, s, rows, n };
-    }
-    copiesOf.push(one);
+    copiesOf.push(Object.fromEntries(Object.entries(shape.matrices).map(([key, size]) => [key, matrixOf(key, size, data?.[key])])));
   }
   const cacheBytes = (pos + 1) * kvDim * 2;
   const v = { h: make(dim * 4), xb: make(dim * 4), q: make(dim * 4), k: make(kvDim * 4), v: make(kvDim * 4), att: make(dim * 4),
@@ -952,12 +961,38 @@ function layerParts(shape, pos, copies, owned, data) {
   // matrices once in a round of its copies (T149's review: a matrix read again soon is read from the GPU's caches, and
   // o's two copies alone would be 9.4 MB a round, q, k and v's 14.2, down's 37.7). A range starts on a binding's
   // alignment, 256 bytes, its scales an eighth of the way in (so 2048 bytes of the weights)
+  // T208: spare matrices (the largest's size, random) where the copies' ranges make fewer than reach bytes of a matrix:
+  // T202 left gate and up two ranges of Llama 3.2 1B's, 75.5 MB a round (the copies' gate and up buffers alone), short
+  // of T149's 128 MiB; two spares make it four, 151 MB, and the other matrices' rounds longer
+  const spares = [];
   const ranges = (key) => {
     const [rows, n] = shape.matrices[key], bytes = rows * n;
-    return copiesOf.flatMap((one) => Object.values(one).flatMap((matrix) =>
+    return [...copiesOf.flatMap((one) => Object.values(one)), ...spares].flatMap((matrix) =>
       [...Array(Math.floor((matrix.rows * matrix.n) / bytes))].map((_, k) => k * bytes).filter((at) => at % 2048 === 0)
-        .map((at) => ({ w: { buffer: matrix.w, offset: at, size: bytes }, s: { buffer: matrix.s, offset: at / 8, size: bytes / 8 }, rows, n }))));
+        .map((at) => ({ w: { buffer: matrix.w, offset: at, size: bytes }, s: { buffer: matrix.s, offset: at / 8, size: bytes / 8 }, rows, n })));
   };
+  const largest = Object.entries(shape.matrices).sort(([, a], [, b]) => b[0] * b[1] - a[0] * a[1])[0];
+  while (Object.entries(shape.matrices).some(([key, size]) => ranges(key).length * matrixBytes(size) < reach)) spares.push(matrixOf(...largest));
+  // T208: the attention's caches for the step timed alone, each a copy of the cache the layer starts from, in one
+  // buffer (a cache's keys, then its values, each on a binding's alignment), as many as make reach bytes: T202 read the
+  // one cache of 256 KB again and again, from the GPU's caches, where a token's 16 layers each read their own after
+  // the other layers' weights. Made when first asked for (the steps' table only)
+  let cacheRanges;
+  const caches = () => {
+    if (cacheRanges) return cacheRanges;
+    const stride = Math.ceil(cacheBytes / 256) * 256, count = Math.max(1, Math.ceil(reach / (2 * stride)));
+    const all = make(2 * stride * count, STORAGE | COPY_DST);
+    const encoder = device.createCommandEncoder();
+    cacheRanges = [...Array(count)].map((_, i) => {
+      encoder.copyBufferToBuffer(v.keys, 0, all, 2 * i * stride, cacheBytes);
+      encoder.copyBufferToBuffer(v.values, 0, all, (2 * i + 1) * stride, cacheBytes);
+      return { keys: { buffer: all, offset: 2 * i * stride, size: cacheBytes }, values: { buffer: all, offset: (2 * i + 1) * stride, size: cacheBytes } };
+    });
+    device.queue.submit([encoder.finish()]);
+    return cacheRanges;
+  };
+  // T208: the attention alone on a cache of caches()
+  const attention = (pipes, cache) => attentionStep(pipes, heads, cache, v, u, group);
   // T202: a matrix of the layer alone on a range of ranges(key), into the scratch buffer (no RoPE, cache, add or
   // SwiGLU after it): its plain matrix × vector (pipeline: mulMatVec, or ortDp4aMatVec reading the quantized vector
   // the fused form reads), one dispatch over all its rows
@@ -974,7 +1009,7 @@ function layerParts(shape, pos, copies, owned, data) {
   // submission starts alike. What these steps do does not depend on the values (unlike SAMPLE's work, T191's review),
   // and the stream grows only by a bounded add a layer, so this keeps the submissions alike rather than their times
   const restart = () => device.queue.writeBuffer(v.h, 0, start.h);
-  return { vectors: v, reset, dispatches, ranges, alone, floor, restart };
+  return { vectors: v, reset, dispatches, ranges, caches, attention, alone, floor, restart, spares: spares.length };
 }
 // T202: the matrices of a layer (layerShape's keys, in the order of the DP4A forms' quantized inputs, v.quantized), and
 // as the steps' table names them
@@ -1296,13 +1331,14 @@ async function layer() {
     }
     rows.push(...timed.map((t) => t.row));
   });
+  layerTimes = rows;
   return { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, rows };
 }
 
 // ---- T202: where the time of a layer goes (T152's review: on the owner's Android the fastest layer took 3.36 ms, its
 // matrices read at the matrix × vector's 38.6 GB/s would take 1.77, and what the other 1.59 ms is was not measured).
-// The fused forms a token would run here (on DP4A where the packed int8 dot is: fused, and fused with the norms apart;
-// else llama.cpp's, both without subgroups, as tokenForm()), and for each:
+// The fused forms a token would run here (stepForms(), T208: the layer table's fastest fused form the check found
+// right, as the engine chooses, T152, and beside it the same with the norms folded or apart), and for each:
 //   - every step of it alone (one of its dispatches, the same name counted where two cost the same),
 //   - its four matrices alone (the plain matrix × vector over all of a matrix's rows, nothing folded into the write:
 //     the "1.77 ms"),
@@ -1310,27 +1346,34 @@ async function layer() {
 //   - the whole layer,
 // all timed in turn (interleaved(): n of each a submission, 2n less n, the rounds taken of every item alike). The
 // layer on the next copy of the weights each time, as layer() times it; a step or a matrix alone on the next range of
-// its size of all the copies' weights (layerParts' ranges(): T202's review, T149's), so that none is read again before
-// about as many bytes of others as a layer's copies (not from the GPU's caches).
+// its size of all the copies' weights and the spares (layerParts' ranges(): T202's review, T149's, T208), the
+// attention alone on the next of its caches (caches(), T208), so that none is read again before MATVEC_BYTES of others
+// (not from the GPU's caches).
 // Why each step alone and not the layer less one step: a step of 20 to 60 µs is 1 or 2% of a layer, about what a
 // layer's time moves from one pair to the next, so a difference of two layers could not tell it; alone it is repeated
 // until a submission takes SUBMISSION_MS. What alone leaves out, the layer less the sum of its steps says: what the
 // chain of different dependent dispatches costs beyond each on its own (a small step on a GPU full of the matrix's
 // workgroups waits for their tail). Each dispatch still waits for the one before it (the same buffers written), as
 // in the layer. The residual stream is written back before every submission (the adds write over it), so that every
-// submission starts alike; the attention reads the one cache of positions up to LAYER_POS (256 KB of keys and values,
-// in the GPU's caches, as in layer()).
+// submission starts alike; the whole layer's attention reads the one cache of positions up to LAYER_POS (256 KB of
+// keys and values), as in layer(): between two reads of it, a copy's weights (68 MB).
+// T208: then the whole layer once more by the GPU's own clock where the device gives timestamp-query (timestamps()).
 async function layerSteps() {
   await gpu();
   const shape = layerShape(MODELS["Llama 3.2 1B"]);
   const bytes = Object.values(shape.matrices).reduce((sum, matrix) => sum + matrixBytes(matrix), 0);
   const copies = fallback ? 1 : Math.ceil(MATVEC_BYTES / bytes);
-  const forms = LAYER_KINDS.filter((kind) => kind.fused && Boolean(kind.dp4a) === packed).map((kind) => ({ ...kind, subgroups: false }));
-  const result = { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, dp4a: packed };
+  const { forms, chosen } = stepForms();
+  const result = { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, dp4a: Boolean(forms[0]?.dp4a), chosen };
+  if (!forms.length) return { ...result, forms: [], steps: [] };
   return scoped(async (owned) => {
-    const parts = layerParts(shape, LAYER_POS, copies, owned);
-    // the fewest MB of weights read before the same ones again: the layer's copies, or a matrix's ranges
+    const parts = layerParts(shape, LAYER_POS, copies, owned, undefined, fallback ? 0 : MATVEC_BYTES);
+    const caches = parts.caches();
+    // the fewest MB of weights (or caches) read before the same ones again: the layer's copies, a matrix's ranges, or
+    // the attention's caches
     result.cycleMB = Math.min(copies * bytes, ...MATRIX_KEYS.map((key) => parts.ranges(key).length * matrixBytes(shape.matrices[key]))) / 1e6;
+    result.spares = parts.spares;
+    result.caches = { count: caches.length, MB: (caches.length * 2 * caches[0].keys.size) / 1e6 };
     await device.queue.onSubmittedWorkDone();
     // units: the dispatches of one unit each, on a copy or a range of the weights, taken in turn; a submission of n
     // units, the stream written back first
@@ -1348,7 +1391,7 @@ async function layerSteps() {
       };
     };
     // what is timed: a step { step, kind, matrix } or a form's layer { form }, each with its submission
-    const items = [], rows = [], seen = new Set();
+    const items = [], rows = [], seen = new Set(), layers = [];
     const add = (item, units) => items.push({ ...item, submission: timing(units) });
     for (const form of forms) {
       const row = { form: form.name, check: layerCheck(form), normApart: Boolean(form.normApart) };
@@ -1365,11 +1408,13 @@ async function layerSteps() {
           else row.steps.push({ step, count: 1 });
         });
         // each step not timed yet (the first of its name): a matrix's on every range of its size in turn (its other
-        // bindings as the layer's), the others' on the copies as the layer
+        // bindings as the layer's), the attention's on every cache in turn, the others' on the copies as the layer
         const fresh = each[0].map((d, k) => ({ d, k })).filter(({ d, k }) => !seen.has(d.step) && each[0].findIndex((e) => e.step === d.step) === k);
-        const stepUnits = await validated(async () => fresh.map(({ d: { matrix }, k }) => (matrix
-          ? parts.ranges(matrix).map((range) => [parts.dispatches(form, pipes, 0, { [matrix]: range })[k]]) : each.map((layer) => [layer[k]]))));
+        const stepUnits = await validated(async () => fresh.map(({ d: { matrix, kind }, k }) => (matrix
+          ? parts.ranges(matrix).map((range) => [parts.dispatches(form, pipes, 0, { [matrix]: range })[k]])
+          : kind === "attention" ? caches.map((cache) => [parts.attention(pipes, cache)]) : each.map((layer) => [layer[k]]))));
         add({ form: form.name }, each);
+        layers.push({ form: form.name, each });
         fresh.forEach(({ d: { step, kind, matrix } }, i) => {
           seen.add(step);
           add({ step, kind, ...(matrix ? { matrix } : {}) }, stepUnits[i]);
@@ -1381,8 +1426,9 @@ async function layerSteps() {
       }
     }
     if (!items.length) return { ...result, forms: rows, steps: [] };
-    // the matrices alone (on the plain matrix × vector of the forms' base) and the floor of a dispatch
-    const product = await compiled(packed ? WGSL.ortDp4aMatVec : WGSL.mulMatVec({ packed: false, subgroups: false }));
+    // the matrices alone (on the plain matrix × vector of the forms' base, with their subgroups or not) and the floor
+    // of a dispatch
+    const product = await compiled(forms[0].dp4a ? WGSL.ortDp4aMatVec : WGSL.mulMatVec({ packed: false, subgroups: forms[0].subgroups }));
     const alone = await validated(async () => MATRIX_KEYS.map((key) => parts.ranges(key).map((range) => [parts.alone(forms[0], product, key, range)])));
     alone.forEach((units, i) => add({ step: units[0][0].step, kind: "alone", matrix: MATRIX_KEYS[i] }, units));
     const floor = parts.floor(pipelinesFor().small);
@@ -1396,8 +1442,72 @@ async function layerSteps() {
       if (item.form) Object.assign(rows.find((row) => row.form === item.form), timed(results[i]));
       else steps.push({ step: item.step, kind: item.kind, ...(item.matrix ? { matrix: item.matrix } : {}), ...timed(results[i]) });
     });
-    return { ...result, forms: rows, steps };
+    postMessage({ alive: true });
+    return { ...result, forms: rows, steps, timestamps: await timestamps(parts, layers) };
   });
+}
+// T208: the fused forms the steps' table breaks down. The engine runs the fastest fused layer the check found right
+// (T152: T150's fusedMatVec, with subgroupAdd where subgroups are, and T175's fusedDp4aMatVec where the packed int8
+// dot is), so: the layer table's fastest fused row (layer(), which the page runs just before in this worker) that the
+// check found right, and beside it the same form with the norms folded or apart where there is one (the two differ
+// only in their norms, and how far their layers less those come apart is how far the run's times move). T202 took
+// DP4A's two where the packed int8 dot is and llama.cpp's elsewhere, which on a device whose fastest layer is another
+// (Apple, where ONNX Runtime does not use DP4A, or llama.cpp's with subgroups) broke down a layer no token runs. Where
+// the layer table gave no time (it failed, or ran in no worker before), as T202.
+function stepForms() {
+  const fused = layerForms().filter((form) => form.fused && !form.none);
+  const fastest = (layerTimes ?? []).filter((row) => row.fused && row.msPerLayer > 0 && layerVerdicts?.[row.check]?.ok === true)
+    .sort((a, b) => a.msPerLayer - b.msPerLayer).map((row) => fused.find((form) => form.name === row.form)).find(Boolean);
+  if (!fastest) {
+    const forms = LAYER_KINDS.filter((kind) => kind.fused && Boolean(kind.dp4a) === packed).map((kind) => ({ ...kind, subgroups: false }));
+    return { forms, chosen: { by: "packed", why: layerTimes ? "the layer table has no fused layer timed and found right" : "no layer table was timed before" } };
+  }
+  const partner = fused.find((form) => form !== fastest && form.base === fastest.base && form.subgroups === fastest.subgroups && Boolean(form.normApart) !== Boolean(fastest.normApart));
+  // in the layer table's order (the norms apart first)
+  return { forms: fused.filter((form) => form === fastest || form === partner), chosen: { by: "layer", fastest: fastest.name } };
+}
+// T208 (T202's review's (d)): the whole layer by the GPU's own clock, each form's: a submission of TIMESTAMP_LAYERS
+// layers (on the copies in turn, as layer() times them), each layer a compute pass of its own that writes a timestamp
+// as it begins and as it ends (llama.cpp's GGML_WEBGPU_GPU_PROFILE writes them a dispatch a pass). The forms in turn,
+// PAIRS rounds, a form's ms a layer the median of its rounds' means. A check of the whole layer only, one line of the
+// table: Chrome rounds a timestamp to 100 µs (unless its developer features are on), too coarse for a step of 20 to 60
+// µs, and each layer's time is off by up to that much; the mean of many layers evens it out where they do not start in
+// step with the clock (not checked). Against the submissions' times: those hold the wait of a submission, taken out
+// as the difference of 2n and n, while these hold only what runs on the GPU. { none } where the device gives no
+// timestamp-query, { error } where it failed.
+const TIMESTAMP_LAYERS = 32;
+async function timestamps(parts, layers) {
+  if (!device.features.has("timestamp-query")) return { none: "this device gives no timestamp-query (the GPU's own clock) to this page" };
+  if (!layers.length) return { none: "no form's layer ran" };
+  const count = fallback ? 1 : TIMESTAMP_LAYERS, rounds = fallback ? 1 : PAIRS;
+  try {
+    return await scoped(async (owned) => {
+      const set = device.createQuerySet({ type: "timestamp", count: 2 * count });
+      const resolved = buffer(16 * count, 0x200 | COPY_SRC);  // GPUBufferUsage.QUERY_RESOLVE
+      owned.push(resolved, { destroy: () => set.destroy() });
+      const means = layers.map(() => []);
+      for (let round = 0; round < rounds; round++) {
+        for (const [i, { each }] of layers.entries()) {
+          parts.restart();
+          const encoder = device.createCommandEncoder();
+          for (let l = 0; l < count; l++) {
+            const pass = encoder.beginComputePass({ timestampWrites: { querySet: set, beginningOfPassWriteIndex: 2 * l, endOfPassWriteIndex: 2 * l + 1 } });
+            each[(round * count + l) % each.length].forEach((d) => run(pass, d));
+            pass.end();
+          }
+          encoder.resolveQuerySet(set, 0, 2 * count, resolved, 0);
+          const stamps = new BigInt64Array(await readBack(encoder, resolved, 16 * count));
+          let ns = 0;
+          for (let l = 0; l < count; l++) ns += Number(stamps[2 * l + 1] - stamps[2 * l]);
+          means[i].push(ns / count / 1e6);
+        }
+        postMessage({ alive: true });
+      }
+      return { layers: count, rounds, forms: layers.map(({ form }, i) => ({ form, ms: middle(means[i]) })) };
+    });
+  } catch (error) {
+    return { error: String(error?.message ?? error) };
+  }
 }
 
 // ---- T151: generated tokens on the GPU (shaders.js's EMBED, fusedMatVec and SAMPLE): a token a compute pass, the

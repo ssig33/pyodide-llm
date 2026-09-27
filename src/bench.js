@@ -440,7 +440,11 @@ function layerSplit(r, form) {
  * the matrices alone read the weights at); gpu: {fallback, lost}. Under the table, for each form: the layer, its
  * steps' sum and what the chain costs beyond it, the matrices alone and the layer less them split into what fusing adds
  * to the matrices (their writes; the norm on the read and gate with up in one workgroup where so), the attention, the
- * norms and quantizing, and the chain. cycleMB: the fewest MB of weights read before the same ones again.
+ * norms and quantizing, and the chain. cycleMB: the fewest MB of weights read before the same ones again. T208: chosen,
+ * how the forms were chosen ({by: "layer", fastest}: the layer table's fastest fused form the check found right, and
+ * beside it the same with the norms folded or apart; {by: "packed", why}: as T202, by the packed int8 dot); caches,
+ * the attention's ({count, MB}: the step alone reads them in turn); timestamps, the whole layer by the GPU's own clock
+ * ({layers, rounds, forms: [{form, ms}]}, {none} or {error}), one line under the forms'.
  */
 export function layerStepsTable(step, check, ceilings, gpu = {}) {
   if (!step) return [];
@@ -452,18 +456,27 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
   const microseconds = (one) => (one?.error ? `failed: ${tableCell(one.error)}` : `${one?.unsteady ? "unsteady: " : ""}${stepMs(one) === undefined ? "?" : number(1000 * one.ms, 1)}`);
   const floor = r.steps.find((one) => one.kind === "floor"), forms = r.forms.filter((form) => !form.error);
   const GBps = (took) => (took === undefined ? "?" : `${number(r.GB / (took / 1000))} GB/s${reads ? `, ${number((100 * r.GB) / (took / 1000) / reads)}% of the buffer's reads (${number(reads)} GB/s)` : ""}`);
-  const lines = [`${title} (T202; ${r.model}'s width at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights a layer, ` +
-    `the layers a token would run here: on ${r.dp4a ? "ONNX Runtime's DP4A (the packed int8 dot is here)" : "llama.cpp's matrix × vector (no packed int8 dot here)"}, fused and fused with the norms apart). ` +
+  const named = forms.map((form) => `"${tableCell(form.form)}"`).join(" and ");
+  const which = r.chosen?.by === "layer"
+    ? `the layer a token would run here: the fastest fused layer of the table above that the check found right, "${tableCell(r.chosen.fastest)}", as the engine chooses it (T152)` +
+      `${forms.length > 1 ? `, and beside it the same with its norms ${forms.find((form) => form.form !== r.chosen.fastest)?.normApart ? "apart" : "folded in"}` : ""}`
+    : `the layers a token would run here by the packed int8 dot alone (${r.chosen?.why ? `${tableCell(r.chosen.why)}: ` : ""}` +
+      `${r.dp4a ? "ONNX Runtime's DP4A, the packed int8 dot is here" : "llama.cpp's matrix × vector, no packed int8 dot here"})`;
+  const lines = [`${title} (T202, T208; ${r.model}'s width at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights a layer, ${which}${named ? `: ${named}` : ""}). ` +
     "Each step of a layer alone, as a submission of 2n of its one dispatch less one of n; the four matrices alone (the plain matrix × vector over all of a matrix's rows, " +
     "nothing folded into what it writes: what the matrices themselves take); a dispatch of one workgroup that does next to nothing (what a step costs for being a dispatch in a chain); " +
     "and the whole layer: all timed in turn, the residual stream written back before every submission. " +
-    `The layer reads its copies of the weights in turn, a matrix alone or a step with a matrix the ranges of its size of all of them in turn${Number.isFinite(r.cycleMB) ? ` (none read again before ${number(r.cycleMB, 0)} MB of other weights` : " (none read again soon"}: not from the GPU's caches). ` +
+    `The layer reads its copies of the weights in turn, a matrix alone or a step with a matrix the ranges of its size of all of them in turn${r.spares ? ` and of ${r.spares} spare matrices of random weights` : ""}` +
+    `${Number.isFinite(r.cycleMB) ? ` (none read again before ${number(r.cycleMB, 0)} MB of other weights` : " (none read again soon"}: not from the GPU's caches). ` +
     "Each step alone, not the layer less that step: a small step is 1 or 2% of a layer, about what a layer's time moves from one pair of submissions to the next, " +
     "so the difference of two layers could not tell it; alone it is repeated until a submission takes long enough. What the steps alone leave out is the layer less their sum: " +
     "what a chain of different dispatches, each waiting for the one before, costs beyond each on its own. " +
     "The fused matrices less the matrices alone is what fusing adds to them: the writes folded in (RoPE and the cache, the residual's add, SwiGLU), in llama.cpp's fused form the norm folded into the read, " +
     "and gate with up in one workgroup, which can take less than the two alone (so this can come out less than nothing). " +
-    "The attention reads one cache (the positions up to this one) every time, in the GPU's caches as in the layer table.",
+    (r.caches?.count > 1
+      ? `The attention alone reads ${r.caches.count} copies of the cache (the keys and values of the positions up to this one) in turn, ${number(r.caches.MB, 0)} MB, so not from the GPU's caches, as a token's layers each read their own; ` +
+        "in the whole layer it reads one cache, with a copy of the layer's weights read between two reads of it, as in the layer table."
+      : "The attention reads one cache (the positions up to this one) every time, in the GPU's caches as in the layer table."),
   ...(none ? [`Read nothing from these times: ${none.replace(/^none:? /, "")}.`] : []), "",
   `| step | µs each | ${forms.map((form) => `in "${tableCell(form.form)}"${wrong(form) ? " (WRONG in the check)" : ""}, µs a layer`).join(" | ")} |`,
   `|---|---:|${forms.map(() => "---:|").join("")}`,
@@ -498,6 +511,22 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
     }
   }
   if (r.steps.some((one) => one.unsteady) || r.forms.some((form) => form.unsteady)) lines.push("", "Unsteady: the pairs of a submission of n and of 2n were not about twice each other, so those times are rough.");
+  // T208: the whole layer once more by the GPU's own clock
+  const t = r.timestamps;
+  if (t) {
+    const head = "The whole layer by the GPU's own clock (timestamp-query), a check of the times above";
+    if (t.none || t.error) lines.push("", `${head}: ${t.none ? "not here" : "failed"}: ${tableCell(t.none ?? t.error)}.`);
+    else {
+      const got = t.forms.map(({ form, ms }) => {
+        const above = stepMs(r.forms.find((one) => one.form === form));
+        return `"${tableCell(form)}" ${Number.isFinite(ms) && ms > 0 ? number(ms, 2) : "?"} ms (above: ${above === undefined ? "?" : number(above, 2)})`;
+      });
+      lines.push("", `${head}: ${got.join(", ")} a layer, each the median of ${t.rounds} submissions of ${t.layers} layers, each layer a compute pass that writes a timestamp as it begins and as it ends. ` +
+        "The times above are a submission of 2n layers less one of n, by the page's clock; these hold only what runs on the GPU, a layer at a time. " +
+        `Chrome rounds a timestamp to 100 µs (unless its developer features are on), so each layer's time is off by up to 0.1 ms and their mean over ${t.layers} by less, where the layers do not start in step with that clock. ` +
+        "Where the two agree to about that, the times above are the layers' work; where these are well below, the times above hold something besides it (what comes between one layer and the next, or of the submissions).");
+    }
+  }
   return lines;
 }
 
