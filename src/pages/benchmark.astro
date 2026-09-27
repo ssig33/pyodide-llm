@@ -396,16 +396,24 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const stages = 2 + rounds.length;
     let readies = 0, pathing = false;
     const prompt = entry.prompt || "Once upon a time";
+    const megabytes = (data: any) => `the model: ${(data.received / 1e6 || 0).toFixed(1)} / ${(data.total / 1e6).toFixed(1)} MB`;
     try {
       const listen = (resolve: (value: any) => void) => {
         w.onmessage = ({ data }) => {
+          // T205's review: a round's words and MB are of its load (the first load's ready counted, readies - 1 is the
+          // round being loaded), and its ready begins its writing: the stage names the round of either (it said the
+          // round before while the next one loaded, so a tab that went down in the load of "without the kernels" read
+          // as one in "everything")
+          const round = readies && !pathing ? rounds[Math.min(readies - 1, rounds.length - 1)].name : "";
           if (data.type === "status" && pathing) staged("model", { stage: `the page's path: ${data.text}`, at: 2, of: stages });
           else if (data.type === "status" && !readies) staged("model", { stage: data.text, at: 1, of: stages });
           else if (data.type === "progress" && !readies) {
-            staged("model", { stage: `the model: ${(data.received / 1e6 || 0).toFixed(1)} / ${(data.total / 1e6).toFixed(1)} MB`,
-                              at: 1, of: stages, part: data.received / data.total || 0 });
+            staged("model", { stage: megabytes(data), at: 1, of: stages, part: data.received / data.total || 0 });
+          } else if (data.type === "status" && round) staged("model", { stage: `round: ${round}: ${data.text}`, at: 2 + readies, of: stages });
+          else if (data.type === "progress" && round) {
+            staged("model", { stage: `round: ${round}: ${megabytes(data)}`, at: 2 + readies, of: stages, part: (data.received / data.total || 0) / 2 });
           } else if (data.type === "ready") {
-            if (readies) staged("model", { stage: `round: ${rounds[Math.min(readies - 1, rounds.length - 1)].name}`, at: 2 + readies, of: stages });
+            if (readies) staged("model", { stage: `round: ${round}: writing`, at: 2 + readies, of: stages, part: 0.5 });
             readies++;
             if (readies === 1) resolve(data);
           } else if (data.type === "bench" || data.type === "paths") resolve(data);
