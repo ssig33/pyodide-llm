@@ -3,6 +3,7 @@
 # so nothing is downloaded and no file is checked in.
 import json
 import random
+import unicodedata
 
 import pytest
 
@@ -62,18 +63,24 @@ def test_pretokenizers_follow_the_patterns(text):
     regex = pytest.importorskip("regex", reason="pip install regex to check the patterns themselves")
     assert pretokenize(text, "gpt2") == regex.findall(GPT2_PATTERN, text)
     assert pretokenize(text, "qwen") == regex.findall(QWEN_PATTERN, text)
-    digits = [part for chunk in regex.findall(r"\d|\D+", text) for part in regex.findall(GPT2_PATTERN, chunk)]
-    assert pretokenize(text, "gpt2-digits") == digits
+    assert pretokenize(text, "gpt2-digits") == digits_then_gpt2(regex, text)
+
+
+def digits_then_gpt2(regex, text):
+    """SmolLM2's pre_tokenizer: Digits(individual_digits) splits off every character Rust's char::is_numeric calls a
+    number (\\p{N}: ², Ⅱ and ① too, not only \\d), and GPT-2's pattern runs on each piece (T206)."""
+    return [part for chunk in regex.findall(r"\p{N}|\P{N}+", text) for part in regex.findall(GPT2_PATTERN, chunk)]
 
 
 # T200's review: a class of CharClasses or a translated pattern that is wrong shows only next to the characters it
 # concerns, which TEXTS has few of. Characters of every class and every kind the patterns name, each next to each.
-# (Not the characters where Python's unicodedata and the regex module disagree: \x1c to \x1f are spaces to
-# str.isspace and not to \s, and letters new in the regex module's Unicode; nor ſ, which (?i:'s) folds to s.)
+# (Not the letters new in the regex module's Unicode, where Python's unicodedata and the regex module disagree.)
+# T206: \x1c to \x1f (spaces to str.isspace, not to \s) and ſ (which (?i:'s) folds to s) are in, as the real one has them.
 PIECES = ["a", "b", "s", "t", "d", "m", "l", "r", "e", "v", "S", "T", "L", "D", "x", "'", "'s", "'LL", "'ve", "'T",
           " ", "  ", "\t", "\n", "\r", "\r\n", "\x0b", "\x0c", "\x85", "\xa0", " ", "　", "0", "7", "123",
           ".", ",", "!", "-", "_", "(", '"', "@", "é", "ß", "Ω", "я", "あ", "カ", "漢", "한", "ｱ", "Ａ", "１", "٣", "²", "Ⅻ",
-          "①", "́", "‍", "、", "。", "\U0001f600", "\U00020bb7", "\U0001d7ce", "\U00010140", "’"]
+          "①", "́", "‍", "、", "。", "\U0001f600", "\U00020bb7", "\U0001d7ce", "\U00010140", "’",
+          "\x1c", "\x1f", "ſ", "'ſ", "'ſt"]
 
 
 def test_pretokenizers_follow_the_patterns_on_random_texts():
@@ -85,8 +92,54 @@ def test_pretokenizers_follow_the_patterns_on_random_texts():
         text = "".join(rng.choices(PIECES, k=rng.randrange(0, 16)))
         for name, pattern in patterns.items():
             assert pretokenize(text, name) == regex.findall(pattern, text), (name, text)
-        digits = [part for chunk in regex.findall(r"\d|\D+", text) for part in regex.findall(GPT2_PATTERN, chunk)]
-        assert pretokenize(text, "gpt2-digits") == digits, text
+        assert pretokenize(text, "gpt2-digits") == digits_then_gpt2(regex, text), text
+
+
+# T206: the classes against the real pre_tokenizers themselves (Oniguruma's \s, \p{L}, \p{N} and (?i), and Rust's
+# char::is_numeric for Digits), at every code point but the surrogates. Each code point c goes into a few places that
+# tell its class apart: next to letters, to punctuation, to digits, after a space, and after an apostrophe (for (?i)'s
+# folds, of s, t, m, d and of the r, e, l of 're, 've, 'll).
+def around(c):
+    return f"a{c}a!{c}!1{c}1 {c}'{c}'{c}e'r{c}'{c}l\n"
+
+
+def real_pretokenizer(name):
+    from tokenizers import Regex, pre_tokenizers
+    byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+    if name == "gpt2":
+        return byte_level
+    if name == "gpt2-digits":
+        return pre_tokenizers.Sequence([pre_tokenizers.Digits(individual_digits=True), byte_level])
+    pattern = QWEN_PATTERN if name == "qwen" else QWEN_PATTERN.replace(r"|\p{N}|", r"|\p{N}{1,3}|")
+    return pre_tokenizers.Split(Regex(pattern), behavior="isolated")
+
+
+@pytest.mark.parametrize("name", ["gpt2", "gpt2-digits", "qwen", "llama3"])
+def test_pretokenizers_split_every_character_as_the_real_ones_do(name):
+    real = real_pretokenizer(name)
+
+    def ends(text):
+        """Where the real pieces end, and where the engine's do (the real offsets are the text's characters)."""
+        theirs = [end for _, (_, end) in real.pre_tokenize_str(text)]
+        mine, at = [], 0
+        for piece in pretokenize(text, name):
+            at += len(piece)
+            mine.append(at)
+        return theirs, mine
+
+    def differs(code):
+        theirs, mine = ends(around(chr(code)))
+        return theirs != mine
+
+    codes = [code for code in range(0x110000) if not 0xD800 <= code < 0xE000]
+    wrong = []
+    for start in range(0, len(codes), 4096):
+        chunk = codes[start:start + 4096]
+        theirs, mine = ends("".join(around(chr(code)) for code in chunk))
+        if theirs != mine:  # which of them
+            wrong += [code for code in chunk if differs(code)]
+    shown = ", ".join(f"U+{code:04X} ({unicodedata.category(chr(code))})" for code in wrong[:40])
+    assert not wrong, f"{name}: {len(wrong)} code points split otherwise than the real one: {shown}"
 
 
 def test_refuses_what_the_engine_cannot_split():

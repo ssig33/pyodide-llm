@@ -63,16 +63,20 @@ def number(char):
 
 class CharClasses(dict):
     r"""What the pre-tokenizer's patterns tell apart, one character for each character (T200): the ASCII letters,
-    the apostrophe, the space, \r and \n as they are (the contractions and the line breaks name them), any other
-    whitespace (str.isspace) "\t", any other letter (\p{L}) "a", a number (\p{N}) "0", anything else "!". A text goes
-    through str.translate() with it, and the standard re module runs the patterns on what comes out: \p{L} and
-    \p{N}, which re has not, become [A-Za-z] and 0. A character is classed the first time it is seen."""
+    the apostrophe, the space, \r and \n as they are (the contractions and the line breaks name them) and ſ (U+017F,
+    which (?i:'s) takes for s), any other whitespace "\t", any other letter (\p{L}) "a", a number (\p{N}) "0",
+    anything else "!". A text goes through str.translate() with it, and the standard re module runs the patterns on
+    what comes out: \p{L} and \p{N}, which re has not, become [A-Za-zſ] and 0. A character is classed the first time
+    it is seen.
+
+    Whitespace is what the real tokenizers' regex (Oniguruma) calls \s (T206): str.isspace less \x1c to \x1f, which
+    Oniguruma takes for neither whitespace nor a letter nor a number."""
 
     def __missing__(self, code):
         char = chr(code)
-        if char.isascii() and char.isalpha() or char in "' \r\n":
+        if char.isascii() and char.isalpha() or char in "' \r\nſ":
             kind = char
-        elif char.isspace():
+        elif char.isspace() and not "\x1c" <= char <= "\x1f":
             kind = "\t"
         elif letter(char):
             kind = "a"
@@ -85,14 +89,16 @@ class CharClasses(dict):
 
 
 CHAR_CLASSES = CharClasses()
-# pretokenize()'s patterns on the classes: \p{L} is [A-Za-z], \p{N} is 0, \s is [ \t\r\n], anything else ['!]
+# pretokenize()'s patterns on the classes: \p{L} is [A-Za-zſ], \p{N} is 0, \s is [ \t\r\n], anything else ['!].
+# Under (?i) re takes ſ for s, as Oniguruma does; GPT-2's case-sensitive 's does not.
 CONTRACTED = "'s|'t|'re|'ve|'m|'ll|'d"
 SPACES = r"[ \t\r\n]+(?![^ \t\r\n])|[ \t\r\n]+"
 PATTERNS = {
-    "gpt2": re.compile(CONTRACTED + r"| ?[A-Za-z]+| ?0+| ?['!]+|" + SPACES),
-    "qwen": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-z0]?[A-Za-z]+|0| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
-    "llama3": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-z0]?[A-Za-z]+|0{1,3}| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    "gpt2": re.compile(CONTRACTED + r"| ?[A-Za-zſ]+| ?0+| ?['!]+|" + SPACES),
+    "qwen": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    "llama3": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0{1,3}| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
 }
+DIGITS = re.compile("0|[^0]+")  # Digits(individual_digits) on the classes: every number a piece of its own
 
 
 def pretokenize(text, pattern):
@@ -102,19 +108,20 @@ def pretokenize(text, pattern):
 
     "gpt2" is what ByteLevel(use_regex) applies:
         's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
-    "gpt2-digits" is the same after Digits(individual_digits), which SmolLM2 puts in front of it.
+    "gpt2-digits" is the same after Digits(individual_digits), which SmolLM2 puts in front of it: every number is a
+    piece of its own, \p{N} as Rust's char::is_numeric says (², Ⅱ and ① too, not only \d: T206), and GPT-2's
+    pattern runs on each piece as if the piece were the whole text.
     "qwen" is the pattern Qwen2 spells out (the contractions match whatever the case, digits come one by one,
     and a piece of anything-but-a-line-break may lead a word):
         (?i:'s|…)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
     "llama3" is Llama 3's, which is Qwen's with the digits taken up to three at a time (\p{N}{1,3}).
     All four are checked against the real patterns in tests/test_bytebpe.py and tests/test_llama3.py.
     """
-    if pattern == "gpt2-digits":
-        parts = []
-        for chunk in re.findall(r"\d|\D+", text):
-            parts += pretokenize(chunk, "gpt2")
-        return parts
     classes = text.translate(CHAR_CLASSES)
+    if pattern == "gpt2-digits":
+        gpt2 = PATTERNS["gpt2"]
+        return [text[match.start():match.end()] for piece in DIGITS.finditer(classes)
+                for match in gpt2.finditer(classes, piece.start(), piece.end())]
     return [text[match.start():match.end()] for match in PATTERNS.get(pattern, PATTERNS["gpt2"]).finditer(classes)]
 
 
