@@ -9,6 +9,9 @@
 // Three sizes: 8192 x 8192 (64 MiB of int8, far past the caches), 2048 x 2048 (4 MiB: T167's size "in the caches"
 // of a server's last level) and 256 x 1024 (in the first levels, called over and over). GB/s counts the bytes a row
 // reads: 32 a group of int8 (24 of int6), its float32 scale and its float32 correction.
+// T167's review: and the runner's ceilings, T163's loops (kernels/ceilings*.ts): at each size the read-only loop over
+// as many bytes as matmul_q8r reads (40 a group), taking turns with the kernels, and once relaxed_dot with its two
+// loads in L1. A form at the read's GB/s is held by the memory there, not by its own instructions.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -29,6 +32,7 @@ for (const file of ["kernel.ts", "kernel_relaxed.ts", "six.ts"]) {
 
 const asc = ["asc", "-O3", "--noAssert", "--runtime", "stub", "--importMemory", "--noExportMemory", "--initialMemory", "1"];
 const memory = new WebAssembly.Memory({ initial: 1, maximum: 8192 });
+const instance = (file) => new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(file)), { env: { memory } }).exports;
 const kernels = {};
 for (const [name, files] of Object.entries(forms)) {
   const dir = `${work}${name}/`;
@@ -36,11 +40,20 @@ for (const [name, files] of Object.entries(forms)) {
   for (const [file, text] of Object.entries(files)) fs.writeFileSync(dir + file, text);
   execFileSync("npx", [...asc, dir + "kernel.ts", "-o", dir + "plain.wasm", "--enable", "simd"], { cwd: root, stdio: "inherit" });
   execFileSync("npx", [...asc, dir + "kernel_relaxed.ts", "-o", dir + "relaxed.wasm", "--enable", "simd,relaxed-simd"], { cwd: root, stdio: "inherit" });
-  const instance = (file) => new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(dir + file)), { env: { memory } }).exports;
-  kernels[name] = { plain: instance("plain.wasm"), relaxed: instance("relaxed.wasm") };
+  kernels[name] = { plain: instance(dir + "plain.wasm"), relaxed: instance(dir + "relaxed.wasm") };
 }
+execFileSync("npx", [...asc, root + "kernels/ceilings.ts", "-o", work + "ceilings.wasm", "--enable", "simd"], { cwd: root, stdio: "inherit" });
+execFileSync("npx", [...asc, root + "kernels/ceilings_relaxed.ts", "-o", work + "ceilings_relaxed.wasm", "--enable", "simd,relaxed-simd"], { cwd: root, stdio: "inherit" });
+const ceilings = { ...instance(work + "ceilings.wasm"), ...instance(work + "ceilings_relaxed.wasm") };
 
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+{  // relaxed_dot with its two loads, on 8 KB at 4096 (below the matrices), the second 4 KB 0..127 as the loop wants
+  const I = new Int8Array(memory.buffer);
+  for (let j = 0; j < 8192; j++) I[4096 + j] = j < 4096 ? (Math.imul(j, 2654435761) >>> 24) - 128 : (j * 37) % 128;
+  const passes = 20000, ms = [];
+  for (let t = 0; t < turns * 3; t++) { const t0 = performance.now(); ceilings.dot(4096, passes); ms.push(performance.now() - t0); }
+  console.log(`ceiling: relaxed_dot with two loads in L1 ${(passes * 4096 / median(ms) / 1e6).toFixed(2)} G MAC/s`);
+}
 for (const [rows, n, calls] of [[8192, 8192, 1], [2048, 2048, 12], [256, 1024, 200]]) {
   const ng = n / 32;
   let top = 65536;
@@ -89,17 +102,20 @@ for (const [rows, n, calls] of [[8192, 8192, 1], [2048, 2048, 12], [256, 1024, 2
       + `tree against main ${error(outputs.tree, outputs.main).toExponential(2)}, ${same} of ${rows} rows the same to the bit`);
   }
   const time = (run, k) => { const t0 = performance.now(); for (let c = 0; c < calls; c++) run(k); return (performance.now() - t0) / calls; };
+  const readBytes = rows * ng * 40, read = () => ceilings.read(w8, readBytes, 1);  // as many bytes as q8r's, from w8 on
   for (let r = 0; r < rounds; r++) {
-    const ms = {};
+    const ms = { read: [] };
     for (let t = 0; t < turns; t++) {
       for (const [name, k] of Object.entries(kernels)) for (const [kernel, { run }] of Object.entries(runs)) (ms[`${kernel} ${name}`] ??= []).push(time(run, k));
+      ms.read.push(time(read));
     }
-    const line = [];
+    const readSpeed = readBytes / median(ms.read) / 1e6;
+    const line = [`read ${readSpeed.toFixed(2)} GB/s`];
     for (const [kernel, { bytes }] of Object.entries(runs)) {
       const base = median(ms[`${kernel} main`]);
       for (const name of Object.keys(kernels)) {
         const m = median(ms[`${kernel} ${name}`]);
-        line.push(`${kernel} ${name} ${(bytes / m / 1e6).toFixed(2)} GB/s ${(rows * n / m / 1e6).toFixed(2)} G MAC/s ${(base / m).toFixed(2)}x`);
+        line.push(`${kernel} ${name} ${(bytes / m / 1e6).toFixed(2)} GB/s (${Math.round(100 * bytes / m / 1e6 / readSpeed)}% of the read) ${(rows * n / m / 1e6).toFixed(2)} G MAC/s ${(base / m).toFixed(2)}x`);
       }
     }
     console.log(`${rows} x ${n}, round ${r + 1}: ${line.join(" | ")}`);

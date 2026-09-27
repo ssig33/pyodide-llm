@@ -83,8 +83,8 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   for (let i = 0; i < rows * ng; i++) F[ws / 4 + i] = Math.fround(1e-3 * (1 + (next() % 1000)));
   for (let g = 0; g < ng; g++) F[xs / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
   for (let i = 0; i < rows * ng * 24; i++) U[w6 + i] = next() & 255;
-  const six = (i, j) => {  // the int8 value of int6 weight j of row i (six_sums above)
-    const at = w6 + (i * ng + (j >> 5)) * 24, m = j & 31;
+  const six = (i, j, groups = ng) => {  // the int8 value of int6 weight j of row i of groups groups (six_sums above)
+    const at = w6 + (i * groups + (j >> 5)) * 24, m = j & 31;
     const low = m < 16 ? U[at + m] & 15 : U[at + m - 16] >> 4, top = (U[at + 16 + (m % 8)] >> (2 * ((m / 8) | 0))) & 3;
     return (((low | (top << 4)) << 2) << 24) >> 24;
   };
@@ -109,43 +109,45 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   }
   // T166: matmul_q6r (relaxed SIMD) to the bit against matmul_q8r on the int8 values six() takes apart here (the two
   // add their products in the same order), the activations 0..127 as quantize_x(bias = 64) gives them, and the
-  // corrections from six_sums and int8_sums
+  // corrections from six_sums and int8_sums. T167: and matmul_q8r to the bit against its sums taken here: each
+  // group's 32 products as one exact integer, times the group's scale (weight scale times activation scale) rounded
+  // once, added into lane g % 4 for the groups in fours and the lanes added in order, the groups past the last four
+  // added one at a time; the corrections the same way. At 1 to 7 groups (no four at all, and one four with 0 to 3
+  // after it) and at 41: T167's review, at 41 alone one group comes after the fours, and a kernel that scaled every
+  // group after the fours with the first one's scale passed
   const relaxed = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_relaxed_plain.wasm`)), { env: { memory } }).exports;
   const w8 = out + rows * 4, wc6 = w8 + rows * n, wc8 = wc6 + rows * ng * 4, out8 = wc8 + rows * ng * 4;
-  for (let i = 0; i < rows; i++) for (let j = 0; j < n; j++) I[w8 + i * n + j] = six(i, j);
   for (let j = 0; j < n; j++) I[x + j] = next() % 128;
-  k.six_sums(wc6, w6, ws, rows * ng);
-  k.int8_sums(wc8, w8, ws, rows * ng);
-  relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, n, 0, rows);
-  relaxed.matmul_q8r(out8, x, xs, w8, ws, wc8, n, 0, rows);
-  for (let i = 0; i < rows; i++) {
-    if (F[out / 4 + i] !== F[out8 / 4 + i]) throw new Error(`matmul_q6r differs at row ${i}: ${F[out / 4 + i]} against matmul_q8r's ${F[out8 / 4 + i]}`);
-  }
-  // T167: matmul_q8r to the bit against its sums taken here: each group's 32 products as one exact integer, times the
-  // group's scale (weight scale times activation scale) rounded once, added into lane g % 4 for the groups in fours
-  // (40 of the 41) and the lanes added in order, the last group added on its own; the corrections the same way
   const round = Math.fround;
-  for (let i = 0; i < rows; i++) {
-    const lanes = [0, 0, 0, 0], corrs = [0, 0, 0, 0];
-    let sum = 0, corr = 0;
-    for (let g = 0; g < ng; g++) {
-      let dot = 0;
-      for (let j = 0; j < 32; j++) dot += I[w8 + i * n + g * 32 + j] * I[x + g * 32 + j];
-      const part = round(dot * round(F[ws / 4 + i * ng + g] * F[xs / 4 + g])), c = round(F[wc8 / 4 + i * ng + g] * F[xs / 4 + g]);
-      if (g < (ng & ~3)) {
-        lanes[g & 3] = round(lanes[g & 3] + part);
-        corrs[g & 3] = round(corrs[g & 3] + c);
-      } else {
-        if (g === (ng & ~3)) {
-          sum = round(round(round(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
-          corr = round(round(round(corrs[0] + corrs[1]) + corrs[2]) + corrs[3]);
-        }
-        sum = round(sum + part);
-        corr = round(corr + c);
+  for (const groups of [1, 2, 3, 4, 5, 6, 7, ng]) {
+    const m = groups * 32, fours = groups & ~3;
+    for (let i = 0; i < rows; i++) for (let j = 0; j < m; j++) I[w8 + i * m + j] = six(i, j, groups);
+    k.six_sums(wc6, w6, ws, rows * groups);
+    k.int8_sums(wc8, w8, ws, rows * groups);
+    relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, m, 0, rows);
+    relaxed.matmul_q8r(out8, x, xs, w8, ws, wc8, m, 0, rows);
+    for (let i = 0; i < rows; i++) {
+      if (F[out / 4 + i] !== F[out8 / 4 + i]) throw new Error(`matmul_q6r differs at row ${i} of ${groups} groups: ${F[out / 4 + i]} against matmul_q8r's ${F[out8 / 4 + i]}`);
+      const part = (g) => {
+        let dot = 0;
+        for (let j = 0; j < 32; j++) dot += I[w8 + i * m + g * 32 + j] * I[x + g * 32 + j];
+        return round(dot * round(F[ws / 4 + i * groups + g] * F[xs / 4 + g]));
+      };
+      const correction = (g) => round(F[wc8 / 4 + i * groups + g] * F[xs / 4 + g]);
+      const lanes = [0, 0, 0, 0], corrs = [0, 0, 0, 0];
+      for (let g = 0; g < fours; g++) {
+        lanes[g & 3] = round(lanes[g & 3] + part(g));
+        corrs[g & 3] = round(corrs[g & 3] + correction(g));
       }
+      let sum = round(round(round(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
+      let corr = round(round(round(corrs[0] + corrs[1]) + corrs[2]) + corrs[3]);
+      for (let g = fours; g < groups; g++) {
+        sum = round(sum + part(g));
+        corr = round(corr + correction(g));
+      }
+      const expected = round(sum - round(64 * corr));
+      if (F[out8 / 4 + i] !== expected) throw new Error(`matmul_q8r differs at row ${i} of ${groups} groups: ${F[out8 / 4 + i]} against ${expected}`);
     }
-    const expected = round(sum - round(64 * corr));
-    if (F[out8 / 4 + i] !== expected) throw new Error(`matmul_q8r differs at row ${i}: ${F[out8 / 4 + i]} against ${expected}`);
   }
 }
 
