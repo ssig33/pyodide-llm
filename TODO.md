@@ -955,6 +955,18 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - いつ: WebGPU の列（T152・T191・T156）が一段落した区切りで。1 つの会話の Opus xhigh が 5 つを順に見る。直すものはタスクごとにコミットを分ける。
 - 見方は docs/notes/review-by-opus.md のとおり（動かしてから OK、数字と式と覆す条件）。
 
+### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: 未着手（2026-09-27、T190 のレビューの「あれば良い」。規模 小）
+- CI で 2 回、2 本のほうが 1.24〜1.34 倍速いのに 1 本を選んだ（8 つの時間を 4 つずつ 2 塊から取る上側の中央値なので、1 塊が乱れると判定が返る）。検索の判定を 1 塊の乱れに強い形にする。偽の時計の試験（gpu-default-check の形）で、乱れた 1 塊があっても正しく選ぶことを見る。持ち主の Android（的の端末）で 4 本を選ぶことは変えない。
+
+### T200 [性能] プロンプトの `encode()` を速くする — 状態: 未着手（2026-09-27、T164 のレビューの数字から。規模 小〜中）
+- 64 トークンの `encode()` が 0.8〜1.7 ms で、tiny-lm ではプロンプトの時間の 4〜5%（generate() の時計の外）。どの段（前分割、BPE の結合、Viterbi）が重いかを CI で測ってから、結果を変えずに縮める。トークナイザの全部の種類（BPE・unigram・byte-level BPE）で、本物の tokenizers・sentencepiece との一致の試験がそのまま通ること。
+
+### T201 [性能] 最大を取る鎖を並べる（sample の x86 と attention の softmax） — 状態: 未着手（2026-09-27、T189 のレビューの「あれば良い」。規模 小）
+- sample の最大は 4 つの累算器にしたが、x86 では 1 回の max が 8 命令の鎖でまだ待ちが残る（8 つ並べで llm-jp の 1 トークンの 0.2% の見積もり）。attention の softmax の最大は、位置ごとにスカラーの max を 1 つの累算器で取っている（長い文脈で効くかは未計測）。どちらも結果はビット単位で同じにできる（max は順に依らない。NaN の扱いは T195 と同じ）。的の Android（arm）で遅くならないこと。
+
+### T202 [計測] 持ち主の Android で 1 トークンの層の内訳を測る — 状態: 未着手（2026-09-27、T152 のレビューから。T191 が本線に入った後。規模 小）
+- T152 の見込みで、1B の 1 トークンの 76% が層（3.36 ms、バッファの読みの 51%）。行列だけなら 1.77 ms で、差の 1.59 ms（norm の量子化・attention・RoPE とキャッシュ・書き出し）の内訳は未計測。`/benchmark/` の GPU の節の層の表に、段ごとの時間（1 つずつ抜いた形の差か、段だけの形）を足して、GPU で生成を勝たせる次の手を数字で選ぶ。GPU が選ばれる線は 1 層 2.72〜2.9 ms 以下（T152 のレビュー）。
+
 ### T195 [バグ] logits に NaN か +inf があると、kernel の sample が index[−1] を返す — 状態: **レビュー待ち**（2026-09-27、T189 のレビューが見つけた。T189 より前からある形。ブランチ `t195-t198`。規模 小）
 - NumPy はエラーになる。kernel・NumPy・`walkLikeCpu` の 3 つで同じ扱いにする（T178）。ページでは NaN の logits は壊れたモデルか数値のあふれのしるしなので、黙って語彙の外を返さず、分かる形で止めるか決めた 1 語にする。
 - **やったこと（2026-09-27）**: **分かる形で止める**を選んだ。当たるのは最大の logit が有限でないとき（NaN がどこかに、+inf がどこかに、全部が −inf）。kernel の `sample` は最大を取った後に `isFinite` を 1 回見て −1 を返す（`f32x4.max` と `max` は NaN を残す）。エンジンの `sample()` は kernel の −1 でも NumPy の最大でも同じ `ValueError`（`llama2_numpy.NOT_FINITE`: 「The model computed logits that are not finite numbers (NaN or infinity), so no token can be drawn: its weights are broken or its numbers overflowed.」。worker.js は ValueError の文をそのまま出す）。greedy（温度 0）も同じ（`Llama.greedy()`: `np.argmax` は NaN を最大と見るので、選んだ logit が有限かを見るだけ）。`shaders.js` の `sampleLikeCpu`（温度 0 も）と `walkLikeCpu` は `finiteLikeCpu()` で投げる。いくつかの −inf は誤りでなく、今までどおり引く。**決めた 1 語にしなかった理由**: 有限でない logits は壊れた重みか数のあふれで、1 語を選ぶと、訪問者には理由の無い壊れた文が続く。止めればその場で分かる。**GPU の SAMPLE は同じ扱いにできない**（直していない）: NaN は `v > value` で飛ばし、+inf は exp(inf − inf) で NaN になり argmax か最後の語に落ちる。WGSL は実装が NaN と無限大が無いと仮定してよいとするので、シェーダの中の検査は当てにならない。GPU で生成する T152 は、別の道（たとえば CPU が読む値）で見つける。
