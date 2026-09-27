@@ -30,7 +30,6 @@ import re
 import struct
 import time
 import unicodedata
-from itertools import accumulate
 
 import numpy as np
 
@@ -164,16 +163,19 @@ class Tokenizer:
         if self.kind == "bytebpe":
             for i, piece in enumerate(self.vocab):
                 self.text_index.setdefault(piece.decode("utf-8", "replace"), i)
-        # the Viterbi search's reach: how long a piece it can match that begins with two given characters can be (T200)
-        self.reach = {}
+        # the Viterbi search's pieces as text, each the token index finds for it (the first of equal pieces), those
+        # it can match only, and how long such a piece that begins with two given characters can be (T200)
+        self.pieces, self.reach = {}, {}
         if self.kind == "unigram":
             for piece, i in self.index.items():
                 try:
                     text = piece.decode("utf-8")
                 except UnicodeDecodeError:
                     continue  # no text encodes to it
-                if len(text) > 1 and self.scores[i] > self.UNMATCHABLE and self.reach.get(text[:2], 0) < len(text):
-                    self.reach[text[:2]] = len(text)
+                if self.scores[i] > self.UNMATCHABLE:
+                    self.pieces[text] = i
+                    if len(text) > 1 and self.reach.get(text[:2], 0) < len(text):
+                        self.reach[text[:2]] = len(text)
         self.unknown_score = min(score for score in self.scores if score > self.UNMATCHABLE) - 10.0
 
     def encode(self, text, specials=()):
@@ -274,22 +276,17 @@ class Tokenizer:
 
     def encode_unigram(self, text):
         # Viterbi: best[j] is the best total score of any segmentation of text[:j]. The pieces that begin at i are
-        # no longer than the reach of text[i:i + 2] (one character where no longer piece begins with those two), and
-        # are looked up by their bytes, cut from the text encoded once: character i begins at byte at[i] (T200)
-        n, index, scores, reach = len(text), self.index, self.scores, self.reach
-        data = text.encode("utf-8")
-        at = range(n + 1) if len(data) == n else [0, *accumulate(  # each character's bytes in UTF-8, summed
-            1 if char < "\x80" else 2 if char < "\u0800" else 3 if char < "\U00010000" else 4 for char in text)]
+        # no longer than the reach of text[i:i + 2] (one character where no longer piece begins with those two) (T200)
+        n, pieces, scores, reach = len(text), self.pieces, self.scores, self.reach
         best = [0.0] + [-math.inf] * n
         back = [None] * (n + 1)
         for i in range(n):
             here = best[i]
             if here == -math.inf:
                 continue
-            start = at[i]
             for j in range(i + 1, min(n, i + reach.get(text[i:i + 2], 1)) + 1):
-                id = index.get(data[start:at[j]])
-                if id is not None and scores[id] > self.UNMATCHABLE and here + scores[id] > best[j]:
+                id = pieces.get(text[i:j])
+                if id is not None and here + scores[id] > best[j]:
                     best[j], back[j] = here + scores[id], (i, [id])
             # a character the vocabulary lacks becomes its UTF-8 bytes, at a penalty
             if back[i + 1] is None or back[i + 1][0] != i:
