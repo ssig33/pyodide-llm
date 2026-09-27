@@ -20,7 +20,9 @@
 // prompt, as Python takes them (tokenBlock at a time on the GPU, else one on the CPU). Far faster: the first steps on the
 // CPU (timed first), then every one on the GPU, and the eighth generation after the first verdict its first 4 on the
 // CPU; far slower: every step on the CPU but that generation's first run; failing on its second request: the CPU from
-// there on, the step it gave back taken by the CPU.
+// there on, the step it gave back taken by the CPU. And Python's generate() through external(), as the page's worker
+// runs it, on the far faster one: sampled and greedy, the steps on the GPU and the counts right (the made-up GPU fails a
+// request whose random numbers, history or settings are not what Python should hand over).
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -56,7 +58,11 @@ parentPort.on("message", (data) => {
     // T152: count steps of a made-up generation: each id the one after the token fed
     Atomics.wait(nap, 0, 0, line.step * data.count);
     if (Atomics.load(ctl, words.wanted) !== data.serial) return;
-    const fail = Boolean(line.failTokensAt) && ++requests >= line.failTokensAt;
+    // (T152: what Python hands over, as a step on the GPU takes it: a random number a step where sampled, the end of
+    // the history and its length, the settings)
+    const odd = data.randoms.length !== (data.settings.temperature ? data.count : 0) || data.history.length > 64 ||
+      data.length < data.history.length || data.history.at(-1) !== data.token || !Array.isArray(data.settings.stops);
+    const fail = odd || (Boolean(line.failTokensAt) && ++requests >= line.failTokensAt);
     ids[0] = data.count;
     for (let i = 0; i < data.count; i++) ids[1 + i] = data.token + 1 + i;
     Atomics.store(ctl, words.failed, fail ? 1 : 0);
@@ -83,7 +89,8 @@ if (isMainThread) {
   const { memory, base } = weightsMemory(checkpoint.length, { shared: true, after: footprint(header, checkpoint.length, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start }) });
   new Uint8Array(memory.buffer).set(checkpoint, base);
   // forward.js waits in Atomics.wait: in a worker, as in the page
-  const worker = new Worker(new URL(import.meta.url), { workerData: { memory, base, size: checkpoint.length, plan, forwardFile } });
+  const worker = new Worker(new URL(import.meta.url), { workerData: { memory, base, size: checkpoint.length, plan, forwardFile,
+    tokenizer: path.join(root, entry.tokenizer), options: entry.options ?? {} } });
   const code = await new Promise((resolve) => {
     worker.on("message", (line) => console.log(line));
     worker.once("exit", resolve);
@@ -91,8 +98,8 @@ if (isMainThread) {
   });
   process.exit(code);
 } else {
-  const { memory, base, size, plan, forwardFile } = workerData;
-  const { compileKernels, createForward, endSearch, timePrompts } = await import(forwardFile);
+  const { memory, base, size, plan, forwardFile, tokenizer, options } = workerData;
+  const { compileKernels, createForward, endSearch, timePrompts, external } = await import(forwardFile);
   const { pathTable } = await import(path.join(root, "src/bench.js"));
   const kernels = compileKernels(fs.readFileSync(path.join(root, "public/simdkernel_shared.wasm")), fs.readFileSync(path.join(root, "public/simdkernel_relaxed_shared.wasm")));
   const spawn = (data) => new Promise((resolve) => {
@@ -323,6 +330,43 @@ if (isMainThread) {
   {
     const seen = await steps("the steps, a GPU that fails on its second request", 0.2, 2, 2);
     expect("the CPU from the failure on", seen, [[4, STEPS - 4], [0, STEPS]]);
+  }
+  // T152: Python's generate() through forward.js's external() (as the page's worker has it) on the made-up GPU far
+  // faster: the steps go to it (Python draws the random numbers and hands the history over as the made-up GPU expects),
+  // and the text and the counts are those of the steps
+  {
+    const { loadPyodide } = await import("pyodide");
+    const py = await loadPyodide();
+    await py.loadPackage("numpy", { messageCallback: () => {} });
+    for (const name of ["llama2_numpy.py", "llama2_convert.py", "simdkernel.so", "simdkernel_relaxed.wasmlib"]) {
+      py.FS.writeFile(name, fs.readFileSync(path.join(root, "public", name)));
+    }
+    py.FS.writeFile("tokenizer.bin", fs.readFileSync(tokenizer));
+    const line = { fixed: 60 * perToken, perToken: 2 * perToken, step: 0.2 * cpuStep };
+    const gpu = () => {
+      const fake = new Worker(FAKE, { eval: true, workerData: line });
+      return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
+    };
+    const outside = external({ memory, base, size, kernels, gpu });
+    py.globals.set("OUTSIDE", outside);
+    py.globals.set("OPTIONS", py.toPy(options));
+    py.runPython(`from llama2_numpy import Llama\nllama = Llama(None, open("tokenizer.bin", "rb").read(), kernels="simdkernel.so", external=OUTSIDE, **OPTIONS)`);
+    await outside.engine.gpu;
+    const written = [];
+    for (const settings of ["temperature=0.8, topp=0.9, repetition_penalty=1.1, seed=3", "temperature=0.0"]) {
+      outside.engine.newGeneration();
+      py.runPython(`text = "".join(llama.generate("こんにちは、今日は", steps=48, ${settings}))`);
+      const stats = py.runPython("llama.stats").toJs({ dict_converter: Object.fromEntries });
+      written.push({ sampled: stats.sampled, gpu: outside.engine.gpuSampled, prompt: stats.prompt_tokens, text: py.globals.get("text").length });
+    }
+    py.runPython("llama.release()");
+    say(`Python's generate() on the made-up GPU: ${JSON.stringify(written)}; status ${outside.engine.gpuStatus}`);
+    written.forEach(({ sampled, gpu, prompt, text }, i) => {
+      if (!(sampled === 48 - prompt && gpu >= sampled - 2 && text > 0)) {
+        failures.push(`Python's generate() ${i ? "greedy" : "sampled"}: ${sampled} sampled, ${gpu} on the GPU, ${text} characters`);
+      }
+    });
   }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");
