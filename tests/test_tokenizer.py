@@ -1,9 +1,11 @@
 # Encode -> decode round trips, on a synthetic vocabulary and on the real ones `make models` fetches.
+import math
+import random
 import unicodedata
 
 import pytest
 
-from conftest import checkpoint_vocab_size, detokenize, model_file, tiny_tokenizer
+from conftest import checkpoint_vocab_size, detokenize, model_file, pack_tokenizer, tiny_tokenizer
 from llama2_numpy import Tokenizer
 
 TEXTS = [
@@ -99,6 +101,88 @@ def test_special_tokens_inside_a_prompt_become_their_token():
     # without being told, the engine spells the same characters out
     assert end not in tokenizer.encode("hello</s>\nworld")
     assert tokenizer.encode("hello", ("</s>",)) == tokenizer.encode("hello")
+
+
+# ---------------------------------------------------------- the definitions, on made-up vocabularies (T200)
+# encode_bpe() keeps the pairs' scores from one merge to the next, and encode_unigram() tries a piece at i only as far
+# as the reach of text[i:i + 2]. Both must give what the plain definitions below give (the engine's own loops before
+# T200), with ties, a piece written twice, unmatchable scores, NaN and characters the vocabulary lacks. A roundtrip
+# does not see a wrong segmentation (any segmentation decodes to the text), and "Once upon a time" has four tokens.
+
+def bpe_by_definition(tokenizer, text):
+    """llama2.c's encode(): the characters' tokens (their bytes where the vocabulary lacks them), then the best pair
+    merged again and again, the first of equal scores, and no pair that scores -1e10 or less"""
+    tokens = []
+    for char in text:
+        piece = char.encode("utf-8")
+        if piece in tokenizer.index:
+            tokens.append(tokenizer.index[piece])
+        elif tokenizer.unknown is not None:
+            tokens += [] if tokens[-1:] == [tokenizer.unknown] else [tokenizer.unknown]
+        else:
+            tokens += [tokenizer.byte_tokens[byte] for byte in piece]
+    while True:
+        best = (-1e10, -1, -1)
+        for i in range(len(tokens) - 1):
+            id = tokenizer.index.get(tokenizer.vocab[tokens[i]] + tokenizer.vocab[tokens[i + 1]])
+            if id is not None and tokenizer.scores[id] > best[0]:
+                best = (tokenizer.scores[id], i, id)
+        if best[1] == -1:
+            return tokens
+        tokens[best[1]:best[1] + 2] = [best[2]]
+
+
+def unigram_by_definition(tokenizer, text):
+    """the segmentation of the best total score, every piece up to the longest tried at every position"""
+    longest = max(len(piece.decode("utf-8", "ignore")) for piece in tokenizer.vocab)
+    n = len(text)
+    best, back = [0.0] + [-math.inf] * n, [None] * (n + 1)
+    for i in range(n):
+        if best[i] == -math.inf:
+            continue
+        for j in range(i + 1, min(n, i + longest) + 1):
+            id = tokenizer.index.get(text[i:j].encode("utf-8"))
+            if id is not None and tokenizer.scores[id] > Tokenizer.UNMATCHABLE and best[i] + tokenizer.scores[id] > best[j]:
+                best[j], back[j] = best[i] + tokenizer.scores[id], (i, [id])
+        if back[i + 1] is None or back[i + 1][0] != i:  # a character the vocabulary lacks
+            score = best[i] + tokenizer.unknown_score
+            if score > best[i + 1]:
+                spelled = [tokenizer.unknown] if tokenizer.unknown is not None else \
+                    [tokenizer.byte_tokens[byte] for byte in text[i].encode("utf-8")]
+                best[i + 1], back[i + 1] = score, (i, spelled)
+    tokens, j = [], n
+    while j > 0:
+        i, ids = back[j]
+        tokens[:0] = [] if tokenizer.unknown is not None and ids == [tokenizer.unknown] and tokens[:1] == ids else ids
+        j = i
+    return tokens
+
+
+def made_up(seed, kind):
+    """a vocabulary of a few characters (one to four bytes) and pieces of them, with scores that tie"""
+    rng = random.Random(seed)
+    letters = rng.sample(["a", "b", "c", " ", "é", "日", "本", "\U0001f600"], rng.randrange(2, 7))
+    scores = [0.0, -1.0, -1.0, -2.0, -3.0, -1e10, -2e10, float("nan"), float("-inf")]
+    rows = [(-1e9, b"<0x%02X>" % byte) for byte in range(256)]  # byte pieces, unmatchable as the converter writes them
+    rows += [(0.0, letters[0].encode("utf-8"))] + [(rng.choice(scores), ch.encode("utf-8")) for ch in letters[1:]
+                                                   if rng.random() < 0.8]
+    for _ in range(rng.randrange(3, 50)):
+        piece = "".join(rng.choices(letters, k=rng.randrange(2, 7))).encode("utf-8")
+        rows.append((rng.choice(scores) if rng.random() < 0.5 else -float(rng.randrange(6)), piece))
+    rows += [(rng.choice(scores), rows[rng.randrange(256, len(rows))][1]) for _ in range(3)]  # pieces written twice
+    tokenizer = Tokenizer(pack_tokenizer(rows), len(rows), kind=kind, unknown=rng.choice([None, 256]))
+    return tokenizer, letters + ["x"], rng
+
+
+@pytest.mark.parametrize("kind", ["bpe", "unigram"])
+def test_made_up_vocabularies_follow_the_definition(kind):
+    by_definition = bpe_by_definition if kind == "bpe" else unigram_by_definition
+    for seed in range(300):
+        tokenizer, letters, rng = made_up(seed, kind)
+        encode = tokenizer.encode_bpe if kind == "bpe" else tokenizer.encode_unigram
+        for _ in range(25):
+            text = "".join(rng.choices(letters, k=rng.randrange(0, 30)))
+            assert encode(text) == by_definition(tokenizer, text), (seed, text)
 
 
 # ------------------------------------------------------------------ a sentencepiece model's normalizer (T126)

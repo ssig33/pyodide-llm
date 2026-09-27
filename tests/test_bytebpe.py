@@ -2,6 +2,7 @@
 # tokenizer.bin -> engine, against Hugging Face's own tokenizers. The vocabularies are trained here in a second,
 # so nothing is downloaded and no file is checked in.
 import json
+import random
 
 import pytest
 
@@ -57,12 +58,35 @@ def test_decodes_every_piece(name, pattern, digits):
 
 @pytest.mark.parametrize("text", TEXTS)
 def test_pretokenizers_follow_the_patterns(text):
-    """The engine spells the patterns out by hand, because re has no \\p{L}."""
+    """The engine runs the patterns on the characters' classes, because re has no \\p{L} (T200)."""
     regex = pytest.importorskip("regex", reason="pip install regex to check the patterns themselves")
     assert pretokenize(text, "gpt2") == regex.findall(GPT2_PATTERN, text)
     assert pretokenize(text, "qwen") == regex.findall(QWEN_PATTERN, text)
     digits = [part for chunk in regex.findall(r"\d|\D+", text) for part in regex.findall(GPT2_PATTERN, chunk)]
     assert pretokenize(text, "gpt2-digits") == digits
+
+
+# T200's review: a class of CharClasses or a translated pattern that is wrong shows only next to the characters it
+# concerns, which TEXTS has few of. Characters of every class and every kind the patterns name, each next to each.
+# (Not the characters where Python's unicodedata and the regex module disagree: \x1c to \x1f are spaces to
+# str.isspace and not to \s, and letters new in the regex module's Unicode; nor ſ, which (?i:'s) folds to s.)
+PIECES = ["a", "b", "s", "t", "d", "m", "l", "r", "e", "v", "S", "T", "L", "D", "x", "'", "'s", "'LL", "'ve", "'T",
+          " ", "  ", "\t", "\n", "\r", "\r\n", "\x0b", "\x0c", "\x85", "\xa0", " ", "　", "0", "7", "123",
+          ".", ",", "!", "-", "_", "(", '"', "@", "é", "ß", "Ω", "я", "あ", "カ", "漢", "한", "ｱ", "Ａ", "１", "٣", "²", "Ⅻ",
+          "①", "́", "‍", "、", "。", "\U0001f600", "\U00020bb7", "\U0001d7ce", "\U00010140", "’"]
+
+
+def test_pretokenizers_follow_the_patterns_on_random_texts():
+    regex = pytest.importorskip("regex", reason="pip install regex to check the patterns themselves")
+    patterns = {"gpt2": GPT2_PATTERN, "qwen": QWEN_PATTERN,
+                "llama3": QWEN_PATTERN.replace(r"|\p{N}|", r"|\p{N}{1,3}|")}
+    rng = random.Random(200)
+    for _ in range(3000):
+        text = "".join(rng.choices(PIECES, k=rng.randrange(0, 16)))
+        for name, pattern in patterns.items():
+            assert pretokenize(text, name) == regex.findall(pattern, text), (name, text)
+        digits = [part for chunk in regex.findall(r"\d|\D+", text) for part in regex.findall(GPT2_PATTERN, chunk)]
+        assert pretokenize(text, "gpt2-digits") == digits, text
 
 
 def test_refuses_what_the_engine_cannot_split():

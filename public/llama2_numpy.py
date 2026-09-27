@@ -52,8 +52,6 @@ def byte_chars():
 BYTE_CHARS = byte_chars()
 CHAR_BYTES = {char: byte for byte, char in BYTE_CHARS.items()}
 
-CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
-
 
 def letter(char):
     return unicodedata.category(char)[0] == "L"
