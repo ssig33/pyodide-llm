@@ -121,6 +121,32 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   for (let i = 0; i < rows; i++) {
     if (F[out / 4 + i] !== F[out8 / 4 + i]) throw new Error(`matmul_q6r differs at row ${i}: ${F[out / 4 + i]} against matmul_q8r's ${F[out8 / 4 + i]}`);
   }
+  // T167: matmul_q8r to the bit against its sums taken here: each group's 32 products as one exact integer, times the
+  // group's scale (weight scale times activation scale) rounded once, added into lane g % 4 for the groups in fours
+  // (40 of the 41) and the lanes added in order, the last group added on its own; the corrections the same way
+  const round = Math.fround;
+  for (let i = 0; i < rows; i++) {
+    const lanes = [0, 0, 0, 0], corrs = [0, 0, 0, 0];
+    let sum = 0, corr = 0;
+    for (let g = 0; g < ng; g++) {
+      let dot = 0;
+      for (let j = 0; j < 32; j++) dot += I[w8 + i * n + g * 32 + j] * I[x + g * 32 + j];
+      const part = round(dot * round(F[ws / 4 + i * ng + g] * F[xs / 4 + g])), c = round(F[wc8 / 4 + i * ng + g] * F[xs / 4 + g]);
+      if (g < (ng & ~3)) {
+        lanes[g & 3] = round(lanes[g & 3] + part);
+        corrs[g & 3] = round(corrs[g & 3] + c);
+      } else {
+        if (g === (ng & ~3)) {
+          sum = round(round(round(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
+          corr = round(round(round(corrs[0] + corrs[1]) + corrs[2]) + corrs[3]);
+        }
+        sum = round(sum + part);
+        corr = round(corr + c);
+      }
+    }
+    const expected = round(sum - round(64 * corr));
+    if (F[out8 / 4 + i] !== expected) throw new Error(`matmul_q8r differs at row ${i}: ${F[out8 / 4 + i]} against ${expected}`);
+  }
 }
 
 // T101: jobs.js says which arguments of each kernel are addresses (BigInt on a 64-bit memory): the same as the
