@@ -76,6 +76,12 @@ const BENCH_MODEL = "llm-jp-3-150m";
         <p class="about">A part of this site's model and a range of a model on huggingface.co: the wait for the first byte
           and the speed. Then huggingface.co read no faster than 1, 4 and 8 MB/s, as a slower line would deliver it.</p>
       </section>
+      <section data-section="memory">
+        <h2>Page memory</h2>
+        <p class="about">How much memory this page can hold before the browser refuses it or ends the tab (an iPhone ends
+          a tab past about 2 to 3 GB, with no error). Not part of Run all: run it on its own. The tab may be reloaded, and
+          the page then says how far it got.</p>
+      </section>
       <div class="report" hidden>
         <h2>Results</h2>
         <p><button id="copy" type="button">Copy the results</button> <a id="issue" target="_blank" rel="noopener">Report them as an issue</a>
@@ -141,6 +147,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
   import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
     matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
+  import { holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
 
   declare const __BUILD__: string;
   const BASE = import.meta.env.BASE_URL;
@@ -148,8 +155,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
   const V = `?v=${__BUILD__}`;
   const $ = (id: string) => document.getElementById(id)!;
   const parameters = new URLSearchParams(location.search);
-  const SECTIONS = ["device", "cpu", "model", "gpu", "storage", "line"] as const;
+  const SECTIONS = ["device", "cpu", "model", "gpu", "storage", "line", "memory"] as const;
   type Name = typeof SECTIONS[number];
+  // T173: "Run all" and ?run=all leave the page-memory section out (it may end the tab): its button or ?run=memory runs it
+  const ALL = SECTIONS.filter((name) => name !== "memory");
   // ok: measured; none: the browser has no such thing (said, and the run goes on); wrong: a result that cannot be
   // right (a shader against JavaScript, a piece read back); error: a section that failed
   type Result = { status: "ok" | "none" | "wrong" | "error"; markdown: string; data?: any };
@@ -668,14 +677,34 @@ const BENCH_MODEL = "llm-jp-3-150m";
     }
   }
 
-  const RUN: Record<Name, () => Promise<Result>> = { device, cpu, model: modelSection, gpu, storage, line };
+  // T173: the tab's sessionStorage, where it works (null: the page-memory section does not run)
+  const tabStorage = (() => {
+    try {
+      sessionStorage.setItem("benchmark-probe", "1");
+      sessionStorage.removeItem("benchmark-probe");
+      return sessionStorage;
+    } catch {
+      return null;
+    }
+  })();
+  async function pageMemory(): Promise<Result> {
+    const w = worker("benchmark/memory.js");
+    try {
+      return memoryResult(await holdMemory({ ask: (message: any) => ask(w, message), storage: tabStorage,
+        limit: memoryLimit(parameters.get("memoryMB")), stage: (s: Stage) => staged("memory", s) })) as Result;
+    } finally {
+      w.terminate();
+    }
+  }
+
+  const RUN: Record<Name, () => Promise<Result>> = { device, cpu, model: modelSection, gpu, storage, line, memory: pageMemory };
   const STATE = { ok: "done", none: "not in this browser", wrong: "WRONG", error: "failed" };
 
-  const TITLES: Record<Name, string> = { device: "This browser", cpu: "CPU", model: "Model", gpu: "GPU", storage: "Storage", line: "Line" };
+  const TITLES: Record<Name, string> = { device: "This browser", cpu: "CPU", model: "Model", gpu: "GPU", storage: "Storage", line: "Line", memory: "Page memory" };
   // T185: a section's lines of the summary (src/bench.js), from the data its tables are made of; a section that did not
   // measure says its state and the first line of why. The GPU's CPU beside it is the CPU section's, as in its tables.
   const SUMMARIES: Partial<Record<Name, (data: any) => string[]>> = {
-    device: deviceSummary, cpu: cpuSummary, storage: storageSummary, line: lineSummary,
+    device: deviceSummary, cpu: cpuSummary, storage: storageSummary, line: lineSummary, memory: memorySummary,
     gpu: (data) => gpuSummary(data.steps, cpuBaseline(results.cpu), { lost: data.lost }),
   };
   function summaryOf(name: Name, result: Result): string[] {
@@ -758,13 +787,24 @@ const BENCH_MODEL = "llm-jp-3-150m";
     (window as any).__benchmark.done = true;
     running = false;
   }
-  $("run-all").onclick = () => runSections(SECTIONS);
+  $("run-all").onclick = () => runSections(ALL);
   $("copy").onclick = () => navigator.clipboard?.writeText($("markdown").textContent ?? "");
   // a report too long for the link goes by the clipboard, in the click itself (Safari writes only there)
   $("issue").addEventListener("click", () => {
     if (!$("long").hidden) navigator.clipboard?.writeText($("markdown").textContent ?? "").catch(() => {});
   });
-  // ?run=all runs every section at once, ?run=cpu,line those (tests/bench-check.mjs)
+  // T173: a mark of the page-memory section is a tab ended (or left) while it grew: what it held is shown, and the
+  // section is not run again by the ?run= below (a ?run=memory would end the tab over and over)
+  const ended = readMark(tabStorage);
+  if (ended) {
+    const result = (results.memory = memoryResult(ended) as Result);
+    parts.memory.state.className = `state ${result.status}`;
+    parts.memory.state.textContent = `${STATE[result.status]} · the page was loaded again`;
+    parts.memory.out.innerHTML = rendered(result.markdown);
+    report();
+  }
+  (window as any).__benchmark.all = ALL;
+  // ?run=all runs every section at once but the page memory, ?run=cpu,line those (tests/bench-check.mjs)
   const asked = parameters.get("run");
-  if (asked) runSections(asked === "all" ? SECTIONS : SECTIONS.filter((name) => asked.split(",").includes(name)));
+  if (asked) runSections((asked === "all" ? ALL : SECTIONS.filter((name) => asked.split(",").includes(name))).filter((name) => !(ended && name === "memory")));
 </script>

@@ -67,6 +67,13 @@ jobs:
           QUERY: ${{ inputs.query }}
         run: node tests/bench-check.mjs --dist chromium --model "$MODEL" --size 64 --query "$QUERY" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # T173: the page-memory section, on a limit the runner holds well below its own, and a tab ended in the middle of
+      # it played by loading the page again (never Run all: it may end a phone's tab)
+      - name: The benchmark's page memory
+        if: always()
+        shell: bash
+        run: node tests/page-memory-check.mjs --dist | tee -a "$GITHUB_STEP_SUMMARY"
+
       # a change to the service worker is tried here, on the branch, before it goes out (AGENTS.md)
       - name: Offline (T111)
         if: inputs.offline
