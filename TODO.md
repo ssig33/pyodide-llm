@@ -959,7 +959,11 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - Qwen3 の 12 項目は 7 リポジトリで、カードが apache-2.0 の Q8_0 があり、取得が 62.5 → 32.7 GB の見込み。GGUF の読み手に qwen3（head ごとの q・k の norm、dim / heads と違う head の大きさ、T124）を足す仕事が要る。DeepSeek-R1 Distill Qwen 1.5B は、段 ② の形（語彙を原本から取る）なら前分割の名前は問題にならない。カードが MIT の Q8_0 は mradermacher（`base_model` が原本）・Mungert・second-state・mmnga。Mungert のものは bartowski と 288 B 違う。
 - 決まりは段 ①〜③ と同じ: 足す前に `gguf_check.py tensors` を通す、`CONVERTER` は上げない（出すものが同じなら）、保存の名前が変わる、カードに原本と同じライセンス。
 
-### T204 [試験] safetensors の GPT-2・NeoX の道の固定値を残す — 状態: 未着手（2026-09-27、T136 の段 ③ のレビューの「あれば良い」。規模 小）
+### T204 [試験] safetensors の GPT-2・NeoX の道の固定値を残す — 状態: **レビュー待ち**（2026-09-27、T136 の段 ③ のレビューの「あれば良い」。ブランチ `t204-fixed-rinna`、Opus medium。規模 小）
+- **やったこと（2026-09-27）**: `tests/fixed_outputs.py` の `MODELS` に rinna japanese-gpt2 small（`hf-japanese-gpt2-small`、454 MB）を足した。NeoX の small（663 MB）ではなく GPT-2 を選んだ訳: 小さい、`transformer.` の付く名前（GGUF の GPT-2 と openai-community/gpt2 は付かない）と Conv1D を流れのまま転置する読みは safetensors の GPT-2 にしか無い、rinna の NeoX は並列残差が偽で回すのは head 全体（Pythia の GGUF の固定値が並列残差と一部の回転を見ている）。壊し方を 1 つのモデルに当てる `--only=<id>` を足した（`--write` とは併せない）。
+- **固定した文**（CI の tests.yml の `extra=`、run 36337952177、float32、greedy の 16 トークン）: 「これからの流行りは」→「、おしゃれなデザインの服がたくさんあるので、 ファッション」。壊れた文ではないと読んだ（「、 ファッション」の空白は rinna の語彙の「▁ファッション」）。**人が読んでから `--write` の決まりなので、レビューで読んでほしい。** ほかの 5 つは同じ run で ok。
+- **わざと壊して（同じ run、`--only=hf-japanese-gpt2-small`）**: 4 つとも落ちた。`c_proj` を転置しない（「、お客層雲南房総半島先端技術の効果音程 ...」）、`c_attn` の q と k を入れ替える（「流行は流行は流行は…」）、q と k の bias を入れ替える（「いません。」）、並列残差にする（「、お肌の乾燥が気になる季節です。乾燥肌の人は、」: まともな文でも固定値と違うので落ちる）。
+- **CI で回すもの**: browsers.yml の huggingface の small（固定値の段は small のジョブだけ。取得が 454 MB 増える）。
 - 段 ③ で固定値（`tests/fixed_outputs.py`）の GPT-2 と NeoX が GGUF の道だけになり、safetensors の道（一覧では rinna の 3 つ）の固定値が無くなった。rinna の小さいもの 1 つ（japanese-gpt-neox-small か japanese-gpt2-small）を固定値に足す。わざと壊して（転置や並列残差を外す）落ちることを見る。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **レビュー待ち**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）

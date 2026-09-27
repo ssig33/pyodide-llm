@@ -7,6 +7,10 @@
     "prompt": "Once upon a time",
     "text": ", the world was a place of peace and harmony. But now, it is"
   },
+  "hf-japanese-gpt2-small": {
+    "prompt": "これからの流行りは",
+    "text": "、おしゃれなデザインの服がたくさんあるので、 ファッション"
+  },
   "hf-smollm2-135m-instruct": {
     "prompt": "What will be popular next? Name three things.",
     "text": "1. The new smartphone model: This is a significant development in the smartphone market"
