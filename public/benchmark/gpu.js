@@ -1592,6 +1592,17 @@ function tiedLogits(vocab) {
   for (let i = 0; i < 200; i++) logits[wide ? 1001 + 618 * i : 200 + i] = 7.26 + i * 1e-3;
   return logits;
 }
+// T191 (Fable's check): a few tokens far over the rest, on the borders of the chunks of the sampling in chunks (the
+// first and the last token of a chunk, the very last token of the vocabulary: a thread's fourth), two of them equal
+// across a border (1023 and 1024), the rest a narrow normal spread: at temperature 0.4 the floor (best − 6.45) is
+// above every other token, so nearly every chunk gathers nothing, the count over the floor is far below a workgroup,
+// and the draw without a nucleus walks through chunks whose sums are next to nothing
+const SPARSE_PEAKS = [[0, 10], [2047, 10.25], [1023, 10.5], [1024, 10.5], [50000, 10.75], [64511, 11], [128255, 11.25], [64512, 11.5], [128000, 11.75], [1, 12]];
+function sparseLogits(vocab) {
+  const logits = madeUpLogits(vocab, 0.5, 0);
+  for (const [at, value] of SPARSE_PEAKS) logits[at] = value;
+  return logits;
+}
 // logits as a model's look (a few tokens far above the rest), made up: a normal spread and `peaks` tokens 8 to 14 over it
 function madeUpLogits(vocab, spread, peaks = 20) {
   const logits = new Float32Array(vocab);
@@ -1654,6 +1665,13 @@ async function checkSampling(kind = "one") {
   // chunks of the sampling in chunks and the draw passes in a chunk far from the first (a model's logits put nearly
   // all of it on one peak: the mass before that chunk is next to nothing, and forgetting it passed)
   for (const random of [0.3, 0.6, 0.9]) cases.push({ vocab: 128256, spread: 1, peaks: 0, topp: 1, temperature: 0.7, penalty: 1.3, random });
+  // T191 (Fable's check): chunks with nothing over the floor, the tokens over it on the chunks' borders (sparseLogits);
+  // the most likely token (temperature 0) is the last of the vocabulary (the fourth unpenalized peak: the window holds
+  // the three most likely)
+  for (const topp of [0.9, 0.5, 1]) {
+    for (const random of [0.02, 0.5, 1 - 2 ** -24]) cases.push({ vocab: 128256, sparse: true, topp, temperature: 0.4, penalty: 1.3, random });
+  }
+  cases.push({ vocab: 128256, sparse: true, topp: 0.9, temperature: 0, penalty: 1.3, random: 0.5 });
   // a history shorter than the window (its empty slots must not count: token 0, among the most likely, is in none)
   for (const spread of [0.5, 2, 6]) for (let i = 0; i < 3; i++) cases.push({ vocab: 1003, spread, topp: 0.9, temperature: 0.7, penalty: 1.3, random: Math.random(), short: true });
   // equal logits (tiedLogits): the draw on the first of the two at the top, on the fifth of the run of 20, and the most
@@ -1714,7 +1732,7 @@ async function checkSampling(kind = "one") {
           const right = c.ties && c.temperature ? got.ids[k] === first : picks.has(got.ids[k]);
           if (!right) {
             wrong++;
-            problems.push(`${c.vocab} spread ${c.spread ?? "tied"} top-p ${c.topp} T ${c.temperature} r ${draws[k].toFixed(3)}: ${got.ids[k]}, the CPU ${first}`);
+            problems.push(`${c.vocab} spread ${c.spread ?? (c.sparse ? "sparse" : "tied")} top-p ${c.topp} T ${c.temperature} r ${draws[k].toFixed(3)}: ${got.ids[k]}, the CPU ${first}`);
             return;
           }
           if (got.ids[k] !== first) edge++;
@@ -1733,7 +1751,7 @@ async function checkSampling(kind = "one") {
         }
       };
       for (const c of cases) {
-        const logits = c.ties ? tiedLogits(c.vocab) : madeUpLogits(c.vocab, c.spread, c.peaks);
+        const logits = c.ties ? tiedLogits(c.vocab) : c.sparse ? sparseLogits(c.vocab) : madeUpLogits(c.vocab, c.spread, c.peaks);
         const ranked = [...logits.keys()].sort((a, b) => logits[b] - logits[a]);
         // 70 tokens: the 6 before the window two of the most likely (3rd and 4th, which must not be penalized), then the
         // window: the three most likely twice each (a repeat is penalized once), early and late in it (both halves of
