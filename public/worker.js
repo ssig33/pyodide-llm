@@ -619,6 +619,8 @@ function weightsBuffer(size, header, options) {
     // six bits are not asked for either. A browser that does not say (Safari, Firefox): 4 GB (the owner decides, TODO.md)
     const deviceMemory = self.navigator?.deviceMemory ?? 4;
     const gpuRoom = deviceMemory >= 8 ? undefined : deviceMemory * 2 ** 30 / 2 - (size + after);
+    // T205: such a browser keeps a generation's steps (the classifier and the embedding on the GPU as well) on the CPU
+    const memoryUnsaid = self.navigator?.deviceMemory === undefined;
     weightsNow = memory;
     return {
       write: (offset, chunk) => new Uint8Array(memory.buffer, base + offset, chunk.length).set(chunk),
@@ -628,7 +630,7 @@ function weightsBuffer(size, header, options) {
         // them would slow down with its upload and compilation; its first load is one of them)
         // (nor under the rounds of /benchmark/'s model section, T184: the same; its page path, timed on the first load
         // before the rounds, has the GPU, and T205: the rounds' loads wait for that GPU to let go of its device)
-        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage && !benching ? openGpu : undefined, gpuRoom,
+        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage && !benching ? openGpu : undefined, gpuRoom, memoryUnsaid,
           gpuRemembered: gpuRequest?.remembered, gpuForce, halfKeys });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
       },

@@ -358,12 +358,12 @@ const CHUNKS_PER_THREAD = 4;
 
 /** What Llama(external=) takes: the size of the checkpoint, read() for the few bytes Python looks at itself, and
  * start(plan), which builds the forward pass. */
-export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce, halfKeys }) {
+export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce, halfKeys }) {
   const outside = {
     size,
     read: (offset, length) => new Uint8Array(memory.buffer, base + offset, length).slice(),
     start: (plan) => {
-      outside.engine = createForward({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce, halfKeys,
+      outside.engine = createForward({ memory, base, size, kernels, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce, halfKeys,
         plan: plan.toJs ? plan.toJs({ dict_converter: Object.fromEntries }) : plan });
       return outside.engine;
     },
@@ -384,8 +384,10 @@ function halfToFloat(h) {
 /** gpu (T135; T148: wherever the worker has WebGPU): makes the GPU's worker (gpu.js, not started: a Worker, or what
  * posts and listens as one). A prompt's blocks then go through the layers there where the model allows it and the GPU
  * is faster; see forwardMany. gpuRoom (T148): the bytes this device can give the GPU's copy of the layers (the
- * worker's reckoning from navigator.deviceMemory; none said: no limit). gpuRemembered: what the page kept of the GPU's
- * shaders on an earlier visit ({ key, matrices, attention }, gpu.js). */
+ * worker's reckoning from navigator.deviceMemory; none said: no limit). memoryUnsaid (T205): the browser does not say
+ * how much memory the device has (no navigator.deviceMemory: Safari, Firefox); a generation's steps then stay on the
+ * CPU. gpuRemembered: what the page kept of the GPU's shaders on an earlier visit ({ key, matrices, attention },
+ * gpu.js). */
 /** wrap (tests/profile.mjs only): gets the kernels' exports and returns what to call instead, to time the forward
  * pass with some kernels replaced by functions that do nothing. */
 /** stalledMs (tests only): how long a phase may make no progress before its software threads are given up (T120) */
@@ -400,7 +402,7 @@ function halfToFloat(h) {
  * first right shader of the matrices untimed, and no block timed (SwiftShader timing Llama 3.2 1B's took more than
  * gpu.js's STEP_MS in CI, T147); pieceBytes (T155), the most bytes of a piece of a matrix on the GPU, so that a small
  * model goes in pieces as a matrix past a buffer of the device does */
-export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, gpuRemembered, gpuForce = {},
+export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce = {},
   halfKeys, wrap = (exports) => exports, stalledMs = STALLED_MS, clock = () => performance.now() }) {
   const { dim, n_layers: layers, n_heads: heads, n_kv_heads: kvHeads, head_size: headSize, vocab_size: vocab,
     seq_len: seqLen, rotary, arch } = plan;
@@ -994,6 +996,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (!wcls?.int8 || wcls.group !== 32 || !["int8", "int6"].includes(embedding.kind) || embedding.group !== 32) {
       return "a classifier of float weights is not on the GPU's tokens";
     }
+    // T205: the classifier and the embedding on the GPU as well (llm-jp-3 150M's 73 MB of layers came to 189 MB) where
+    // the browser does not say what the device has: an iPhone's tab went down in /benchmark/'s model section. The
+    // prompts' blocks still go (their layers alone)
+    if (memoryUnsaid) return "this browser does not say how much memory the device has";
     const table = vocab * dim * (1 + 4 / 32);
     const onGpu = layersOnGpu() + table * (plan.shared_classifier ? 1 : 2) + seqLen * headSize * 4 + 3 * vocab * 4;
     if (gpuRoom !== undefined && onGpu > gpuRoom) {
