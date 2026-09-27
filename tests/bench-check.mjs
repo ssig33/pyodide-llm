@@ -12,6 +12,9 @@ import fs from "node:fs";
 import path from "node:path";
 import * as playwright from "playwright-core";
 
+// T180: the browsers' profiles, in the repository's .tmp/ (never $HOME or /tmp)
+const PROFILES = path.join(path.dirname(new URL(import.meta.url).pathname), "..", ".tmp", "bench-check-profiles");
+
 const args = process.argv.slice(2);
 const option = (name, value) => {
   const at = args.indexOf(name);
@@ -70,14 +73,20 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   const branded = ["chrome", "msedge"].includes(engine);
   const type = branded ? playwright.chromium : playwright[engine];
   console.log(`### ${engine}`);
-  let browser;
+  // T180: a profile on the disk, not the throwaway (off-the-record) one of browser.newContext(): Chromium keeps an
+  // off-the-record profile's storage in memory, and on macOS' runner (7 GB) the model section's llm-jp-3 150M in the
+  // cache and the storage section's 256 MiB no longer fit ("No space" at about 200 MB, 2026-09-27). A visitor's
+  // browser keeps its storage on the disk, as this does. The profile is removed when the browser closes.
+  const profile = path.join(PROFILES, `${engine}-${process.pid}`);
+  let context;
   try {
-    browser = await type.launch({ ...(branded ? { channel: engine } : {}), args: branded || engine === "chromium" ? WEBGPU : [] });
+    fs.rmSync(profile, { recursive: true, force: true });
+    context = await type.launchPersistentContext(profile, { ...(branded ? { channel: engine } : {}), args: branded || engine === "chromium" ? WEBGPU : [] });
   } catch (error) {
     console.log(`could not start: ${String(error.message).split("\n")[0]}\n`);
     continue;
   }
-  const page = await (await browser.newContext()).newPage();
+  const page = context.pages()[0] ?? await context.newPage();
   await page.addInitScript(watchStages);
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error.message)));
@@ -92,7 +101,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
         if (!/destroyed|navigat|detached/i.test(String(error.message))) throw error;
       }
     }
-    console.log(`${browser.version()}\n`);
+    console.log(`${await page.evaluate(() => navigator.userAgent)}\n`);
     const { results, markdown } = await page.evaluate(() => window.__benchmark);
     console.log(markdown, "\n");
     const statuses = Object.entries(results).map(([name, result]) => `${name} ${result.status}`);
@@ -126,8 +135,13 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   console.log("");
   // T141: Windows' WebKit sometimes never returns from close(), and each browser waits for the one before it (bench.yml's
   // Windows job sat 55 minutes after WebKit's report, 2026-09-27): give it 15 seconds and go on
-  const closed = await Promise.race([browser.close().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 15000))]);
+  const closed = await Promise.race([context.close().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 15000))]);
   if (!closed) console.log(`${engine}: the browser did not close within 15 s; going on`);
+  try {
+    fs.rmSync(profile, { recursive: true, force: true });
+  } catch {
+    // a browser that did not close may hold its files: they go with the runner (or .tmp/ on this machine)
+  }
 }
 server?.close();
 process.exit(failed ? 1 : 0);

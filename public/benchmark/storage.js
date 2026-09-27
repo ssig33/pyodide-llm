@@ -73,7 +73,12 @@ async function run(mib) {
     const put = (i) => {
       fill(bytes, i);
       const written = handle.write(bytes, { at: i * PIECE });
-      if (written !== PIECE) throw new Error(`piece ${i}: ${written} of ${PIECE} bytes written`);
+      // T180: Chromium hands back a file error as a negative count read unsigned (4294967288 is -8, no space)
+      if (written !== PIECE) {
+        const code = written > 0x7fffffff ? written - 0x100000000 : written;
+        throw new Error(code < 0 ? `piece ${i}: the browser could not write it (error ${code}${code === -8 ? ": no space left" : ""})`
+          : `piece ${i}: ${written} of ${PIECE} bytes written`);
+      }
     };
     // (a) in order and (b) far apart, one flush at the end
     const once = (order) => {

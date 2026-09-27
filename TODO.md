@@ -454,6 +454,11 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 持ち主に見てもらうこと: preview.yml の画面（棒の色と太さ、帯の位置、全体の行の位置と言い方）。GPU の節の段の名前は長いものがあり、スマホでは 2 行に折れる。
 
 - **本線に入れた（2026-09-27、持ち主が `preview.yml` の画面を見て「なんかよさそう。入れてみて違ったらまた言うよ」）**。画面で気づいた別件: スマホ幅で機能の表の「storage the browser grants」の値が右で切れる（T177 の前から）。
+### T180 [バグ] macOS の CI で保存の節が「No space」で落ちる — 状態: **直した（2026-09-27）。本番の bench.yml で確かめる**（規模 小）
+- 根拠: T176 でベンチの既定のモデルを llm-jp-3 150M にしてから、bench.yml の macOS の Chromium と Edge で保存の節が「piece 23: 4294967288 of 8388608 bytes written」で落ちる（4294967288 は −8、Chromium のファイルの誤り NO_SPACE）。ブラウザは 2.1 GB を許すと言っている。`model=tiny-lm` で走らせ直すと通った（36300676711）。**見立て**: Playwright の `browser.newContext()` は使い捨て（off-the-record）のプロファイルで、Chromium はその保存をメモリに置く。macOS のランナー（7 GB）では、モデルの節がキャッシュに置いた 171 MB と保存の節の 256 MiB が入らない。Linux（16 GB）では起きない。
+- 直し: `tests/bench-check.mjs` はディスクの上のプロファイル（`launchPersistentContext`、リポジトリの `.tmp/bench-check-profiles/`、閉じたら消す）で開く（訪問者のブラウザもディスクに置くので、こちらが近い）。ページの `storage.js` は負の数（符号なしで読んだもの）を「the browser could not write it (error −8: no space left)」と読める文にする。モデルのキャッシュを保存の節の前に消す形は採らない（訪問者のキャッシュを消すことになる）。
+- 確かめ: 手元の Chromium で `--run device,storage`（プロファイルは消えた）。bench.yml を既定（llm-jp-3 150M）で走らせ、macOS の Chromium と Edge の保存の節が通ること。
+
 ### T179 [バグ] bench-check が Windows の WebKit の close() で止まる — 状態: **済（2026-09-27、持ち主「CI まだ不具合のこってるじゃねえか」）**（規模 小）
 - 根拠: bench.yml（36296244022、T176 の後）の Windows のジョブが、WebKit の節の報告（05:15）の後、次の Chrome を始めないまま 55 分止まり、取り消した。T141 で `e2e.mjs`・`bench-browser.mjs`・`stock-firefox.mjs` の `browser.close()` に 15 秒の見切りを入れたが、T134 で足した `tests/bench-check.mjs` に入れていなかった。
 - 直し: `bench-check.mjs` の close にも 15 秒の見切り（見切ったら 1 行言って次のブラウザへ。終わりは前から `process.exit`）。
