@@ -1133,7 +1133,7 @@ async function timeTokens(m, forms) {
 
 // ---- T152's check of a form on the model's own weights, against JavaScript (the drivers, the subgroups and the
 // packed dot differ from device to device, and only the device can say):
-//   1. EMBED of the last token of the vocabulary and the first layer at position 1 (the cache's row 0 of random
+//   1. EMBED of a token of the second half of the vocabulary and the first layer at position 1 (the cache's row 0 of random
 //      float16), the stream h and the keys and values of position 1 read back: against JavaScript's layer in float64
 //      (the weights read from the shared memory as forward.js holds them: int6 widened by shaders.js's sixValues; RoPE
 //      from the CPU's tables; the keys and values rounded to float16 where the attention reads them; on DP4A each
@@ -1181,7 +1181,12 @@ async function checkTokens(m, form) {
   const owned = [];
   try {
     // 1. the first layer at position 1
-    const token = vocab - 1, pos = 1;
+    // a token of the second half of the vocabulary whose row is large: the rows of tokens no text has (llm-jp-3's
+    // last) are nearly 0, and their keys and values then float16's subnormals (a check of them was 15% off, CI)
+    const embeddingOf = plan.tokens.embedding ?? plan.tokens.classifier, groups = dim / wgsl.GROUP;
+    const sizeOf = (t) => new Float32Array(m.memory.buffer, embeddingOf.at[1] + t * groups * 4, groups).reduce((sum, v) => sum + Math.abs(v), 0);
+    const token = [...Array(64).keys()].map((i) => vocab - 1 - Math.floor((i * vocab) / 128)).reduce((best, t) => (sizeOf(t) > sizeOf(best) ? t : best));
+    const pos = 1;
     const halfBits = () => (Math.random() < 0.5 ? 0x8000 : 0) | ((13 + ((Math.random() * 3) | 0)) << 10) | ((Math.random() * 1024) | 0);
     const row0 = [0, 1].map(() => new Uint16Array(kvDim).map(halfBits));
     if (m.cache.capacity < 2) grow(m, 2);
