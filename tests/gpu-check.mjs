@@ -58,7 +58,9 @@
 // stop token (NumPy's second) ends the steps after it; a penalty of 100 on NumPy's first id (greedy) gives the largest
 // of NumPy's logits penalized so (or a near tie); two sampled steps at temperature 2 with random numbers of 0.02 and
 // 0.98 give two tokens of NumPy's nucleus, not the same (the random numbers reach the GPU: where either lands is not
-// held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js).
+// held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js); and 4
+// steps after the prompt went through the CPU while the GPU's own cache held the keys and values of other tokens
+// (a prompt of them through the GPU first): NumPy's ids, or a near tie (the CPU's keys and values went up).
 //
 // T183: what a person reads to judge it, in the log of CI (the development machine does not run WebGPU's tests): E16,
 // how far NumPy's answer moves when nothing but its cache is rounded to float16 (answer(half=True), T153's review), and
@@ -431,6 +433,13 @@ try {
       out.penaltyHistory = [...tokens.slice(0, -1), greedy[0], tokens[n]];
       out.penalized = engine.generateMany(tokens[n], n, out.penaltyHistory.slice(-64), out.penaltyHistory.length, 1, 0, 0.9, 100, [], []);
       out.sampled = [0.02, 0.98].map((random) => ask(tokens[n], n, [], 1, [2, 0.999, 1], [random]));
+      // the CPU's keys and values going up: a prompt of other tokens through the GPU (its own cache then holds theirs),
+      // the prompt through the CPU, and the GPU's steps from its last token, which must see the CPU's of every position
+      engine.forwardMany(tokens.slice(1, -1).reverse(), 0);
+      engine.gpuSide = "cpu";
+      engine.forwardMany(tokens.slice(0, -1), 0);
+      engine.gpuSide = null;
+      out.uploaded = ask(tokens[n], n, [], 4);
       return out;
     };
     const run = async (gpu, gpuForce, gpuRemembered, steps = false) => {
@@ -809,7 +818,11 @@ function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
     return same;
   };
   const first = run(steps.first, 0, 4), second = first === 4 ? run(steps.second, 5, 3) : 0;
+  // the steps after the prompt went through the CPU (the GPU's cache held another's): NumPy's, or a near tie
+  const kept = positions.length, uploaded = run(steps.uploaded, 0, 4);
+  positions.length = kept;
   said.push(`${first}${first === 4 ? ` and ${second}` : ""} greedy ids as NumPy's${first === 4 && second === 3 ? "" : " (then a near tie)"}` +
+    `, after a prompt on the CPU ${uploaded}` +
     (first === 4 ? `, the CPU's step between them ${steps.cpuStep === greedy[4] ? "NumPy's" : `${steps.cpuStep} (NumPy's ${greedy[4]})`}` : ""));
   // the keys and values the GPU wrote back of the positions whose inputs were NumPy's (not the CPU's step's: the CPU's)
   const layers = ref.header[2];
