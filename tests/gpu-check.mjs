@@ -706,7 +706,8 @@ function scaleOff(got, want) {
   return gw / ww - 1;
 }
 // the status of a GPU that takes the prompts (T152: what it says of the tokens after it)
-const promptsOnGpu = (note) => /^prompts on WebGPU($|, )/.test(note ?? "");
+// (T152: "prompts and answers on WebGPU", or "prompts on WebGPU, answers on the CPU")
+const promptsOnGpu = (note) => /^prompts (and answers )?on WebGPU($|, )/.test(note ?? "");
 let failed = false;
 for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;

@@ -138,6 +138,23 @@ export function tokenTimes() {
   };
 }
 
+// T152: what the status line says of the GPU (the owner's words, 2026-09-27): prompts, the prompt's side as the prompts'
+// verdict has it (PROMPTS_* below, "prompts of N tokens and more on WebGPU", or on the CPU and why), and answers, the
+// generation's steps: "gpu", "cpu" (faster here), "why" (the GPU does not take them: why is in the console alone),
+// "untimed", or null where there is nothing to say of them (no GPU, or the prompts are on the CPU for a reason)
+export const PROMPTS_UNTIMED = "prompts on WebGPU where it is faster than the CPU";
+export const PROMPTS_GPU = "prompts on WebGPU";
+export const PROMPTS_CPU = "prompts on the CPU (faster here than WebGPU)";
+const ANSWERS = { gpu: "answers on WebGPU", cpu: "answers on the CPU (faster here)", why: "answers on the CPU",
+  untimed: "answers on WebGPU where it is faster than the CPU" };
+export function gpuLine(prompts, answers) {
+  if (!prompts || !answers) return prompts;
+  if (prompts === PROMPTS_UNTIMED && answers === "untimed") return "WebGPU where it is faster than the CPU";
+  if (prompts === PROMPTS_GPU && answers === "gpu") return "prompts and answers on WebGPU";
+  if (prompts === PROMPTS_CPU && answers === "cpu") return "prompts and answers on the CPU (faster here than WebGPU)";
+  return `${prompts}, ${ANSWERS[answers]}`;
+}
+
 // T184: the model page's own path on /benchmark/ (worker.js's timedPaths, src/bench.js's pathTable): prompts of counts
 // tokens through forwardMany() at position 0 as the page chooses (T148), on the CPU only and on the GPU only
 // (engine.gpuSide). The sides take turns, a warm-up round and then PATH_ROUNDS, so that a device that heats up or is
@@ -908,16 +925,13 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   let gpuReason = null, gpuSide = null;
   const times = promptTimes();
   // T152: a generation's steps. tokensOn: the GPU takes them where it is faster (steps: their times); tokenStatus: what
-  // the status line says of them; tokenRecheck, cpuRecheck, sinceTokens: the side not chosen timed again now and then
+  // the status line says of them (gpuLine's answers); tokenRecheck, cpuRecheck, sinceTokens: the side not chosen timed again now and then
   // (the CPU's first TOKEN_RECHECK steps of a generation, or the GPU's first run), every GPU_RECHECK generations after
   // the first verdict, as a prompt's; gpuSampled: the steps the GPU took since the generation began
   let tokensOn = false, tokenStatus = null, tokensReason = tokensWhyNot, tokenRecheck = null, cpuRecheck = 0, sinceTokens = 0, gpuSampled = 0;
   const steps = tokenTimes();
-  // what the status line says of the GPU: of the prompts, then of the tokens where there is something to say
-  const statusNow = () => {
-    const parts = [gpuStatus, tokenStatus].filter(Boolean);
-    return parts.length ? parts.join(", ") : gpuStatus;
-  };
+  // what the status line says of the GPU: of the prompts, and of the answers where there is something to say (gpuLine)
+  const statusNow = () => gpuLine(gpuStatus, tokenStatus);
   const gpuNote = !gpu ? undefined : new Promise((resolve) => {
     settleGpu = (note) => {
       settleGpu = null;
@@ -1026,18 +1040,20 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
           tokensOn = true;
           gpuChosen.tokens = data.tokens.form;
           if (data.tokens.ms !== undefined) steps.gpu(data.tokens.ms);
-          tokenStatus = gpuForce.always ? "tokens on WebGPU" : "tokens on WebGPU where it is faster than the CPU";
+          tokenStatus = gpuForce.always ? "gpu" : "untimed";
           const kinds = data.tokens.forms.map((f) => `${f.name} ${f.none ?? (f.remembered ? "remembered" : f.ms ? `${f.ms.toFixed(2)} ms` : "untimed")}`).join("; ");
           console.info(`gpu: a token by ${data.tokens.form} (a step of a run of ${GPU_TOKENS}: ${kinds})`);
         } else if (data.tokensWhy) {
           tokensReason = data.tokensWhy;
-          tokenStatus = `tokens on the CPU (${tokensReason})`;
-          console.info(`gpu: tokens on the CPU (${tokensReason})`);
+          tokenStatus = "why";
+          console.info(`gpu: answers on the CPU (${tokensReason})`);
         } else if (tokensReason) {
-          // (T152's review: a model whose steps were not asked of the GPU says why too, in the console)
-          console.info(`gpu: tokens on the CPU (${tokensReason})`);
+          // (T152's review: a model whose steps were not asked of the GPU says why too, in the console alone: the
+          // owner's words have the status line say no reason for the answers)
+          tokenStatus = "why";
+          console.info(`gpu: answers on the CPU (${tokensReason})`);
         }
-        settleGpu?.(gpuForce.always ? "prompts on WebGPU" : "prompts on WebGPU where it is faster than the CPU");
+        settleGpu?.(gpuForce.always ? PROMPTS_GPU : PROMPTS_UNTIMED);
       } else if (data.type === "unusable") {
         stopGpu(data.reason);
       } else if (data.type === "failed") {
@@ -1085,8 +1101,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function verdict() {
     const most = times.of(GPU_BLOCK, threads), from = times.threshold(GPU_BLOCK, threads);
     if (!most || gpuForce.always) return;
-    const status = from > GPU_BLOCK ? "prompts on the CPU (faster here than WebGPU)"
-      : from > BATCH ? `prompts of ${Math.ceil(from / BATCH) * BATCH} tokens and more on WebGPU` : "prompts on WebGPU";
+    const status = from > GPU_BLOCK ? PROMPTS_CPU
+      : from > BATCH ? `prompts of ${Math.ceil(from / BATCH) * BATCH} tokens and more on WebGPU` : PROMPTS_GPU;
     if (status !== gpuStatus) {
       console.info(`gpu: a block of ${GPU_BLOCK} tokens: ${most.gpu.toFixed(1)} ms on the GPU, ${most.cpu.toFixed(1)} ms on the ` +
         `CPU (${threads} thread${threads > 1 ? "s" : ""}), the GPU from ${from > GPU_BLOCK ? "no count" : `${from} tokens`}: ${status}`);
@@ -1143,10 +1159,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function tokenVerdict() {
     const known = tokensOn && !gpuForce.always ? steps.of(threads) : null;
     if (!known) return;
-    const status = known.faster ? "tokens on WebGPU" : "tokens on the CPU (faster here than WebGPU)";
+    const status = known.faster ? "gpu" : "cpu";
     if (status !== tokenStatus) {
       console.info(`gpu: a step of a generation: ${known.gpu.toFixed(2)} ms on the GPU, ${known.cpu.toFixed(2)} ms on the CPU ` +
-        `(${threads} thread${threads > 1 ? "s" : ""}): ${status}`);
+        `(${threads} thread${threads > 1 ? "s" : ""}): answers on ${known.faster ? "WebGPU" : "the CPU"}`);
     }
     tokenStatus = status;
   }
@@ -1270,9 +1286,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     get gpuAttention() {
       return gpuChosen?.attention;
     },
-    /** T135: where the worker has WebGPU, a promise of what the status line says of the GPU ("prompts on WebGPU
-     * where it is faster than the CPU", or on the CPU and why), settled once the layers are on the GPU or it is known
-     * that they will not be. T148: nothing waits for it */
+    /** T135: where the worker has WebGPU, a promise of what the status line says of the GPU (gpuLine: "WebGPU where it
+     * is faster than the CPU", or on the CPU and why), settled once the layers are on the GPU or it is known that they
+     * will not be. T148: nothing waits for it */
     gpu: gpuNote,
     /** T148: what the status line says of the GPU now (it changes with the times of the prompts), and what the GPU
      * chose as it started ({ matrices, attention, key, remembered, seconds }: the page shows it and remembers it) */
@@ -1328,7 +1344,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (stopList.length > STOPS_MOST) {
         tokensOn = false;
         tokensReason = `more than ${STOPS_MOST} stop tokens`;
-        tokenStatus = `tokens on the CPU (${tokensReason})`;
+        tokenStatus = "why";
+        console.info(`gpu: answers on the CPU (${tokensReason})`);
         return undefined;
       }
       const began = performance.now();

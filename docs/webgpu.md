@@ -41,9 +41,12 @@ tokens, and the fixed cost is shared among them.
 The page is ready without waiting for the GPU: until the GPU is ready, prompts run on the CPU. The shape it chose
 is remembered per model and device, so the next visit compiles two shaders instead of all of them.
 
-The status line says what happens: "prompts on WebGPU", "prompts of 29 tokens and more on WebGPU", "prompts on the
-CPU (faster here than WebGPU)", or "prompts on the CPU (reason)", and then "tokens on WebGPU", "tokens on the CPU
-(faster here than WebGPU)" or "tokens on the CPU (reason)".
+The status line says what happens. Before the page has timed both sides it says "WebGPU where it is faster than the
+CPU". Then it says "prompts and answers on WebGPU" where the GPU is faster for both, "prompts on WebGPU, answers on
+the CPU (faster here)" where the CPU writes the answer faster, and "answers on the CPU" where the GPU cannot write
+the answer for this model (the reason is in the console). The prompts can also say "prompts of 29 tokens and more on
+WebGPU", "prompts on the CPU (faster here than WebGPU)", or "prompts on the CPU (reason)" where the GPU is not used
+at all.
 
 ## Where the GPU is not used
 

@@ -314,8 +314,9 @@ if (isMainThread) {
     const seen = [];
     for (let g = 1; g <= generations; g++) seen.push(write(engine));
     say(`${name}: [on the GPU, on the CPU] ${seen.map((pair) => pair.join("/")).join(" ")}; status ${engine.gpuStatus}`);
+    const status = engine.gpuStatus;
     engine.release();
-    return seen;
+    return Object.assign(seen, { status });
   };
   {
     const seen = await steps("the steps, a GPU far faster", 0.2, 12);
@@ -323,14 +324,21 @@ if (isMainThread) {
     expect("then every step on the GPU", seen.slice(1, 8), all(2, 8, [STEPS, 0]));
     expect("the eighth after the first verdict: its first 4 on the CPU", seen[8], [STEPS - 4, 4]);
     expect("and the GPU again", seen.slice(9), all(10, 12, [STEPS, 0]));
+    // (the owner's words, 2026-09-27: "prompts and answers on WebGPU", or the prompts' own verdict and "answers on WebGPU")
+    expect(`the status line says the answers are on WebGPU (${seen.status})`, /answers on WebGPU$/.test(seen.status), true);
   }
   {
     const seen = await steps("the steps, a GPU far slower", 5, 12);
-    expect("every step on the CPU but the check's first run", seen, [...all(1, 8, [0, STEPS]), [4, STEPS - 4], ...all(10, 12, [0, STEPS])]);
+    expect("every step on the CPU but the check's first run", [...seen], [...all(1, 8, [0, STEPS]), [4, STEPS - 4], ...all(10, 12, [0, STEPS])]);
+    // ("prompts on WebGPU, answers on the CPU (faster here)", or both on the CPU where the prompts are too)
+    expect(`the status line says the answers are on the CPU, faster (${seen.status})`,
+      /(, answers on the CPU \(faster here\)|^prompts and answers on the CPU \(faster here than WebGPU\))$/.test(seen.status), true);
   }
   {
     const seen = await steps("the steps, a GPU that fails on its second request", 0.2, 2, 2);
-    expect("the CPU from the failure on", seen, [[4, STEPS - 4], [0, STEPS]]);
+    expect("the CPU from the failure on", [...seen], [[4, STEPS - 4], [0, STEPS]]);
+    expect(`the status line says why the prompts are on the CPU, and nothing of the answers (${seen.status})`,
+      /^prompts on the CPU \(.*failed on a token/.test(seen.status) && !/answers/.test(seen.status), true);
   }
   // T152: Python's generate() through forward.js's external() (as the page's worker has it) on the made-up GPU far
   // faster: the steps go to it (Python draws the random numbers and hands the history over as the made-up GPU expects),

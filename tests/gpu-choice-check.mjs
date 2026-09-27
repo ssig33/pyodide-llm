@@ -2,7 +2,7 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { promptTimes, tokenTimes } from "../public/forward.js";
+import { gpuLine, PROMPTS_CPU, PROMPTS_GPU, PROMPTS_UNTIMED, promptTimes, tokenTimes } from "../public/forward.js";
 import { halvesOf } from "../public/shaders.js";
 
 // a GPU with a fixed cost of 40 ms a block and 0.5 ms a token (16 tokens 48 ms, 64 tokens 72 ms)
@@ -117,5 +117,20 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   assert.equal(one(65520), 0x7c00, "past the largest: the infinity");
   assert.equal(one(2 ** -25), 0, "half the least subnormal: 0 (the even one)");
   assert.equal(one(-(2 ** -26)), 0x8000, "below it: -0");
+}
+// T152: the status line's words (the owner's, 2026-09-27): both on the GPU, before either is timed, the answers alone on
+// the CPU (faster here), and a reason for the answers (in the console alone)
+{
+  assert.equal(gpuLine(PROMPTS_GPU, "gpu"), "prompts and answers on WebGPU");
+  assert.equal(gpuLine(PROMPTS_UNTIMED, "untimed"), "WebGPU where it is faster than the CPU");
+  assert.equal(gpuLine(PROMPTS_GPU, "cpu"), "prompts on WebGPU, answers on the CPU (faster here)");
+  assert.equal(gpuLine(PROMPTS_GPU, "why"), "prompts on WebGPU, answers on the CPU");
+  assert.equal(gpuLine(PROMPTS_UNTIMED, "why"), "prompts on WebGPU where it is faster than the CPU, answers on the CPU");
+  assert.equal(gpuLine(PROMPTS_CPU, "cpu"), "prompts and answers on the CPU (faster here than WebGPU)");
+  assert.equal(gpuLine(PROMPTS_CPU, "gpu"), "prompts on the CPU (faster here than WebGPU), answers on WebGPU");
+  assert.equal(gpuLine("prompts of 32 tokens and more on WebGPU", "gpu"), "prompts of 32 tokens and more on WebGPU, answers on WebGPU");
+  assert.equal(gpuLine(PROMPTS_GPU, "untimed"), "prompts on WebGPU, answers on WebGPU where it is faster than the CPU");
+  assert.equal(gpuLine("prompts on the CPU (no GPU adapter here)", null), "prompts on the CPU (no GPU adapter here)");
+  assert.equal(gpuLine(undefined, null), undefined);
 }
 console.log("ok");

@@ -279,8 +279,8 @@ if (!/tok\/s/.test(result.meta)) failures.push("no speed line under the answer")
 if (result.pageScrolls) failures.push("the page itself scrolls");
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
 if (gpuTest && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
-// T152: where the status says the GPU takes the tokens (a model it takes them of), they went through it
-if (gpuTest && /tokens on WebGPU/.test(result.status) && !/on WebGPU/.test(result.generated)) {
+// T152: where the status says the GPU takes the answers (a model it takes them of), they went through it
+if (gpuTest && /answers on WebGPU/.test(result.status) && !/on WebGPU/.test(result.generated)) {
   failures.push(`the tokens did not go through the GPU (${result.generated || "no line of the tokens"}; ${result.status})`);
 }
 // (refused as a fallback adapter, or before that for another reason: a page that is not cross-origin isolated)

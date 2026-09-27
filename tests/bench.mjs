@@ -300,12 +300,12 @@ assert.ok(unmeasured.at(-1).includes("not measured here"), unmeasured.at(-1));
 // T184: the model page's own path, one table: a device whose GPU took the prompts, one whose GPU stopped while timed,
 // CI's fallback adapter, a model the GPU does not take, a failure
 const cell = (speed, low, high, gpuTokens, unsteady = false) => ({ speed, low, high, gpuTokens, unsteady });
-const real = { threads: 4, gpu: { seconds: 4.23, matrices: "TF.js 64×64", attention: "llama.cpp flash" }, status: "prompts of 32 tokens and more on WebGPU",
+const real = { threads: 4, gpu: { seconds: 4.23, matrices: "TF.js 64×64", attention: "llama.cpp flash" }, status: "prompts of 32 tokens and more on WebGPU, answers on the CPU (faster here)",
   rows: [{ what: "prompt", tokens: 64, chosen: cell(820.4, 800, 830, 64), cpu: cell(612, 600, 640, 0, true), gpu: cell(830, 810, 840, 64) },
          { what: "prompt", tokens: 256, chosen: cell(1300, 1280, 1310, 192), cpu: cell(650, 640, 655, 0), gpu: cell(1310, 1300, 1320, 256) },
          { what: "generation", tokens: 64, chosen: { same: "cpu" }, cpu: cell(80.44, 79.1, 81.2), gpu: { skip: "not on the GPU yet" } }] };
 const pathLines = pathTable(real, "llm-jp-3 150M").split("\n");
-assert.equal(pathLines[0], "**The model page's path** (llm-jp-3 150M): 4 software threads · WebGPU ready in 4.2 s · matrices by TF.js 64×64 · attention by llama.cpp flash · prompts of 32 tokens and more on WebGPU");
+assert.equal(pathLines[0], "**The model page's path** (llm-jp-3 150M): 4 software threads · WebGPU ready in 4.2 s · matrices by TF.js 64×64 · attention by llama.cpp flash · prompts of 32 tokens and more on WebGPU, answers on the CPU (faster here)");
 assert.ok(pathLines.includes("| a prompt of 64 tokens | 820 tok/s (800–830), GPU | 612 tok/s (600–640, unsteady) | 830 tok/s (810–840) | 1.4× |"), pathLines.join("\n"));
 assert.ok(pathLines.includes("| a prompt of 256 tokens | 1300 tok/s (1280–1310), GPU 192 of 256 | 650 tok/s (640–655) | 1310 tok/s (1300–1320) | 2.0× |"), pathLines.join("\n"));
 assert.ok(pathLines.includes("| writing 64 tokens | same as CPU only | 80.4 tok/s (79.1–81.2) | not on the GPU yet |  |"), pathLines.join("\n"));
