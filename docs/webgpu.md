@@ -62,7 +62,7 @@ The shapes are taken from public implementations, and each file keeps their noti
 | Attention | llama.cpp's `flash_attn_tile` (MIT). The path for devices without subgroups is ours. |
 | RMSNorm, and Qwen3's per-head norms of q and k | llama.cpp's `rms_norm_mul` (MIT) |
 | Qwen2's biases of q, k and v, GPT-2's and GPT-NeoX's biases | llama.cpp's `binary` ADD (MIT) |
-| LayerNorm of GPT-2 and GPT-NeoX | llama.cpp's `row_norm` NORM (MIT), with the weight and the bias in the same dispatch |
+| LayerNorm of GPT-2 and GPT-NeoX | llama.cpp's `row_norm` NORM (MIT), with the weight and the bias in the same dispatch as llama.cpp's Metal `kernel_norm_mul_add_f32` has them (MIT) |
 | GELU of GPT-2 and GPT-NeoX | llama.cpp's `unary` GELU (MIT) |
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
 | One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |

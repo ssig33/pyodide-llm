@@ -769,7 +769,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 //
 // The row of a norm, its weight broadcast over the rows and the in-place form adapted from llama.cpp,
 // ggml/src/ggml-webgpu/wgsl-shaders/rms_norm_mul.wgsl and binary.wgsl (OP_ADD, INPLACE; ADD below), and (T154)
-// row_norm.wgsl (NORM: LAYER_NORM below) and unary.wgsl (GELU: GELU below)
+// row_norm.wgsl (NORM: LAYER_NORM below) and unary.wgsl (GELU: GELU below), and the fusion of LAYER_NORM's last line
+// from ggml/src/ggml-metal/kernels/norm.metal (kernel_norm_mul_add_f32, F == 3; ggml-metal-fusion.cpp's NORM_MUL_ADD)
 // (https://github.com/ggml-org/llama.cpp, commit 2145525a, 2026-09-26), under the MIT License:
 //
 // Copyright (c) 2023-2026 The ggml authors
@@ -815,9 +816,10 @@ export const HEAD_NORM = rmsNorm(true);
 // T154: LayerNorm (GPT-2's and GPT-NeoX's), out = weight * ((x - mean) / sqrt(variance + eps)) + bias, as the CPU's
 // layernorm kernel computes it: llama.cpp's row_norm.wgsl with NORM (the notice above: the sum of the row, its mean,
 // then the sum of the squares about the mean, a reduction of the workgroup each), in the frame of RMSNORM above: one
-// workgroup a row, the tokens the dispatch's y. Changed: the weight's MUL and the bias's ADD, which llama.cpp runs as
-// two dispatches of binary.wgsl after the NORM, are the last line of this one (as rms_norm_mul.wgsl folds the MUL into
-// RMS_NORM, and the CPU's kernel does all three at once); both are this layer's, from float at.
+// workgroup a row, the tokens the dispatch's y. The weight's MUL and the bias's ADD, which llama.cpp's WebGPU runs as
+// two dispatches of binary.wgsl after the NORM, are the last line of this one, as llama.cpp's Metal fuses NORM, MUL and
+// ADD (kernel_norm_mul_add_f32: (y * scale) * f0 + f1, y = x - mean, the rounding in the same order as here and as the
+// CPU's kernel); both are this layer's, from float at.
 export const LAYER_NORM = /* wgsl */ `
 struct Norm { size: u32, at: u32, eps: f32, unused: u32 }
 ${STEP}

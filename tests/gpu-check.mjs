@@ -32,7 +32,9 @@
 // hides a wrong one); both of three layers. T154: "synthetic-gpt2", GPT-2's form (LayerNorm with biases, a bias after
 // every matrix, an FFN of two matrices and GELU, learned positions and no RoPE), and "synthetic-neox", GPT-NeoX's (the
 // same with RoPE on the first quarter of every head, as Pythia's rotary_pct 0.25, and the parallel residual), both of
-// three layers and 4 heads of keys and values (neither has grouped-query attention). The others are the models of this directory (make models kernels), or <prefix>.json: a
+// three layers and 4 heads of keys and values (neither has grouped-query attention), their biases drawn around 0 (the
+// review of T154: a bias of 1 ± 0.03 is nearly the same number everywhere, and LayerNorm's mean takes most of it out);
+// "synthetic-neox-256", GPT-NeoX with Pythia 1B's heads of 256 (dim 512, 2 heads), 64 of them turned. The others are the models of this directory (make models kernels), or <prefix>.json: a
 // model tests/perplexity_prepare.py converted (<prefix>.bin, <prefix>.tokenizer.bin, and the options in <prefix>.json;
 // gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
 // the native Python ($PYTHON, python3 by default).
@@ -58,13 +60,15 @@ const engine = option("--engine", "chromium");
 // T147: --forms <part,part>: only the matrices' shaders whose names hold one of these (all of them by default)
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
-const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "synthetic-gpt2", "synthetic-neox", "stories15M", "tiny-lm", "llm-jp-3-150m"];
+const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "synthetic-gpt2", "synthetic-neox", "synthetic-neox-256",
+  "stories15M", "tiny-lm", "llm-jp-3-150m"];
 // T153: the made-up models of another form (see above). Three layers: a layer's vectors are read at l × their size,
 // which a second layer alone would not tell from 0 + size
 const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias: true }, { bias: true, rms_norm_eps: 1e-6 }],
   "synthetic-qwen3": [{ layers: 3, qk_norm: true, head_dim: 32 }, { qk_norm: true, head_dim: 32, rms_norm_eps: 0.5 }],
   "synthetic-gpt2": [{ layers: 3, kv_heads: 4, arch: "gpt2" }, { arch: "gpt2" }],
-  "synthetic-neox": [{ layers: 3, kv_heads: 4, arch: "neox" }, { arch: "neox", rotary: 4, parallel_residual: true }] };
+  "synthetic-neox": [{ layers: 3, kv_heads: 4, arch: "neox" }, { arch: "neox", rotary: 4, parallel_residual: true }],
+  "synthetic-neox-256": [{ dim: 512, hidden: 1024, layers: 3, heads: 2, kv_heads: 2, arch: "neox" }, { arch: "neox", rotary: 64, parallel_residual: true }] };
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
@@ -111,12 +115,17 @@ def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_
     rng = np.random.default_rng(seed)
     header = (dim, hidden, layers, heads, kv_heads, vocab, seq_len)
     out = [struct.pack("<7i", *header)]
+    # T154: GPT-2's and GPT-NeoX's vectors (Llama.gpt2_tensors' order) are the weights of the LayerNorms at 0, 6 and 10,
+    # and biases, which are drawn around 0 as the matrices are
+    vectors, weights = 0, (0, 6, 10) if form.get("arch", "llama") in ("gpt2", "neox") else None
     for shape, is_matrix in llama2_convert.layout(*header, **form):
         if is_matrix is None:
             continue  # the RoPE tables: an int8 file leaves them out
         values = (rng.standard_normal(shape) * 0.3).astype(np.float32)
         if not is_matrix:
-            out.append((1.0 + values * 0.1).astype(np.float32).tobytes())
+            bias = weights is not None and vectors not in weights
+            vectors += 1
+            out.append((values if bias else 1.0 + values * 0.1).astype(np.float32).tobytes())
             continue
         q, scales = llama2_convert.quantize(values.reshape(-1, shape[-1]))
         out += [q.tobytes(), scales.tobytes()]
