@@ -24,8 +24,9 @@ const STALLED_MS = 10000;
 // worker quiet for longer than that is one the browser ended
 const GPU_QUIET_MS = 200000;
 // T205: the most release() waits for the GPU's worker to say it let go of its buffers and its device ("ended"), before
-// the next model is read; one that says nothing by then (a compilation that does not return) is terminated
-const GPU_END_MS = 5000;
+// the next model is read; one that says nothing by then (a compilation that does not return) is terminated (worker.js
+// waits as long for the GPU's worker of a model on the GPU alone let go before its engine was built, T156)
+export const GPU_END_MS = 5000;
 // T147: the most tokens of a prompt the GPU takes at once: the tokens of the largest tile (T146's 64 × 64), whose
 // sixteen blocks left three quarters of it idle. Python hands a prompt over this many at a time where the GPU is on
 // (promptBlock), BATCH where it is not: the worker answers nothing while one call runs (T108)

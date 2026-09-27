@@ -131,3 +131,106 @@ into.release();
 into.release();
 assert.equal(destroyed, 2, "release() let go of the buffer not once");
 console.log("ok: FORM's keys and defaults reach footprint() from sink.open()");
+
+// The review of T156: a model on the GPU alone. Its GPU's worker opens before a byte comes, and makes the device and a
+// buffer for every layer's matrices then (4.1 GB of Llama 3.2 3B). A load let go before its engine was built (cancelled,
+// failed, another try of the converter) must stop that worker, and the next load wait for its "ended": on the branch
+// before the review nothing stopped it, and it held them for the rest of the visit. A built one whose GPU failed
+// (gpuOnlyReady) is let go before its load on the CPU begins, whether forward.js had started its GPU or not (T205).
+// worker.js runs in a context of its own here, with a WebGPU adapter as the owner's Android has (8 GB said, 256 MiB bound).
+{
+  const LLAMA3B = [3072, 8192, 28, 24, 8, 128256, 4096];
+  const [dim, hidden, layers, heads, kvHeads, vocab] = LLAMA3B, kvDim = (kvHeads * dim) / heads;
+  // its tensors in file order, int8, as llama2_numpy.external_tensors() places them
+  const tensors = {};
+  let end = 28;
+  for (const [name, shape, int8] of [["token_embedding_table", [vocab, dim], true], ["rms_att_weight", [layers, dim], false],
+    ["wq", [layers, dim, dim], true], ["wk", [layers, kvDim, dim], true], ["wv", [layers, kvDim, dim], true],
+    ["wo", [layers, dim, dim], true], ["rms_ffn_weight", [layers, dim], false], ["w1", [layers, hidden, dim], true],
+    ["w2", [layers, dim, hidden], true], ["w3", [layers, hidden, dim], true], ["rms_final_weight", [dim], false]]) {
+    const count = shape.reduce((a, b) => a * b, 1);
+    tensors[name] = { kind: int8 ? "int8" : "f32", offset: end, shape, group: int8 ? 32 : 0, scales: int8 ? end + count : 0 };
+    end += int8 ? count + count / 8 : count * 4;
+  }
+  const size = end;
+  // the GPU's worker (gpu.js): what it was told, and "ended" a moment after a stop, as its end() says it
+  const workers = [];
+  class Worker {
+    constructor() {
+      Object.assign(this, { heard: [], told: [], terminated: false });
+      workers.push(this);
+    }
+    addEventListener(type, listener) {
+      if (type === "message") this.heard.push(listener);
+    }
+    postMessage(data) {
+      this.told.push(data.type);
+      if (data.type === "stop") setTimeout(() => this.heard.forEach((listener) => listener({ data: { type: "ended" } })), 5);
+    }
+    terminate() {
+      this.terminated = true;
+    }
+  }
+  const android = { deviceMemory: 8, gpu: { requestAdapter: async () => ({ info: { isFallbackAdapter: false },
+    limits: { maxStorageBufferBindingSize: 2 ** 28, maxBufferSize: 2 ** 28, minStorageBufferOffsetAlignment: 256 } }) } };
+  const gpuContext = vm.createContext({
+    self: { navigator: android, location: { search: "" }, crossOriginIsolated: true }, navigator: android,
+    console, performance, URL, TextDecoder, TextEncoder, setTimeout, clearTimeout, WebAssembly, Atomics, SharedArrayBuffer, Worker,
+    postMessage() {},
+  });
+  vm.runInContext(source, gpuContext, { filename: fileURLToPath(at) });
+  let engineGpu;
+  gpuContext.stand = {
+    forward: {
+      ...forward,
+      weightsMemory: () => ({ memory: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }), base: 64 }),
+      growMemory() {},
+      external: () => ({ engine: { gpu: engineGpu } }),
+    },
+    llama2_numpy: { KV_START: 256, OUTLIER_CHANNELS: 8, external_tensors: () => ({ toJs: () => tensors, destroy() {} }),
+      Llama: { callKwargs: () => ({}) } },
+  };
+  vm.runInContext("forwardModule = stand.forward; llama2_numpy = stand.llama2_numpy; jsKernels = { relaxed: true }; " +
+    "sharedKernels = {}; wideKernels = { plain: {}, shared: {} }; disabled = [];", gpuContext);
+  await vm.runInContext("adapterAsked", gpuContext);
+  const opened = () => {
+    const into = vm.runInContext("checkpointSink()", gpuContext);
+    into.sink.open(size, proxy(LLAMA3B), "int8", proxy(FORM));
+    assert.ok(into.weights.direct, "Llama 3.2 3B on a device that says 8 GB did not go on the GPU alone");
+    const worker = workers.at(-1);
+    assert.deepEqual(worker.told, ["open"]);
+    return { into, worker };
+  };
+  // (1) let go before its engine was built: the worker is stopped, and the next load waits for its "ended"
+  {
+    const { into, worker } = opened();
+    into.release();
+    assert.deepEqual(worker.told, ["open", "stop"], "a model on the GPU alone let go before it was built kept its GPU's worker");
+    await vm.runInContext("gpuOnlyEnding", gpuContext);
+    assert.ok(worker.terminated, "the next load did not wait for the GPU's worker to end");
+  }
+  // (2) another try of the converter (sink.open() again) lets go of the first one's worker
+  {
+    const { into, worker } = opened();
+    into.sink.open(size, proxy(LLAMA3B), "int8", proxy(FORM));
+    assert.deepEqual(worker.told, ["open", "stop"], "a second sink.open() kept the first GPU's worker");
+    into.release();
+    await vm.runInContext("gpuOnlyEnding", gpuContext);
+  }
+  // (3) built, its GPU ready: kept (destroy() lets nothing go); then its GPU fails: let go before the load on the CPU
+  for (const lost of [null, "the GPU was lost (a test)"]) {
+    const { into, worker } = opened();
+    engineGpu = Promise.resolve("prompts and answers on WebGPU");
+    into.weights.llama({}, {});
+    into.release();
+    assert.deepEqual(worker.told, ["open"], "a built model on the GPU alone lost its GPU's worker");
+    gpuContext.lost = lost;
+    vm.runInContext("gpuOnlyNow.lost = lost", gpuContext);
+    const ready = await vm.runInContext("gpuOnlyReady({ id: 'probe' })", gpuContext);
+    assert.equal(ready, !lost);
+    assert.equal(vm.runInContext("cpuOnly.has('probe')", gpuContext), Boolean(lost));
+    assert.deepEqual(worker.told, lost ? ["open", "stop"] : ["open"]);
+    assert.equal(worker.terminated, Boolean(lost), "the load on the CPU began before the GPU's worker ended");
+  }
+  console.log("ok: a model on the GPU alone lets go of its GPU's worker where its load ends without it (T156's review)");
+}

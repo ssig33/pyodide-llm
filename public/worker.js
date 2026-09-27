@@ -708,14 +708,30 @@ function gpuOnlyBuffer(size, header, options, { tensors, stored, gpuOnly }, keep
   const { memory, base, shared } = pooledWeights(stored, after, true, wide);
   if (!shared) throw new Error("This browser gave no shared memory for a model on the GPU alone.");
   const worker = openGpu();
-  worker.onmessage = () => {};  // (forward.js listens from start() on; the worker says nothing before)
+  // (forward.js listens from start() on. Here only "ended", beside it: T205, the next load after the GPU's worker let
+  // go of its device and its buffers, which it makes for every layer as it opens, before a byte comes)
+  let ended;
+  const ending = new Promise((resolve) => { ended = resolve; });
+  worker.addEventListener("message", ({ data }) => data?.type === "ended" && ended());
+  worker.addEventListener("error", () => ended());
+  // the GPU's worker stopped, and once it said "ended" (or after GPU_END_MS: terminated), resolved; as release() does
+  const end = () => {
+    worker.postMessage({ type: "stop" });
+    let timer;
+    const late = new Promise((resolve) => { timer = setTimeout(resolve, forwardModule.GPU_END_MS); });
+    return Promise.race([ending, late]).then(() => {
+      clearTimeout(timer);
+      worker.terminate();
+    });
+  };
   const weights = forwardModule.gpuOnlyWeights({ memory, base, size, tensors, worker });
   worker.postMessage({ type: "open", plan: forwardModule.gpuOnlyPlan(header, tensors, gpuForce, gpuRequest?.remembered), flow: weights.flow });
   // (T156: the checkpoint's size and /benchmark/'s CPU reading, for the estimate the GPU's step is held against)
   const direct = gpuOnlyNow = { worker, lost: null, stored, size, cpuGBps: gpuRequest?.cpu?.GBps, place: weights.place,
-    room: weights.room, drained: weights.drained, onLost: (why) => { direct.lost = why; } };
+    room: weights.room, drained: weights.drained, onLost: (why) => { direct.lost = why; }, end };
   weightsNow = memory;
   const kernels = wide ? wideKernels.shared : sharedKernels;
+  let built = false;
   return {
     direct,
     write(offset, chunk) {
@@ -727,11 +743,21 @@ function gpuOnlyBuffer(size, header, options, { tensors, stored, gpuOnly }, keep
     llama: (tokenizer, engineOptions) => {
       outsideNow = forwardModule.external({ memory, base, size, kernels, spawn: spawnThread, gpu: () => worker, gpuForce, halfKeys: true, direct,
         gpuRemembered: gpuRequest?.remembered });
-      return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...engineOptions, external: outsideNow });
+      const made = llama2_numpy.Llama.callKwargs(null, tokenizer, { ...engineOptions, external: outsideNow });
+      built = true;
+      return made;
     },
-    destroy() {},
+    // (the review of T156: a load cancelled or failed before its engine was built, or another try of the converter's
+    // (sink.open() again), let go of the GPU's worker: nothing else would, and it held the device and a buffer for
+    // every layer's matrices, 4.1 GB for Llama 3.2 3B, for the rest of the visit. The next load waits for it)
+    destroy() {
+      if (!built) gpuOnlyEnding = end();
+    },
   };
 }
+// the GPU's worker of a model on the GPU alone let go before its engine was built (destroy() above): the next load
+// waits for it, as release() waits for a built one's (T205)
+let gpuOnlyEnding = Promise.resolve();
 // T156: where the loops that write the weights can wait for the GPU's worker of a model on the GPU alone (room), and
 // before its engine is built (drained)
 const weightsRoom = () => gpuOnlyNow?.room?.();
@@ -745,9 +771,10 @@ async function gpuOnlyReady(model) {
   if (!direct.lost) return true;
   console.warn(`gpu: ${direct.lost}: the model was on the GPU alone, and is loaded again on the CPU`);
   cpuOnly.add(modelKey(model));
-  // (the GPU's worker let go of its device: stopped by forward.js where it started it, and here where it did not; the
-  // release() of the next load waits for its "ended", T205)
-  direct.worker.postMessage({ type: "stop" });
+  // (the GPU's worker let go of its device: stopped by forward.js where it started it, and here where it did not, as a
+  // model whose GPU forward.js gave up as the engine was built, before start(): its release() has no "ended" to wait
+  // for then. The review of T156: the load on the CPU begins after it, T205)
+  await direct.end();
   gpuOnlyNow = undefined;
   return false;
 }
@@ -1310,6 +1337,7 @@ async function load(model, signal, id) {
   loadingKey = modelKey(model);
   gpuOnlyNow = undefined;
   await adapterAsked;  // (T156: before any weights are placed)
+  await gpuOnlyEnding;  // (the review of T156: the GPU's worker of a model on the GPU alone let go before it was built)
   // let go of the previous model first, so that two never have to fit in memory
   if (llama) {
     // what forward.js holds of Python's, and its software threads (T93); T205: and the GPU's worker, whose buffers and
