@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuTable, environmentOf, loginUrl, parseReport, reportBody,
-         generateTable, gpuSkipped, layerTable, matVecTable, PATH_PROMPTS, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -296,35 +296,42 @@ assert.ok(generateTable(generateStep, generateRight, { fallback: true }).some((l
 assert.equal(generateTable({ name: "x", error: "a | b" })[0], "**Tokens generated on the GPU**: a \\| b");
 const unmeasured = generateTable({ ...generateStep, result: { ...generateStep.result, work: undefined, sampling: undefined, rows: [{ perSubmission: 1, msPerToken: 900 }, { perSubmission: 2, msPerToken: 800 }] } }, generateRight, { fallback: true });
 assert.ok(unmeasured.at(-1).includes("not measured here"), unmeasured.at(-1));
-// T184: the model page's own path, one table: a device whose GPU took the prompts, CI's fallback adapter, a failure
-const real = { threads: 4, gpu: { seconds: 4.23, matrices: "TF.js 64×64", attention: "llama.cpp flash" }, from: 48, block: 64,
-  rows: [{ what: "prompt", tokens: 64, chosen: { speed: 820.4, gpuTokens: 64 }, cpu: { speed: 612, gpuTokens: 0 }, gpu: { speed: 830, gpuTokens: 64 } },
-         { what: "prompt", tokens: 256, chosen: { speed: 1300, gpuTokens: 192 }, cpu: { speed: 650 }, gpu: { speed: 1310 } },
-         { what: "generation", tokens: 64, chosen: { speed: 80.44, tokens: 64 }, cpu: { speed: 81.2 }, gpu: { skip: "not on the GPU yet" } }] };
+// T184: the model page's own path, one table: a device whose GPU took the prompts, one whose GPU stopped while timed,
+// CI's fallback adapter, a model the GPU does not take, a failure
+const cell = (speed, low, high, gpuTokens, unsteady = false) => ({ speed, low, high, gpuTokens, unsteady });
+const real = { threads: 4, gpu: { seconds: 4.23, matrices: "TF.js 64×64", attention: "llama.cpp flash" }, status: "prompts of 32 tokens and more on WebGPU",
+  rows: [{ what: "prompt", tokens: 64, chosen: cell(820.4, 800, 830, 64), cpu: cell(612, 600, 640, 0, true), gpu: cell(830, 810, 840, 64) },
+         { what: "prompt", tokens: 256, chosen: cell(1300, 1280, 1310, 192), cpu: cell(650, 640, 655, 0), gpu: cell(1310, 1300, 1320, 256) },
+         { what: "generation", tokens: 64, chosen: { same: "cpu" }, cpu: cell(80.44, 79.1, 81.2), gpu: { skip: "not on the GPU yet" } }] };
 const pathLines = pathTable(real, "llm-jp-3 150M").split("\n");
-assert.equal(pathLines[0], "**The model page's path** (llm-jp-3 150M): 4 software threads · WebGPU ready in 4.2 s · matrices by TF.js 64×64 · attention by llama.cpp flash · the GPU from 48 tokens");
-assert.ok(pathLines.includes("| a prompt of 64 tokens | 820 tok/s, GPU | 612 tok/s | 830 tok/s | 1.4× |"), pathLines.join("\n"));
-assert.ok(pathLines.includes("| a prompt of 256 tokens | 1300 tok/s, GPU 192 of 256 | 650 tok/s | 1310 tok/s | 2.0× |"), pathLines.join("\n"));
-assert.ok(pathLines.includes("| writing 64 tokens | 80.4 tok/s | 81.2 tok/s | not on the GPU yet |  |"), pathLines.join("\n"));
+assert.equal(pathLines[0], "**The model page's path** (llm-jp-3 150M): 4 software threads · WebGPU ready in 4.2 s · matrices by TF.js 64×64 · attention by llama.cpp flash · prompts of 32 tokens and more on WebGPU");
+assert.ok(pathLines.includes("| a prompt of 64 tokens | 820 tok/s (800–830), GPU | 612 tok/s (600–640, unsteady) | 830 tok/s (810–840) | 1.4× |"), pathLines.join("\n"));
+assert.ok(pathLines.includes("| a prompt of 256 tokens | 1300 tok/s (1280–1310), GPU 192 of 256 | 650 tok/s (640–655) | 1310 tok/s (1300–1320) | 2.0× |"), pathLines.join("\n"));
+assert.ok(pathLines.includes("| writing 64 tokens | same as CPU only | 80.4 tok/s (79.1–81.2) | not on the GPU yet |  |"), pathLines.join("\n"));
 const pathRows = pathLines.filter((line) => line.startsWith("|"));
 assert.equal(pathRows.length, 2 + real.rows.length, "a header, the separator, a row each: 3 to 6 rows (T185 keeps the report short)");
 for (const line of pathRows) assert.equal(cellsOf(line).length, cellsOf(pathRows[0]).length, line);
-assert.ok(pathTable({ ...real, from: 65 }).includes("the CPU for every block up to 64 tokens"));
-assert.ok(!pathTable({ ...real, from: null }).includes("the GPU from"), "no threshold said where none is known");
+// the review's must-fix: a GPU that stopped while the sides were timed says so, and no ratio stands (T157)
+const stopped = pathTable({ ...real, gpu: { ...real.gpu, lost: "the GPU failed on a block of the prompt" },
+  rows: [real.rows[0], { ...real.rows[1], chosen: cell(640, 630, 650, 0), gpu: { skip: "the GPU failed on a block of the prompt" } }] });
+assert.ok(stopped.includes("WebGPU stopped while timed: the GPU failed on a block of the prompt") && !stopped.includes("ready in"), stopped);
+assert.ok(!stopped.includes("×"), `no ratio where the GPU stopped\n${stopped}`);
+assert.ok(stopped.includes("| 650 tok/s (640–655) | the GPU failed on a block of the prompt |  |"), stopped);
 // the GPU's cells say why in a few words; the line has the reason where it is no such few words
 const fallback = "a fallback adapter: the CPU in the GPU's place";
-const onFallback = pathTable({ threads: 2, gpu: { why: fallback }, from: null, block: 64,
-  rows: [{ what: "prompt", tokens: 64, chosen: { speed: 500, gpuTokens: 0 }, cpu: { speed: 505, gpuTokens: 0 }, gpu: { skip: fallback } }] });
-assert.ok(onFallback.includes("WebGPU: not on a fallback adapter") && onFallback.includes("| a prompt of 64 tokens | 500 tok/s, CPU | 505 tok/s | not on a fallback adapter |  |"), onFallback);
+const onFallback = pathTable({ threads: 2, gpu: { why: fallback },
+  rows: [{ what: "prompt", tokens: 64, chosen: { same: "cpu" }, cpu: cell(505, 500, 510, 0), gpu: { skip: fallback } }] });
+assert.ok(onFallback.includes("WebGPU: not on a fallback adapter") && onFallback.includes("| a prompt of 64 tokens | same as CPU only | 505 tok/s (500–510) | not on a fallback adapter |  |"), onFallback);
 assert.equal(gpuSkipped("no WebGPU in a worker here"), "not here");
 assert.equal(gpuSkipped("no GPU adapter here"), "not here");
-const float32 = pathTable({ threads: 1, gpu: { why: "float32 weights are not on the GPU yet" }, block: 64,
-  rows: [{ what: "prompt", tokens: 64, chosen: { speed: 50, gpuTokens: 0 }, cpu: { speed: 51 }, gpu: { skip: "float32 weights are not on the GPU yet" } }] });
-assert.ok(float32.includes("WebGPU: float32 weights are not on the GPU yet") && float32.includes("| 51.0 tok/s | not used |  |"), float32);
+const float32 = pathTable({ threads: 1, gpu: { why: "float32 weights are not on the GPU yet" },
+  rows: [{ what: "prompt", tokens: 64, chosen: { same: "cpu" }, cpu: cell(51, 50, 52, 0), gpu: { skip: "float32 weights are not on the GPU yet" } }] });
+assert.ok(float32.includes("WebGPU: float32 weights are not on the GPU yet") && float32.includes("| 51.0 tok/s (50.0–52.0) | not used |  |"), float32);
 assert.equal(pathTable({ error: "a | b" }, "x"), "**The model page's path** (x): failed: a \\| b");
 assert.ok(!pathTable(undefined).includes("undefined"));
-for (const text of [pathTable(real), onFallback, float32]) assert.ok(!text.includes("undefined") && !text.includes("NaN"), text);
+for (const text of [pathTable(real), stopped, onFallback, float32]) assert.ok(!text.includes("undefined") && !text.includes("NaN"), text);
 assert.deepEqual(PATH_PROMPTS, [64, 256]);
+assert.equal(PATH_WRITES, 64);
 // in the report, under the rounds' table: parseReport() still reads the rounds alone
 const withPath = [markdown, pathTable(real, "tiny-lm 29M")].join("\n\n");
 assert.deepEqual(parseReport(withPath).rows.map((row) => row.name), ["everything", "without the kernels"]);

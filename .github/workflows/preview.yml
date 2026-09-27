@@ -10,6 +10,15 @@ on:
         description: 'T111: also open the branch in Chromium, Firefox and WebKit, go offline, load again and answer'
         type: boolean
         default: false
+      model:
+        description: 'T184: the model of /benchmark/ (stories15M is int8: its prompts can go on the GPU)'
+        type: choice
+        options: [stories260K, stories15M]
+        default: stories260K
+      query:
+        description: 'T184: more of /benchmark/''s query, e.g. gpuTest=on (the fallback adapter taken as a GPU: its side of the page path)'
+        type: string
+        default: ''
 
 jobs:
   screenshots:
@@ -39,6 +48,11 @@ jobs:
           mkdir -p public/models
           split -b 8388608 -d -a 3 stories260K.bin public/models/stories260K.bin.
           cp tok512.bin public/models/
+          if [ "${{ inputs.model }}" = stories15M ]; then
+            make stories15M.bin tokenizer.bin
+            split -b 8388608 -d -a 3 stories15M.bin public/models/stories15M.bin.
+            cp tokenizer.bin public/models/
+          fi
           npm run build
           npx playwright-core install --with-deps chromium
 
@@ -48,7 +62,10 @@ jobs:
       # T134: /benchmark/ of this branch, every section in Chromium (tests/bench-check.mjs serves dist/ itself)
       - name: The benchmark page
         shell: bash
-        run: node tests/bench-check.mjs --dist chromium --model stories260K --size 64 | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          MODEL: ${{ inputs.model || 'stories260K' }}
+          QUERY: ${{ inputs.query }}
+        run: node tests/bench-check.mjs --dist chromium --model "$MODEL" --size 64 --query "$QUERY" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # a change to the service worker is tried here, on the branch, before it goes out (AGENTS.md)
       - name: Offline (T111)

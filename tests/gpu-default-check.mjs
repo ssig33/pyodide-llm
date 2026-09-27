@@ -10,6 +10,9 @@
 //     the GPU once;
 //   - a GPU faster from 36 tokens on (the band of 17 to 64 where the first version of T148 put the prompt on blocks of
 //     16 on the GPU in its check, 1.47 times as long): the generation that checks again takes no longer than the others.
+// T184 (the review's must-fix): /benchmark/'s page path (forward.js's timePrompts, src/bench.js's pathTable) on the same
+// made-up GPU: far faster, every block of the GPU's side on it and a ratio; failing on its sixth block, the GPU's cells
+// empty with why and no ratio anywhere (its time was the CPU's: 0.90× before); no GPU, the CPU's side alone.
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -23,7 +26,7 @@ const forwardFile = args.includes("--forward") ? path.resolve(args[args.indexOf(
 // sleep of that long and the answer
 const FAKE = `
 const { parentPort, workerData: line } = require("node:worker_threads");
-let ctl, words;
+let ctl, words, blocks = 0;
 const nap = new Int32Array(new SharedArrayBuffer(4)), ms = (n) => line.fixed + line.perToken * n;
 parentPort.on("message", (data) => {
   if (data.type === "start") {
@@ -34,7 +37,8 @@ parentPort.on("message", (data) => {
   } else if (data.type === "prompt") {
     Atomics.wait(nap, 0, 0, ms(data.count));
     if (Atomics.load(ctl, words.wanted) !== data.serial) return;
-    Atomics.store(ctl, words.failed, 0);
+    const fail = Boolean(line.failAt) && ++blocks >= line.failAt;  // T184: a GPU that fails on its failAt-th block
+    Atomics.store(ctl, words.failed, fail ? 1 : 0);
     Atomics.store(ctl, words.done, data.serial);
     Atomics.notify(ctl, words.done);
   } else if (data.type === "stop") process.exit(0);
@@ -67,7 +71,8 @@ if (isMainThread) {
   process.exit(code);
 } else {
   const { memory, base, size, plan, forwardFile } = workerData;
-  const { compileKernels, createForward } = await import(forwardFile);
+  const { compileKernels, createForward, timePrompts } = await import(forwardFile);
+  const { pathTable } = await import(path.join(root, "src/bench.js"));
   const kernels = compileKernels(fs.readFileSync(path.join(root, "public/simdkernel_shared.wasm")), fs.readFileSync(path.join(root, "public/simdkernel_relaxed_shared.wasm")));
   const spawn = (data) => new Promise((resolve) => {
     const helper = new Worker(path.join(root, "public/helper.js"));
@@ -96,8 +101,8 @@ if (isMainThread) {
   alone.release();
   say(`the CPU: ${perToken.toFixed(2)} ms a prompt token`);
 
-  const run = async (name, fixed, tokenCost, generations, after) => {
-    const line = { fixed: fixed * perToken, perToken: tokenCost * perToken };
+  const run = async (name, fixed, tokenCost, generations, after, failAt = 0) => {
+    const line = { fixed: fixed * perToken, perToken: tokenCost * perToken, failAt };
     const gpu = () => {
       const fake = new Worker(FAKE, { eval: true, workerData: line });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
@@ -146,6 +151,37 @@ if (isMainThread) {
     const normal = seen.slice(1, 8).map(([ms]) => ms).sort((a, b) => a - b)[3], check = seen[8][0];
     expect("the check: the last 32 tokens on the CPU", seen[8][1], PROMPT - 38);
     if (!(check <= 1.5 * normal)) failures.push(`the check took ${check.toFixed(0)} ms, the others ${normal.toFixed(0)} (more than 1.5 times)`);
+  }
+  // T184: the page path of /benchmark/, as worker.js's timedPaths times it (2 rounds here), and its table
+  const paths = (engine) => {
+    const ready = engine.gpuReady;  // as timedPaths: what the GPU was before the sides were timed
+    const rows = timePrompts(engine, { words: [100, 101, 102, 103, 104], counts: [64, 256], rounds: 2 });
+    const gpu = ready ? { seconds: 0, matrices: "made up", attention: "made up", ...(engine.gpuWhyNot ? { lost: engine.gpuWhyNot } : {}) }
+      : { why: engine.gpuWhyNot };
+    return { rows, table: pathTable({ threads: engine.threads, gpu, status: engine.gpuStatus, rows }) };
+  };
+  {
+    const { more } = await run("the page path, a GPU far faster", 10, 0.05, 0, async (engine) => paths(engine));
+    say(more.table);
+    expect("the GPU's side all on the GPU", more.rows.map((row) => row.gpu.gpuTokens), [64, 256]);
+    expect("as chosen: the GPU", more.rows.map((row) => row.chosen.gpuTokens), [64, 256]);
+    expect("the CPU's side on the CPU", more.rows.map((row) => row.cpu.gpuTokens), [0, 0]);
+    if ((more.table.match(/×/g) ?? []).length !== 2) failures.push("the page path: a ratio a prompt where the GPU ran them");
+  }
+  {
+    const { more } = await run("the page path, a GPU that fails on its sixth block", 10, 0.05, 0, async (engine) => paths(engine), 6);
+    say(more.table);
+    // the sixth block is the first of 256's warm-up: 64's GPU side ran whole before it, 256's on the CPU after it
+    expect("the GPU's cell of 256 empty, with why", more.rows.map((row) => row.gpu.skip), [undefined, "the GPU failed on a block of the prompt"]);
+    if (/×/.test(more.table) || !more.table.includes("WebGPU stopped while timed")) failures.push("the page path: a ratio, or no word of the GPU that stopped");
+  }
+  {
+    const engine = createForward({ memory, base, size, kernels, plan, spawn });
+    await engine.setThreads(1);
+    const { rows, table } = paths(engine);
+    engine.release();
+    say(table);
+    expect("no GPU: the CPU's side alone", rows.map((row) => [row.chosen.same, row.gpu.skip]), [["cpu", "no WebGPU in a worker here"], ["cpu", "no WebGPU in a worker here"]]);
   }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");

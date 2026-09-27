@@ -496,11 +496,11 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 作るもの: logits は float16 のキャッシュの答えの差（L16、`answers()` がもう回している）を目盛りに、線を max(1.5 × CPU, k × L16)。DP4A は NumPy の活性値を CPU と同じ 8 ビットにした答えを目盛りに。k は CI の数字で決める。ほかに、T175 のレビューが見つけた norm の尺度の小さな誤り（平均を n−1 で割る）を RMSNORM の道で見逃す件（T150・T147 のプロンプトの経路）を、norm の後の量子化かその出力の線で捕まえる。
 - 完了条件: 上の壊し方が全部の形で落ち、正しい実物のモデル（CI の real=）が全部通る。
 
-### T184 [計測] `/benchmark/` にページの本当の経路を測る段を — 状態: **レビュー待ち**（ブランチ `t184-real-path`、Opus medium。2026-09-27、持ち主「まだベンチ改善の余地あるよね？」「改善全部終わってから」: 知人のグラボの PC で測ってもらうのはベンチの改善が全部終わってから。規模 中）
+### T184 [計測] `/benchmark/` にページの本当の経路を測る段を — 状態: **レビュー済み、直しを入れてレビュー待ち**（ブランチ `t184-real-path`、Opus medium。2026-09-27、持ち主「まだベンチ改善の余地あるよね？」「改善全部終わってから」: 知人のグラボの PC で測ってもらうのはベンチの改善が全部終わってから。規模 中）
 - 根拠: GPU の節が測るのは作り物の行列とシェーダ単体で、T148 がその端末で選ぶ形で実物のモデルのプロンプトと生成がどれだけ速いかは出ていない。「この端末では GPU を選んだか、何トークンから GPU か、何倍か」が報告に無い。
 - 作るもの: モデルの節（`worker.js` の bench）で、llm-jp-3 150M のプロンプト（例 64・256 トークン）と生成を、T148 の選び方のまま・CPU だけ・GPU だけ（試験の旗 `gpuTest` の形）で測り、選んだ形と境のトークン数、GPU ÷ CPU を 1 つの表に。T152 が入ったら生成の GPU も同じ表に。
 - 完了条件: 持ち主の Android・iPhone・PC と知人の独立した GPU の報告で、ページの本当の速さと GPU の選び方が 1 行で読める。
-- **入れたもの（2026-09-27、Opus medium）**: 元ネタは無い（シェーダではない。計り方はモデルの節のラウンド（T45）と同じ形）。モデルの節はラウンドの後に、モデルをもう 1 回モデルのページと同じ形で読み込み（GPU も作る。`gpuRequest` なしで形は毎回選び直す: 初めての訪問と同じ、どの回も同じ）、`worker.js` の `timedPaths()` が測る: (1) GPU の準備を待つ（5 秒ごとに段の文「the GPU gets ready: N s」）、(2) スレッドの本数の検索を 64 トークンの生成で最大 8 回まで進め、そこで止める（`setThreads`。CPU の時間と選び方は本数ごとなので、どの側も同じ本数で測る）、(3) 64・256 トークンのプロンプトを `forwardMany()` で、選び方のまま・CPU だけ・GPU だけ（`forward.js` の新しい `gpuSide`: `"gpu"` は `gpuTest` の `always` と同じ形）、それぞれ温めの 1 回の後に 3 回の真ん中、(4) 64 トークンの生成を選び方のまま・CPU だけ（GPU の生成は T152: 同じ行の GPU の欄に入る形を開けてある）。選び方のままの欄は、GPU に行ったトークン数も（`gpuTokens` の差）。**ラウンドは GPU を作らない**（`benching` の間: それまで `/benchmark/` のラウンドは検索 `""` で読み込むので、WebGPU の端末では各ラウンドの裏で GPU の準備が走っていた）。`forward.js` に足したのは `gpuSide`（ベンチだけ）、`gpuFrom`（しきい値: `promptTimes().threshold`）、`gpuWhyNot`（CPU のままの理由）と `GPU_BLOCK` の export だけ。表は `src/bench.js` の `pathTable()`（`tests/bench.mjs` に試験、`gpuSkipped()` が理由を短く）。報告ではラウンドの表のすぐ下（`parseReport()` は最初の表だけを読むのでそのまま）。`bench-check.mjs` は表の行を `model path: ` で出し、行が無ければ落とす（`ci.mjs` の bench.yml と preview.yml の既定の `--grep` に入れた）。
+- **入れたもの（2026-09-27、Opus medium）**: 元ネタは無い（シェーダではない。計り方はモデルの節のラウンド（T45）と同じ形）。モデルの節はラウンドの後に、モデルをもう 1 回モデルのページと同じ形で読み込み（GPU も作る。`gpuRequest` なしで形は毎回選び直す: 初めての訪問と同じ、どの回も同じ）、`worker.js` の `timedPaths()` が測る: (1) GPU の準備を待つ（5 秒ごとに段の文「the GPU gets ready: N s」）、(2) スレッドの本数の検索を 64 トークンの生成で最大 8 回まで進め、そこで止める（`setThreads`。CPU の時間と選び方は本数ごとなので、どの側も同じ本数で測る）、(3) 64・256 トークンのプロンプトを `forwardMany()` で、選び方のまま・CPU だけ・GPU だけ（`forward.js` の新しい `gpuSide`: `"gpu"` は `gpuTest` の `always` と同じ形）、それぞれ温めの 1 回の後に 3 回の真ん中、(4) 64 トークンの生成を選び方のまま・CPU だけ（GPU の生成は T152: 同じ行の GPU の欄に入る形を開けてある）。選び方のままの欄は、GPU に行ったトークン数も（`gpuTokens` の差）。**ラウンドは GPU を作らない**（`benching` の間: それまで `/benchmark/` のラウンドは検索 `""` で読み込むので、WebGPU の端末では各ラウンドの裏で GPU の準備が走っていた）。`forward.js` に足したのは `gpuSide`（ベンチだけ）、`gpuFrom`（しきい値: `promptTimes().threshold`）、`gpuWhyNot`（CPU のままの理由）と `GPU_BLOCK` の export だけ。表は `src/bench.js` の `pathTable()`（`tests/bench.mjs` に試験、`gpuSkipped()` が理由を短く）。報告ではラウンドの表のすぐ下（`parseReport()` は最初の表だけを読むのでそのまま）。`bench-check.mjs` は表の行を `model path: ` で出し、行が無ければ落とす（`ci.mjs` の既定の `--grep` に入ったのは preview.yml だけだった: bench.yml の行は sed の `$` で外れていた。直しで両方に）。
 - **文面の案（英語の仮、持ち主が選ぶ）**:
 
   ```
@@ -515,6 +515,31 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 
   （数字は試験の作り物。）GPU の無いとき: 行の頭が「WebGPU: not here」、GPU の欄が「not here」。代わりのアダプタ: 「not on a fallback adapter」。モデルが GPU に乗らない（float32 など）: 行の頭に理由、欄は「not used」。しきい値が 64 を超える: 「the CPU for every block up to 64 tokens」。
 - **確かめたこと**: `node --check`、pytest（496 passed）、smoke、`node tests/bench.mjs`（表の試験。わざと壊す: 代わりのアダプタの判定を外す・GPU に行った数を消すと落ちる）、`gpu-choice-check`・`gpu-default-check`（`forward.js` を触ったので）、build。手元の Playwright の Chromium（WebGPU なし）で `bench-check.mjs --dist chromium --run model --model stories260K`（下の CI の前に、worker の道が回るか）。WebGPU の欄は CI では SwiftShader なので飛ぶ（T182）。**GPU だけの欄と選び方が本物の GPU で測れるかは未確認**（持ち主の端末で）。
+- **レビュー（Opus xhigh、2026-09-27）: must-fix 1（GPU が測る途中で失われると GPU only の欄に CPU の時間と比が出る。偽の GPU で 64 は 0.90×、256 は 1.0×、見出しは ready のまま）。should 8（最初の読み込みの GPU がラウンド 1 に重なる、側を交互に幅つきで、同じ道の 2 列、生成の数と空の温め、5 秒の status、しきい値の文、記録 4 つ、CI）。問題なし: 本番と ?bench=1 への害、直の forwardMany の判定、本数と位置、T96 のメモリ、報告 +約 1,000 字。**
+- **直したもの（2026-09-27、Opus medium、本線 21ab1c7 に rebase）**:
+  - must-fix: プロンプトの計り方を `forward.js` の `timePrompts()` に移し（worker.js が呼び、試験も同じ関数を呼ぶ）、GPU の側の回のどれかで GPU に行ったトークンが数に足りなければ、その行の GPU の欄は `gpuWhyNot` の理由の文。GPU が準備できていたのに測った後で `gpuWhyNot` があれば、表の頭は「WebGPU stopped while timed: …」で、比はどの行にも出さない（T157 と同じ）。`tests/gpu-default-check.mjs` に偽の GPU で 3 つ: 速い（GPU の側は全部 GPU、比が 2 つ）、6 つ目のブロックで失敗（256 の GPU の欄が理由、比なし、頭に「stopped while timed」）、GPU なし（CPU の側だけ）。`tests/bench.mjs` にも止まった表の試験。
+  - should 1: ページの経路は最初の読み込みの上で、ラウンドの前に（読み込みが 1 回減り、GPU を作るのも 1 回。最初の読み込みの GPU はラウンド 1 の読み込みで閉じる）。
+  - should 2: 側を交互に、温めの 1 巡の後 4 巡。欄は真ん中の tok/s と（最小–最大）、その比が `BETTER`（0.95）の余裕より開けば「unsteady」。
+  - should 3: GPU の無いときのプロンプトと、T152 までの書くことは CPU だけを 1 回測り、「as chosen」は「same as CPU only」。
+  - should 4: 書くことは `steps` = プロンプトの長さ + 64（`steps` はプロンプトの位置も数える）を 3 回、tok/s はエンジンの `stats`（ステータス行と同じ数、プロンプトを含まない）。温めは 8 ステップを本当に回す（始まる前のジェネレータの `return()` は何も走らせない: ラウンドの温めも同じ穴で、直した）。
+  - should 5: GPU を待つ間の 5 秒ごとの status をやめ、待ちに上限 240 秒（節の見張りの 5 分の内）。間に合わなければ GPU の欄は「not ready after 240 s」。
+  - should 6: 選び方の文はステータス行の文そのもの（`gpuStatus`、16 の倍数に丸めたしきい値）。`gpuFrom` は外した。
+  - should 7: この項の `--grep` の記録、AGENTS.md の T184 の項を落とし穴から「これまでに分かったこと」（T148 の次）へ、worker.js の頭の知らせの一覧に `bench` と `paths`、AGENTS.md の構成の表の benchmark の行。
+  - should 8: `/benchmark/?gpuTest=on` はモデルの節の Worker に `?gpuTest=on` を渡す（試験だけ、モデルのページと同じ旗）。`bench-check.mjs --query`、`preview.yml` の入力 `model`（stories260K か stories15M）と `query`。GPU の側を CI で見るのは `preview.yml --ref t184-real-path -f model=stories15M -f query=gpuTest=on`。bench.yml は本番を開くのでブランチは試せない（本線に入った後に）。
+- **文面の案（直しの後、英語の仮）**:
+
+  ```
+  **The model page's path** (llm-jp-3 150M): 4 software threads · WebGPU ready in 4.2 s · matrices by TF.js 64×64 · attention by llama.cpp flash · prompts of 32 tokens and more on WebGPU
+
+  | the page | as chosen | CPU only | GPU only | GPU ÷ CPU |
+  |---|---|---|---|---|
+  | a prompt of 64 tokens | 820 tok/s (800–830), GPU | 612 tok/s (600–640, unsteady) | 830 tok/s (810–840) | 1.4× |
+  | a prompt of 256 tokens | 1300 tok/s (1280–1310), GPU 192 of 256 | 650 tok/s (640–655) | 1310 tok/s (1300–1320) | 2.0× |
+  | writing 64 tokens | same as CPU only | 80.4 tok/s (79.1–81.2) | not on the GPU yet |  |
+  ```
+
+  GPU が測る途中で止まった: 頭が「WebGPU stopped while timed: the GPU failed on a block of the prompt」、止まった後の行の GPU の欄はその理由、比は無し。
+- 確かめ（直しの後、T188 の決まり: 手元は編集と `node --check`）: CI の `tests.yml --ref t184-real-path`（bench.mjs と gpu-default-check）と `preview.yml --ref t184-real-path`（既定の stories260K と、`model=stories15M query=gpuTest=on`）。手元で gpu-default-check を 1 回回した（T188 の前に始めた回）: 新しい 3 つは試験台の読み違い（GPU を止まった後で読んでいた）を直す前に 1 つ落ち、古い「faster from 36 tokens」の時間の検査は機械の混みで 1 つ落ちた（直前の回は通っていた）。直した後は CI で。
 
 ### T185 [計測] ベンチの報告を短くして Issue の URL に入れる — 状態: 未着手（2026-09-27、同じ回。規模 小。文面は持ち主）
 - 根拠: GPU の節が付くと報告はほぼ必ず URL の上限（T134 の 7,000 字）を越えてクリップボードに回る。T163 のレビューが案を 3 つ出した（上限の表を 1 行の文に、読み出しの行を 2 つに、説明文を報告から外す）。

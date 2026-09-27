@@ -95,6 +95,50 @@ export function promptTimes() {
   };
 }
 
+// T184: the model page's own path on /benchmark/ (worker.js's timedPaths, src/bench.js's pathTable): prompts of counts
+// tokens through forwardMany() at position 0 as the page chooses (T148), on the CPU only and on the GPU only
+// (engine.gpuSide). The sides take turns, a warm-up round and then PATH_ROUNDS, so that a device that heats up or is
+// busy for a while slows all of them alike; each cell is the median with the slowest and the fastest, unsteady where
+// they are further apart than the choice's own margin (BETTER). Where the GPU is not on, the page's choice is the CPU:
+// one side, timed once ("same" in the other). A GPU side a run of which the GPU did not take whole (it failed or was
+// lost on the way: its time is the CPU's) is no GPU's time, and is said as such with why (as T157's lost device).
+export const PATH_ROUNDS = 4;
+export function timePrompts(engine, { words, counts, rounds = PATH_ROUNDS }) {
+  const gpu = Boolean(engine.gpuReady);
+  const sides = gpu ? { chosen: null, cpu: "cpu", gpu: "gpu" } : { cpu: "cpu" };
+  const rows = [];
+  try {
+    for (const count of counts) {
+      const tokens = Array.from({ length: count }, (_, i) => words[i % words.length]);
+      const runs = Object.fromEntries(Object.keys(sides).map((name) => [name, []]));
+      for (let round = 0; round <= rounds; round++) {
+        for (const [name, side] of Object.entries(sides)) {
+          engine.gpuSide = side;
+          const before = engine.gpuTokens, began = performance.now();
+          engine.forwardMany(tokens, 0);
+          if (round) runs[name].push({ ms: performance.now() - began, gpuTokens: engine.gpuTokens - before });
+        }
+      }
+      const row = { what: "prompt", tokens: count, chosen: { same: "cpu" } };
+      for (const [name, list] of Object.entries(runs)) row[name] = timedCell(list, count);
+      if (!gpu) row.gpu = { skip: engine.gpuWhyNot ?? "not ready" };
+      else if (runs.gpu.some((run) => run.gpuTokens < count)) row.gpu = { skip: engine.gpuWhyNot ?? "the GPU did not take every block" };
+      rows.push(row);
+    }
+  } finally {
+    engine.gpuSide = null;
+  }
+  return rows;
+}
+/** T184: runs of count tokens ({ ms, gpuTokens }) as a cell: tok/s of the median run, of the slowest and the fastest,
+ * the median run's tokens on the GPU, and whether they spread more than BETTER's margin */
+export function timedCell(runs, count) {
+  const sorted = [...runs].sort((a, b) => a.ms - b.ms), middle = sorted[(sorted.length - 1) >> 1];
+  const speed = (run) => count / (run.ms / 1000);
+  return { speed: speed(middle), low: speed(sorted.at(-1)), high: speed(sorted[0]), gpuTokens: middle.gpuTokens,
+           unsteady: sorted.at(-1).ms * BETTER > sorted[0].ms };
+}
+
 /** The kernels as WebAssembly modules. The relaxed one fails to compile where relaxed SIMD is missing (Safari):
  * then int8 runs on matmul_q8. wide (T101): the build for a 64-bit memory (simdkernel_*64.wasm). */
 export function compileKernels(plain, relaxed, wide = false) {
@@ -1055,10 +1099,6 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
      * the keys and values before it, as gpuForce.always), or null: each where it is faster (promptTimes) */
     set gpuSide(side) {
       gpuSide = side === "cpu" || side === "gpu" ? side : null;
-    },
-    /** T184: the fewest tokens of a block the GPU takes now (GPU_BLOCK + 1: none), null until both sides are timed */
-    get gpuFrom() {
-      return times.threshold(GPU_BLOCK, threads);
     },
     /** T135: the tokens of a prompt that went through the GPU since the generation began */
     get gpuTokens() {

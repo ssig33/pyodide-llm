@@ -24,6 +24,8 @@ const option = (name, value) => {
   return at >= 0 ? args.splice(at, 2)[1] : value;
 };
 const model = option("--model", "tiny-lm"), size = option("--size", "256"), sections = option("--run", "all");
+// T184: more of the page's query, e.g. --query gpuTest=on (CI's fallback adapter taken as a GPU in the model section)
+const query = option("--query", "");
 const dist = args.includes("--dist") ? args.splice(args.indexOf("--dist"), 1) : null;
 let [site = "https://takano32.github.io/pyodide-llm/", ...engines] = dist ? [undefined, ...args] : args;
 let server;
@@ -97,7 +99,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error.message)));
   try {
-    await page.goto(`${site}benchmark/?run=${sections}&model=${model}&size=${size}`);
+    await page.goto(`${site}benchmark/?run=${sections}&model=${model}&size=${size}${query ? `&${query}` : ""}`);
     // the first visit reloads once, when the service worker takes the page over (T93): the wait starts again
     for (;;) {
       try {

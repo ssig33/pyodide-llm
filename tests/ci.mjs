@@ -103,7 +103,7 @@ const rest = args.slice(1);
 // the lines of a workflow's logs worth reading when nothing else is asked for
 const LINES = {
   "models.yml": "ready in|^then |^again|^offline|thread reports during|FAILED|timed out",
-  "bench.yml": "^### (chromium|firefox|webkit|chrome|msedge)$|^sections:|WRONG|^failed:",
+  "bench.yml": "^### (chromium|firefox|webkit|chrome|msedge)$|^sections:|^model path:|WRONG|^failed:",
   "browsers.yml": "ready in|FAILED|timed out",
   "preview.yml": "^sections:|^model path:|FAILED|timed out",
   // T183: gpu-check's lines of each model and run, its tables by layer (against NumPy's and E16), each run's line and
