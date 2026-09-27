@@ -18,7 +18,8 @@ NAMES = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": 
          "lm_head.weight": "output.weight"}
 LAYER = {"input_layernorm": "attn_norm", "post_attention_layernorm": "ffn_norm", "self_attn.q_proj": "attn_q",
          "self_attn.k_proj": "attn_k", "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output",
-         "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+         "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down",
+         "self_attn.q_norm": "attn_q_norm", "self_attn.k_norm": "attn_k_norm"}  # a Qwen3's (T203)
 
 
 def q8_0_blocks(values):
@@ -281,6 +282,62 @@ def test_a_rope_freqs_table_that_is_not_the_originals_scaling_is_refused():
     # without the original's config.json (?hf= of a GGUF) the table is refused as before
     with pytest.raises(ValueError, match="rope_freqs table"):
         Conversion.from_gguf(file)
+
+
+# ---- T203 (T136's fourth stage): a Qwen3, whose GGUF holds q, k and the norms of their heads in Hugging Face's order
+def qwen3_gguf(head_size, eps=1e-6):
+    from test_qwen3 import qwen3
+    config, weights = synthetic_weights(n_kv_heads=2, head_size=head_size)
+    tensors, published = qwen3(config, weights, True)
+    published["rms_norm_eps"] = eps
+    # llama.cpp writes the size of a head as the length of a key, whatever it is, and always the epsilon
+    more = [("qwen3.attention.key_length", 4, config["head_size"]), ("qwen3.attention.layer_norm_rms_epsilon", 6, eps)]
+    file, same = gguf_file(tensors, published, config["vocab_size"], "qwen3", pre="qwen2", more=more)
+    return config, published, file, same
+
+
+@pytest.mark.parametrize("dtype", ["int8", "float32"])
+@pytest.mark.parametrize("head_size", [0, 16])
+def test_a_qwen3_gguf_with_the_originals_files_is_the_safetensors_conversion(head_size, dtype):
+    """The checkpoint, tokenizer.bin and options of the safetensors of the same values, the norms of q and k with them
+    (qk_norm), and heads of another size than dim / heads (head_dim). Unread, the norms would leave a Qwen3 that runs
+    as a Llama and writes nonsense without a word."""
+    config, published, file, same = qwen3_gguf(head_size)
+    vocabulary = unigram(config["vocab_size"])
+    got = with_original(file, published, vocabulary, "tokenizer.json", dtype)
+    safetensors = safetensors_file(same)
+    size = struct.unpack("<Q", safetensors[:8])[0]
+    expected = Conversion(safetensors[8:8 + size].decode(), 8 + size, json.dumps(published), vocabulary,
+                          "tokenizer.json", dtype=dtype, max_seq_len=1 << 20)
+    expected.feed(safetensors)
+    expected.finish()
+    assert bytes(got.checkpoint) == bytes(expected.checkpoint)
+    assert bytes(got.tokenizer) == bytes(expected.tokenizer)
+    assert got.options == expected.options
+    assert got.options["qk_norm"] is True and got.options.get("head_dim") == (head_size or None)
+
+
+@pytest.mark.parametrize("head_size", [0, 16])
+def test_a_qwen3_gguf_alone_converts_to_the_checkpoint_of_the_same_values(head_size):
+    """?hf= of a Qwen3's GGUF alone (its own vocabulary and settings): the same checkpoint, and the options say the
+    norms and the size of a head."""
+    config, published, file, same = qwen3_gguf(head_size)
+    conversion = fed(file, "int8")
+    assert bytes(conversion.checkpoint) == converted(Safetensors(reader(safetensors_file(same))), published, "int8")
+    assert conversion.options["qk_norm"] is True and conversion.options.get("head_dim") == (head_size or None)
+    assert conversion.options["rms_norm_eps"] == pytest.approx(1e-6)
+
+
+@pytest.mark.parametrize("change, what", [
+    (dict(model_type="qwen2"), "architecture"),
+    (dict(head_dim=8), "size of a head"),
+    (dict(rms_norm_eps=1e-5), "RMSNorm epsilon"),
+])
+def test_a_qwen3_gguf_that_is_not_the_originals_is_refused(change, what):
+    config, published, file, _ = qwen3_gguf(16)
+    llama2_convert.gguf_weights(file, json.dumps(published))  # its own config goes through
+    with pytest.raises(ValueError, match=what):
+        llama2_convert.gguf_weights(file, json.dumps({**published, **change}))
 
 
 # ---- T136's third stage: GPT-2 and GPT-NeoX, as llama.cpp's convert_hf_to_gguf.py writes them

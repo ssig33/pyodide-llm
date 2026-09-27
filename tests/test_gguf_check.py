@@ -325,3 +325,20 @@ def test_a_gpt2_or_neox_gguf_of_other_weights_does_not(tmp_path, capsys, monkeyp
 
     assert not gguf_check.check_tensors(*other_model(tmp_path, model, swap))
     assert summary(capsys)["mismatches"] >= 1
+
+
+@pytest.mark.parametrize("norm", [None, "model.layers.1.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight"])
+def test_a_qwen3_gguf_is_held_to_its_norms_of_q_and_k(tmp_path, capsys, norm):
+    """T203: a Qwen3's GGUF (llama.cpp's attn_q_norm and attn_k_norm, heads of another size than dim / heads) passes
+    against its original, and a norm of other values does not (unread, the norms went unchecked: no counterpart)."""
+    from test_gguf import qwen3_gguf
+    config, published, file, same = qwen3_gguf(16)
+    original = {name: tensor.copy() for name, tensor in same.items()}
+    if norm:
+        original[norm] = original[norm][::-1].copy()  # the GGUF now holds another norm than the original's
+    (tmp_path / "model.gguf").write_bytes(file)
+    (tmp_path / "model.safetensors").write_bytes(safetensors_file(original))
+    (tmp_path / "config.json").write_text(json.dumps(published))
+    assert gguf_check.check_tensors(tmp_path / "model.gguf", tmp_path) is (norm is None)
+    result = summary(capsys)
+    assert (result["mismatches"] == 0) is (norm is None)
