@@ -56,5 +56,7 @@ if [ "$suite" = full ]; then
   # T148: the default choice of the GPU or the CPU for a prompt's blocks, with a made-up GPU's worker
   part "the GPU or the CPU by default" node tests/gpu-default-check.mjs
   part "the software threads" node tests/threads-check.mjs
+  # T206: the pre-tokenizers against the real ones at every code point (about 90 s, too long for the deploy)
+  part "the pre-tokenizers at every code point" env EVERY_CODE_POINT=1 python -m pytest tests/test_bytebpe.py -q -k every_character
 fi
 echo "suite: $suite passed in $SECONDS s"

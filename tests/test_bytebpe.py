@@ -2,6 +2,7 @@
 # tokenizer.bin -> engine, against Hugging Face's own tokenizers. The vocabularies are trained here in a second,
 # so nothing is downloaded and no file is checked in.
 import json
+import os
 import random
 import unicodedata
 
@@ -114,6 +115,8 @@ def real_pretokenizer(name):
     return pre_tokenizers.Split(Regex(pattern), behavior="isolated")
 
 
+# 17 to 29 s for each of the four on CI's runner, so only the full suite runs it (tests/suite.sh full, T193)
+@pytest.mark.skipif(not os.environ.get("EVERY_CODE_POINT"), reason="EVERY_CODE_POINT=1: tests/suite.sh full runs it")
 @pytest.mark.parametrize("name", ["gpt2", "gpt2-digits", "qwen", "llama3"])
 def test_pretokenizers_split_every_character_as_the_real_ones_do(name):
     real = real_pretokenizer(name)

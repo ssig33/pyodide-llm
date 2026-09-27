@@ -982,8 +982,10 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - **CI で回すもの**: browsers.yml の huggingface の small（固定値の段は small のジョブだけ。取得が 454 MB 増える）。
 - 段 ③ で固定値（`tests/fixed_outputs.py`）の GPT-2 と NeoX が GGUF の道だけになり、safetensors の道（一覧では rinna の 3 つ）の固定値が無くなった。rinna の小さいもの 1 つ（japanese-gpt-neox-small か japanese-gpt2-small）を固定値に足す。わざと壊して（転置や並列残差を外す）落ちることを見る。
 
-### T206 [バグ] 前分割の文字の種類を本物（onig）に合わせる 3 点 — 状態: 未着手（2026-09-27、T200 のレビューが見つけた。main からある違い。規模 小）
+### T206 [バグ] 前分割の文字の種類を本物（onig）に合わせる 3 点 — 状態: **レビュー待ち**（2026-09-27、T200 のレビューが見つけた。main からある違い。規模 小。ブランチ `t206-onig`、Opus medium）
 - (1) \x1c〜\x1f を Python は空白と見て、onig は見ない。(2) Qwen と Llama 3 の `(?i:'s)` の ſ（U+017F）。(3) gpt2-digits の `\d` が ²・Ⅱ・① を数字と見る。どれも `CharClasses` の 1 行で直せるが、その文字を含むプロンプトの ID が変わる（本物の tokenizers に近づく向き）。変換器の出すものは変わらないので `CONVERTER` は要らない。本物の tokenizers と全符号位置で比べる試験（T200 のレビューの形）で確かめる。
+- **やったこと（2026-09-27）**: 元ネタは本物そのもの（tokenizers の onig と Rust の `char::is_numeric`）。`CharClasses` で (1) `isspace` から \x1c〜\x1f を外して「ほか」に、(2) ſ は種類の文字列でも ſ のまま（型の字の類は `[A-Za-zſ]`、`(?i:…)` の中だけ標準の `re` が s と読む）、(3) `gpt2-digits` の切り出しを種類の `0`（`\p{N}`）で（`re.finditer` の pos・endpos で GPT-2 の型を塊ごとに。前は Python の `\d`）。試験は `test_pretokenizers_split_every_character_as_the_real_ones_do`（全符号位置 × 4 つの型、本物の前分割と区切りの位置で。約 87 秒なので `tests/suite.sh full` だけ）と、`regex` と比べる乱数の文の試験の `PIECES` に \x1c・\x1f・ſ・'ſ を足した。
+- **CI**: tests.yml `full=true` run 36343272727（EPYC 9V74、tokenizers 0.23.2、Python 3.14.7）で全部通った。**わざと戻して**（同じ run の `extra=`）: (1) は 4 つの型が U+001C〜U+001F の 4 つで、(2) は qwen と llama3 が U+017F で、(3) は gpt2-digits が 1151 の符号位置（No・Nl）で落ち、乱数の文の試験も 3 つとも落ちた。**残した違い**: gpt2-digits の 13（U+11DE0〜U+11DE9、U+16FF4〜U+16FF6）は Python の Unicode 16.0 が割り当てていない（Cn）が Rust は数と見る。Pyodide の Python も同じ unicodedata の版なので、ページではその 13 字だけ本物と違う。試験は Cn を外して、数を 1 行出す。**format_check**（run 36343272891、tests.yml の `extra=`、T145 の形）: ok 38・known 4・none 11・DIFF 0 で main と同じ。
 
 ### T207 [性能] 長い文の BPE を 2 乗でなくする — 状態: 未着手（2026-09-27、T200 のレビューの残り。規模 小〜中）
 - T200 の後も、llama2.c の形の BPE は 1000 トークンで 0.17〜0.19 秒（合併のたびに最良を探す）。優先度つきの待ち行列（heap）で最良の対を取り、合併した所の両隣だけ入れ直す形にする（同点は前のものを選ぶ決まりを保つ）。ID は main と同じ。T200 の定義どおりの試験がそのまま通ること。
