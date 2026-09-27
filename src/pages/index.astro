@@ -399,10 +399,12 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
   };
   // T148: what the GPU chose for a model on this device (its shaders: T147 times them all the first time), for the next
   // visit: the worker's GPU compiles only those, where the adapter and browser are the same (gpu.js's key)
-  const gpuKey = (id: string) => `gpu:${id}`;
+  // (a model of ?hf= or of the visitor's folder is "local" in the list: named by its repository or its name, the
+  // review of T148)
+  const gpuKey = (entry: any) => `gpu:${entry.id !== "local" ? entry.id : entry.hf?.repo ? `hf:${entry.hf.repo}@${entry.hf.revision}` : `file:${entry.name}`}`;
   const gpuFor = (entry: { id: string }) => {
     try {
-      return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry.id)) ?? "null") ?? undefined };
+      return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry)) ?? "null") ?? undefined };
     } catch {
       return {};  // no storage here, or something else under the name: choose again
     }
@@ -705,7 +707,9 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     gpuNote = note ?? gpuNote;
     if (!readyLine || benchmarking) return;
     const { backend, threads, pyodide } = readyLine;
-    statusText.textContent = `${model.name} · ${backend}${threads > 1 ? `, ${threads} threads` : ""}${gpuNote ? `, ${gpuNote}` : ""} · Pyodide ${pyodide}`;
+    // (?gpuTest=on, the tests' flag, says so as ?without= does)
+    const tested = gpuNote && parameters.get("gpuTest") === "on" ? " (gpuTest)" : "";
+    statusText.textContent = `${model.name} · ${backend}${threads > 1 ? `, ${threads} threads` : ""}${gpuNote ? `, ${gpuNote}${tested}` : ""} · Pyodide ${pyodide}`;
   }
   // T135: how many of the prompt's tokens went through the GPU (the ones counted as the prompt: the one after them
   // makes the first logits, on the CPU)
@@ -833,7 +837,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
           textContent: `WebGPU ${seconds(data.seconds)} · ${data.matrices}${data.remembered ? " (remembered)" : ""} · ${data.attention}`,
         }));
         try {
-          localStorage.setItem(gpuKey(model.id), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention }));
+          localStorage.setItem(gpuKey(model), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention }));
         } catch {
           // no storage here: the next visit times them again
         }

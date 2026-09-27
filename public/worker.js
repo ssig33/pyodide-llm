@@ -304,6 +304,8 @@ let forceWide = false;
 // and the first right shader of the matrices taken untimed (SwiftShader timed Llama 3.2 1B's past gpu.js's 180 s)
 const hasWebGpu = Boolean(self.navigator?.gpu);
 let gpuForce = {};
+// ?bench= (T45): the page measures the CPU's combinations, and no GPU starts beside them
+let benchPage = false;
 // what the page kept of the GPU's shaders for the model asked for ({ remembered }), as threadsRequest
 let gpuRequest;
 // the optimizations this session leaves out (T52): ?without=relaxed,sampler, and ?kernel=off as it always was
@@ -397,6 +399,7 @@ async function init(search) {
   if (connections >= 1 && connections <= 32) hfConnections = Math.floor(connections);
   forceWide = asked.get("wide") === "on";
   gpuForce = asked.get("gpuTest") === "on" ? { fallback: true, always: true, quick: true } : {};
+  benchPage = asked.has("bench");
   const version = await resolvePyodideVersion(search);
   const base = `https://cdn.jsdelivr.net/pyodide/v${version}/full/`;
   // Each step says its name, and ends in an error rather than never: loadPyodide() does not fail when a fetch of
@@ -601,16 +604,18 @@ function weightsBuffer(size, header, options) {
     const spawn = shared ? spawnThread : undefined;
     // T148: the layers on the GPU are a second copy of them (T156 will keep one), in the same memory where the GPU is
     // a phone's or an Apple's: both, with the rest of this model, within half of what the device says it has (as
-    // src/models.js's weightsFor asks for six bits past half). A browser that does not say (Safari, Firefox): 4 GB
-    const gpuRoom = (self.navigator?.deviceMemory ?? 4) * 2 ** 30 / 2 - (size + after);
+    // src/models.js's weightsFor asks for six bits past half). Chromium says 8 for 8 GB or more: no limit then, as
+    // six bits are not asked for either. A browser that does not say (Safari, Firefox): 4 GB (the owner decides, TODO.md)
+    const deviceMemory = self.navigator?.deviceMemory ?? 4;
+    const gpuRoom = deviceMemory >= 8 ? undefined : deviceMemory * 2 ** 30 / 2 - (size + after);
     weightsNow = memory;
     return {
       write: (offset, chunk) => new Uint8Array(memory.buffer, base + offset, chunk.length).set(chunk),
       slice: (begin, end) => new Uint8Array(memory.buffer, base + begin, end - begin).slice(),
       llama: (tokenizer, options) => {
-        // (not in the benchmark's rounds, T45: they time the CPU's combinations, which a GPU starting beside them
-        // would slow down with its upload and compilation)
-        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benching ? openGpu : undefined, gpuRoom,
+        // (not on the benchmark's page, ?bench=, T45: it times the CPU's combinations, which a GPU starting beside
+        // them would slow down with its upload and compilation; its first load is one of them)
+        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage ? openGpu : undefined, gpuRoom,
           gpuRemembered: gpuRequest?.remembered, gpuForce });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
       },
@@ -1268,8 +1273,8 @@ const threadsNow = () => outsideNow?.engine?.threads ?? 1;
 // meanwhile says it too; the page drops what is not of its latest load.
 function watchGpu(id) {
   const engine = outsideNow?.engine;
-  if (!engine) return "prompts on the CPU (the NumPy engine runs this model)";
-  if (!engine.gpu) return `prompts on the CPU (${benching ? "the benchmark times the CPU" : "no WebGPU in a worker here"})`;
+  if (!engine) return "prompt on CPU (the NumPy engine runs this model)";
+  if (!engine.gpu) return `prompt on CPU (${benchPage ? "the benchmark times the CPU" : "no WebGPU in a worker here"})`;
   engine.gpu.then((note) => outsideNow?.engine === engine && postMessage({ type: "gpu", load: id, note, ...(engine.gpuReady ?? {}) }));
   return engine.gpuStatus;
 }

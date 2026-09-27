@@ -27,23 +27,27 @@ const GPU_QUIET_MS = 200000;
 // sixteen blocks left three quarters of it idle. Python hands a prompt over this many at a time where the GPU is on
 // (promptBlock), BATCH where it is not: the worker answers nothing while one call runs (T108)
 const GPU_BLOCK = 64;
-// T148: every this many generations, halfway between the threads' checks, a prompt goes to the side not chosen
+// T148: every this many generations after the first verdict, a part of a prompt goes to the side not chosen
 const GPU_RECHECK = 8;
 // T147: the number of the GPU's requests, for this worker and every model it loads (the memory and its control area
 // are kept from model to model, T96): a request of an engine let go is never one of the next engine's
 let gpuRequests = 0;
 const align = (n, to = 64) => Math.ceil(n / to) * to;
 const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+// T148 (the review): the lower of the two middles. A block is slowed by what else runs (the first after a pause, a
+// page in the background), never sped up: of two, the faster says the device, and one slow first block does not
+// move a verdict
+const lowerMedian = (xs) => [...xs].sort((a, b) => a - b)[(xs.length - 1) >> 1];
 
 // T148: how long a block of a prompt takes on either side, from which forward.js gives each block to the GPU or keeps
 // it on the CPU (AGENTS.md's policy 9: the GPU by default, the CPU where this device runs it faster). Measured, never
 // written down (the development machine's numbers are no visitor's):
 //   - the CPU: ms a token of the blocks of BATCH it runs of real prompts (no work only to time it), per number of
-//     threads (the search may change it), the median of the last KEEP; none until TIMED of them (the first block after
-//     a pause is the slowest: a single one would favour the GPU);
+//     threads (the search may change it), the lower median of the last KEEP; none until TIMED of them (the first
+//     block after a pause is the slowest: a single one would favour the GPU);
 //   - the GPU: gpu.js times whole blocks of 16 and 64 tokens as it starts (in turn, after one of each to warm up),
 //     and the line through them says a block of any count (fixed + a token: the tiles make a block of 16 cost nearly
-//     as much as one of 64); every block it then runs for real scales that line by the median of the last KEEP
+//     as much as one of 64); every block it then runs for real scales that line by the lower median of the last KEEP
 //     ratios (what the page adds around a block, a device that heats up or is loaded).
 // A block of count tokens goes to the GPU where it takes less than BETTER of the CPU's time: a short prompt, whose
 // block is small, stays on the CPU (T147's estimate: the GPU wins from about 64 tokens on a 1B model, a tiny-lm
@@ -79,7 +83,7 @@ export function promptTimes() {
     of(count, threads) {
       const times = cpu.get(threads);
       if (!line || !times || times.length < TIMED) return null;
-      const onCpu = median(times) * count, onGpu = onLine(count) * (ratios.length ? median(ratios) : 1);
+      const onCpu = lowerMedian(times) * count, onGpu = onLine(count) * (ratios.length ? lowerMedian(ratios) : 1);
       return { cpu: onCpu, gpu: onGpu, faster: onGpu < BETTER * onCpu };
     },
     /** the fewest tokens of a block (up to most) the GPU takes, most + 1 where none; null where of() is */
@@ -764,7 +768,12 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // GPU that is ready in the middle of a prompt changes nothing of it). Which blocks it takes: promptTimes above.
   let gpuWorker = null, gpuOn = false, gpuEnd = 0, gpuSerial = 0, gpuTokens = 0, settleGpu = null, gpuChosen = null;
   // T148: what the status line says of the GPU now, and whether this generation checks the side not chosen again
-  let gpuStatus = gpu ? null : undefined, recheckingGpu = false;
+  // recheck: the side not chosen that a part of the next long prompt goes to, to time it again ("cpu": the last
+  // 2 × BATCH tokens of the prompt, "gpu": its first GPU_BLOCK; a GPU, then the CPU, is the order a prompt may take),
+  // every GPU_RECHECK generations after the first verdict (sinceCheck), until it is timed (the review of T148: every
+  // block on the other side put a GPU faster from 17 to 64 tokens on blocks of 16, 1.47 times as long, and never
+  // timed the CPU). written: the positions this generation has filled
+  let gpuStatus = gpu ? null : undefined, recheck = null, sinceCheck = 0, written = 0;
   const times = promptTimes();
   const gpuNote = !gpu ? undefined : new Promise((resolve) => {
     settleGpu = (note) => {
@@ -772,10 +781,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuStatus = note;
       resolve(note);
     };
-    if (gpuWhyNot) settleGpu(`prompts on the CPU (${gpuWhyNot})`);
+    if (gpuWhyNot) settleGpu(`prompt on CPU (${gpuWhyNot})`);
     else startGpu();
   });
-  const gpuStarting = () => gpuWorker !== null && !gpuOn;
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
   function gpuUnfit() {
     if (!sharedMemory) return "the page is not cross-origin isolated";
@@ -806,7 +814,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       quiet = setTimeout(() => stopGpu(`the GPU said nothing for ${GPU_QUIET_MS / 1000} s`), GPU_QUIET_MS);
     };
     gpuWorker = gpu();
-    gpuStatus = "prompts on the CPU while the GPU gets ready";
+    gpuStatus = "prompt on CPU (GPU getting ready)";
     gpuWorker.onmessage = ({ data }) => {
       if (data.type === "progress") return listen();
       clearTimeout(quiet);
@@ -819,7 +827,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         const forms = data.forms.map((f) => `${f.name} ${f.none ?? (f.remembered ? "remembered" : f.ms ? `${f.ms.toFixed(1)} ms` : "untimed")}`).join("; ");
         const blocks = data.blocks.map(({ count, ms }) => `${count} tokens ${ms.toFixed(1)} ms`).join(", ");
         console.info(`gpu: the matrices by ${data.form}, the attention by ${data.attention} (a pass of the first layer by ${GPU_BLOCK} tokens: ${forms}; a whole block: ${blocks})`);
-        settleGpu?.(gpuForce.always ? "prompts on WebGPU" : "prompts on WebGPU where it is faster than the CPU");
+        settleGpu?.(gpuForce.always ? "prompt on GPU" : "prompt on GPU when faster");
       } else if (data.type === "unusable") {
         stopGpu(data.reason);
       } else if (data.type === "failed") {
@@ -841,31 +849,33 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (ctl) Atomics.store(ctl, GPU_WANTED, 0);  // T147: a request still under way writes nothing now
     gpuWorker?.postMessage({ type: "stop" });
     gpuWorker = null;
-    const note = `prompts on the CPU (${why ?? "the model was let go"})`;
+    const note = `prompt on CPU (${why ?? "the model was let go"})`;
     if (settleGpu) settleGpu(note);
     else if (gpu) gpuStatus = note;
   }
   // T148: whether a block of count tokens at pos0 goes to the GPU: where the GPU holds the keys and values before it,
-  // and is faster for count tokens than the CPU on the threads in use now (promptTimes); the other way round in a
-  // generation that checks the side not chosen again (recheckingGpu). The first block of a prompt says the verdict for
-  // a whole block in the console where it changes (and the status line has it)
+  // and is faster for count tokens than the CPU on the threads in use now (promptTimes); and the first whole block of
+  // a prompt where the GPU is to be timed again (recheck)
   function gpuTakes(count, pos0) {
     if (!gpuOn || pos0 > gpuEnd) return false;
     if (gpuForce.always) return true;
     const known = times.of(count, threads);
-    if (pos0 === 0) {
-      const most = times.of(GPU_BLOCK, threads), from = times.threshold(GPU_BLOCK, threads);
-      const status = !most ? "prompts on the CPU (timing it against WebGPU first)"
-        : from > GPU_BLOCK ? "prompts on the CPU (faster here than WebGPU)"
-        : from > 1 ? `prompts of ${from} tokens and more on WebGPU` : "prompts on WebGPU";
-      if (status !== gpuStatus || recheckingGpu) {
-        console.info(`gpu: ${!most ? `the CPU's time of a prompt is not known yet on ${threads} thread${threads > 1 ? "s" : ""}`
-          : `a block of ${GPU_BLOCK} tokens: ${most.gpu.toFixed(1)} ms on the GPU, ${most.cpu.toFixed(1)} ms on the CPU (${threads} thread${threads > 1 ? "s" : ""})`}: ` +
-          `${status}${recheckingGpu && most ? " (this one on the other side, to time it again)" : ""}`);
-      }
-      gpuStatus = status;
+    if (!known) return false;  // the CPU is timed first, on this prompt
+    return known.faster || (recheck === "gpu" && pos0 === 0 && count === GPU_BLOCK);
+  }
+  // T148: the verdict for a whole block, as a prompt begins: the status line has it (the fewest tokens the GPU takes,
+  // rounded up to a block of the CPU's, and none said up to one: the line does not move with every prompt), and the
+  // console says it where it changes. Until the CPU is timed, the line stays as the GPU left it
+  function verdict() {
+    const most = times.of(GPU_BLOCK, threads), from = times.threshold(GPU_BLOCK, threads);
+    if (!most || gpuForce.always) return;
+    const status = from > GPU_BLOCK ? "prompt on CPU (faster here)"
+      : from > BATCH ? `prompt on GPU from ${Math.ceil(from / BATCH) * BATCH} tokens` : "prompt on GPU";
+    if (status !== gpuStatus) {
+      console.info(`gpu: a block of ${GPU_BLOCK} tokens: ${most.gpu.toFixed(1)} ms on the GPU, ${most.cpu.toFixed(1)} ms on the ` +
+        `CPU (${threads} thread${threads > 1 ? "s" : ""}), the GPU from ${from > GPU_BLOCK ? "no count" : `${from} tokens`}: ${status}`);
     }
-    return known ? known.faster !== recheckingGpu : false;
+    gpuStatus = status;
   }
   // A block of a prompt (up to GPU_BLOCK tokens at pos0, pos0 + 1, ...) through the layers on the GPU: false where it
   // must go to the CPU instead (no GPU, keys and values the GPU does not have, a failure)
@@ -896,6 +906,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     gpuEnd = pos0 + count;
     gpuTokens += count;
     times.gpu(count, performance.now() - began);
+    if (recheck === "gpu") recheck = null;
     return true;
   }
   // T148: a block of a prompt on the CPU, BATCH at a time (T108), each whole one timed where the GPU is there to
@@ -904,7 +915,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     for (let i = 0; i < tokens.length; i += BATCH) {
       const piece = tokens.slice(i, i + BATCH), began = performance.now();
       run(piece, pos0 + i, false);
-      if (gpuOn && piece.length === BATCH) times.cpu(threads, (performance.now() - began) / BATCH);
+      if (gpuOn && piece.length === BATCH) {
+        times.cpu(threads, (performance.now() - began) / BATCH);
+        if (recheck === "cpu") recheck = null;
+      }
     }
   }
 
@@ -948,7 +962,13 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (!search && chosen && recheckEvery && generations % recheckEvery === 0) beginSearch(chosen);
       // T148: halfway between the threads' checks, a prompt goes to the side not chosen, so that its time stays
       // today's (a device that heats up, a GPU timed while the CPU was busy)
-      recheckingGpu = gpuOn && !gpuForce.always && generations % GPU_RECHECK === GPU_RECHECK / 2;
+      written = 0;
+      const whole = gpuOn && !gpuForce.always ? times.of(GPU_BLOCK, threads) : null;
+      if (whole && ++sinceCheck >= GPU_RECHECK && !recheck && !search) {
+        recheck = whole.faster ? "cpu" : "gpu";
+        sinceCheck = 0;
+        console.info(`gpu: the ${recheck === "cpu" ? "CPU on the end" : "GPU on the beginning"} of the next long prompt, to time it again`);
+      }
     },
     get searching() {
       return search !== null;
@@ -974,10 +994,17 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     forwardMany(tokens, pos) {
       const list = tokens.toJs ? tokens.toJs() : [...tokens];
       for (let at = 0; at < list.length;) {
-        const block = list.slice(at, at + (gpuOn ? GPU_BLOCK : BATCH));
-        if (!gpuTakes(block.length, pos + at) || !promptOnGpu(block, pos + at)) promptOnCpu(block, pos + at);
+        const block = list.slice(at, at + (gpuOn ? GPU_BLOCK : BATCH)), from = pos + at;
+        if (from === 0) verdict();
+        // T148: the CPU timed again on the last 2 × BATCH tokens of a prompt (its last block is the short one), the
+        // rest of that block where it goes
+        const tail = recheck === "cpu" && block.length < GPU_BLOCK ? Math.min(block.length, 2 * BATCH) : 0;
+        const head = block.slice(0, block.length - tail);
+        if (head.length && (!gpuTakes(head.length, from) || !promptOnGpu(head, from))) promptOnCpu(head, from);
+        if (tail) promptOnCpu(block.slice(head.length), from + head.length);
         at += block.length;
       }
+      written = pos + list.length;
     },
     /** T147: how many tokens of a prompt Python hands forwardMany() at once: GPU_BLOCK where the GPU takes a whole
      * block (T148: where it is faster), else BATCH (a longer call keeps the worker from answering for longer, and the
@@ -986,7 +1013,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       if (!gpuOn) return BATCH;
       if (gpuForce.always) return GPU_BLOCK;
       const whole = times.of(GPU_BLOCK, threads);
-      return whole && whole.faster !== recheckingGpu ? GPU_BLOCK : BATCH;
+      return whole && (whole.faster || (recheck === "gpu" && written === 0)) ? GPU_BLOCK : BATCH;
     },
     /** T147: the shaders the GPU multiplies a prompt's matrices and runs its attention with (tests) */
     get gpuForm() {
@@ -1012,7 +1039,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       return gpuTokens;
     },
     forward(token, pos, needLogits = true) {
-      if (search && needLogits && !gpuStarting()) {  // T148: not while the GPU's start shares the CPU
+      if (search && needLogits) {
         const [count, timed] = countForToken();
         threads = count;
         const began = performance.now();

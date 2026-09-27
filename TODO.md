@@ -220,14 +220,14 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 - **完了条件の書き方（レビューの案）**: 1B 級で 64 トークン以上のプロンプトが CPU より速い。**覆す条件**: `/benchmark/` の「A prompt」の最速が 64 トークンで 90 GFLOPS 未満なら、1B でも CPU に負ける。
 
 - **本番の確認（2026-09-27、8c1062c のデプロイの後）**: gpu-prompt.yml（36277493235）は Chromium・Chrome・Edge の SwiftShader の synthetic と、新しい Dawn（lavapipe）のジョブ（4 モデル、3.4 分）が通った。models.yml の `gpu=on`（36277494297）: llm-jp-3 150M と sarashina2.2 0.5B は「prompts on WebGPU」で答えた。**Llama 3.2 1B は SwiftShader で形の計測の段が 180 秒の期限を越え、「prompts on the CPU (timing the tiled shaders took more than 180 s)」で CPU に戻って答えた**（準備完了 210.4 秒。T148 でフォールバックのアダプタを断れば訪問者には起きない。試験の道具で SwiftShader を通すときは形を固定するなど）。Qwen2.5 0.5B（bias）と Firefox（Worker に WebGPU なし）は理由を出して CPU で答えた（e2e が「GPU を通らなかった」と落とすのは、頼んだ試しの形のせいで期待どおり）。
-### T148 [性能] 既定で GPU、端末で測って選ぶ（方針 9） — 状態: **レビュー待ち（2026-09-27、Opus medium、ブランチ `t148-default`。文面は英語の仮で入れた: 下の案を持ち主に。持ち主の端末の数字は未計測）**（T147 の後。規模 小〜中）
+### T148 [性能] 既定で GPU、端末で測って選ぶ（方針 9） — 状態: **レビュー済み（must-fix 2 と should 9 を直した、2026-09-27、Opus medium、ブランチ `t148-default`）。直しの確かめを待って本線へ。文面は仮（下の案 A と B、持ち主が選ぶ）。持ち主の端末の数字は未計測**（T147 の後。規模 小〜中）
 - 作るもの: オプションなしで GPU を使う。読み込みか最初のプロンプトで GPU と CPU を短く測り、その端末で GPU が遅ければ CPU に戻す（ソフトウェアスレッドの本数の検索と同じ形）。判断はコンソールに 1 行、ステータス行に「prompts on WebGPU」か「on the CPU (理由)」。重みを 2 重に持つと入らないモデル（T156 の前）は CPU。`?gpu=` の旗は外す。
 - 止まる点: 持ち主の端末（Android・iPhone・PC）で、既定のページで遅くならないこと。レビューは Opus xhigh（全部の訪問者の既定が変わるので、測り方の揺れ・熱・最初のプロンプトの短さで選び違えないかを見る）。
 - T147 のレビューから: GPU を待たずに準備完了にし、GPU の準備ができたら途中のプロンプトから GPU に切り替える（`gpuEnd` があるので安全なことはレビューがコードで確かめた）。
 - T147 のレビューから: フォールバックのアダプタ（SwiftShader など、CPU が GPU の代わり）はシェーダのコンパイルの前に断る（SwiftShader では全部の形のコンパイルで準備完了が 2〜4 分延びる）。
 - T147 のレビューから: 端末ごとに選んだ行列積の形を覚え、次からはコンパイルを 2 つ（選んだ形と attention）にする。
 - T147 のレビューから: 選んだ形と GPU の準備の秒を画面に出す（文面は持ち主）。
-- **作ったもの（2026-09-27）**: 元ネタは無い（シェーダではない部分: 選び方はスレッドの本数の検索（T93）と同じ形にした）。決定と理由は AGENTS.md の「既定で GPU、端末で測って選ぶ（T148）」。要点:
+- **作ったもの（2026-09-27、レビューの前の初めの形。測り直し・中央値・文面・メモリの読みは下の「直したもの」で変わった）**: 元ネタは無い（シェーダではない部分: 選び方はスレッドの本数の検索（T93）と同じ形にした）。決定と理由は AGENTS.md の「既定で GPU、端末で測って選ぶ（T148）」。要点:
   1. **旗なしで GPU**: WebGPU のある Worker では、どのモデルでも GPU の Worker を作る。`?gpu=on` は外し、試験用の旗 `?gpuTest=on` を置いた（名前と理由: CI と開発機の WebGPU は SwiftShader だけで、ページはそれを断るので、ページの GPU の道を試すには許す旗が要る。`fallback`・`always`（GPU の方が遅くてもブロックを回す）・`quick`（形を 1 つ目の正しいもので測らずに決め、ブロックも測らない: SwiftShader で Llama 3.2 1B の形の計測が 180 秒の期限を越えた、T147 の本番の CI））。`tests/gpu-check.mjs` は `gpuForce` の `fallback`・`always` で。GPU を切る旗は作らなかった（試験の道具は要らない。旗なしの Playwright の Chromium はアダプタが無く CPU）。
   2. **GPU を待たない準備完了**: 準備完了は CPU の準備だけで出し、GPU の準備（転送・コンパイル・検査・計測）が終わったら `{type: "gpu"}` でステータス行を書き直す。GPU は次のブロックから（`gpuEnd` より先から始まるブロックは CPU）。
   3. **フォールバックのアダプタを断る**: `requestAdapter` の直後、`requestDevice` の前（`adapter.info.isFallbackAdapter`、古い名前 `adapter.isFallbackAdapter` も）。
@@ -236,18 +236,51 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   6. **画面**: ステータス行の GPU の部分が変わる（下の案）。準備完了の内訳（ステータス行を開いたところ）に 1 行「WebGPU <秒> · <行列積の形>（remembered）· <attention の形>」。コンソールには判断が変わるたびに 1 行（`gpu: a block of 64 tokens: X ms on the GPU, Y ms on the CPU (N threads): …`）。
   7. **メモリ**: 層を GPU にも置くと `deviceMemory` の半分（言わないブラウザは 4 GB と見て 2 GB）を越えるモデルは CPU（チェックポイント + `footprint()` + GPU の層）。
   8. `?bench=1` のラウンドは GPU を作らない。スレッドの検索は GPU の準備中は止める。
-- **文面の案（仮に入れたもの。持ち主に）**: ステータス行の GPU の部分（「tiny-lm 29M · SIMD kernels, int8, relaxed SIMD, 4 threads, ＿＿ · Pyodide …」の ＿＿）:
-  - 準備中: `prompts on the CPU while the GPU gets ready`
-  - 準備ができた（まだ比べていない）: `prompts on WebGPU where it is faster than the CPU`
-  - CPU を測る前: `prompts on the CPU (timing it against WebGPU first)`
-  - 比べた後: `prompts on WebGPU` ／ `prompts of 29 tokens and more on WebGPU` ／ `prompts on the CPU (faster here than WebGPU)`
-  - 使えない: `prompts on the CPU (<理由>)`（例: `a fallback adapter: the CPU in the GPU's place`、`no GPU adapter here`、`no WebGPU in a worker here`、`the page is not cross-origin isolated`、`the layers on the GPU as well (1234 MB) would not leave this device enough memory`）
-  - 準備完了の内訳の行: `WebGPU 3.21 s · llama.cpp tiles 32×32, f16 (remembered) · llama.cpp flash attention tiles, f16, subgroups`
-  - 案 B（短く）: ステータス行は `GPU` ／ `GPU from 29 tokens` ／ `CPU (<理由>)` だけにして、詳しい文はコンソールと内訳に。スマホ幅でステータス行が長い（今の案で 1 行 100 字前後）ので、B を推す。
-- **正しさ**（2026-09-27、この開発機）: pytest 504、smoke、forward-check（共有と `--plain`）、threads-check、`tests/gpu-choice-check.mjs`、build。`gpu-check` の Dawn + lavapipe は 4 モデル全部通った（数字は T147 と同じ。作り物のモデルで、遅れた GPU の後に CPU がブロックをやり直すこと、試験の許しの無いフォールバックのアダプタを 0.1 秒で断ること、覚えた形はそのアダプタの鍵のときだけ使うこと）。Playwright の Chromium の SwiftShader（`isFallbackAdapter` が真と言う）で作り物のモデルも全部通った（断るのは 0.0 秒、数字は T147 と同じ）。`?bench=1`（`bench-browser.mjs`）も通った。**わざと壊すと落ちる**（Dawn、`.tmp/t148/mutate.sh`）: フォールバックの判定を外す（断られずに 3.1 秒で「prompts on WebGPU where …」）、鍵の比べを外す（ほかの鍵でも覚えた形を使った）、GPU の失敗で CPU に戻る道を外す（遅れた GPU の後に CPU が K を書かなかった）。どれも落ち、戻すと通る。**ページ**（Playwright の Chromium、`npm run build` の `dist/`、3GB の枠）: 旗なしの tiny-lm は「prompts on the CPU (no GPU adapter here)」で答えた（準備完了 17.9 秒）。`E2E_GPU=swiftshader` の tiny-lm と llm-jp-3 150M は準備完了と同時に「prompts on the CPU (a fallback adapter: …)」で CPU で答えた（17.5・23.4 秒）。`E2E_QUERY=gpuTest=on` の llm-jp-3 150M は準備完了 27.9 秒、その 129 秒後に「prompts on WebGPU」、プロンプトは GPU で答え、同じページで替えた tiny-lm は GPU の準備中に CPU で答えた。`?coi=off` は「(the page is not cross-origin isolated)」で CPU。Firefox はこの開発機に無い（Playwright の Firefox も入っていない）ので CI で。準備完了の秒は GPU を待たないので前と同じ形（前後を同じ機械で交互に測ってはいない: ほかの担当が同じ機械で Dawn を回していた）。
-- **見つけたもの（T148 の外、別の番号に）**: ページの「progress と token と status 以外の知らせは、Worker が空いた印」（`index.astro` の末尾）は、生成の途中に来る `threads`・`threads-compared`（スレッドの検索が生成の中で決まる）でも送信ボタンを戻す。`gpu` の知らせは足したが、`threads` の 2 つは直していない。
-- **確かめていないもの**: 持ち主の端末で、GPU の準備の秒、覚えた形で縮む秒、選ばれる側としきい値（1B で 64 トークン以上が GPU になるか、tiny-lm で CPU のままか）、熱で入れ替わるか。`isFallbackAdapter` を言わないブラウザ（古い Chrome、Safari）でソフトウェアのアダプタが混ざる場合。
-- **持ち主に測ってもらう手順**: 本線に入った後、本番のモデルのページを旗なしで開き（`?run=` などは付けない）、(1) ステータス行が「…while the GPU gets ready」から変わるまでの秒と、ステータス行を開いた内訳の「WebGPU … s」の行、(2) 100 字ほどと 1000 字ほどの問いを 2 回ずつ送り、ステータス行と答えの下の「prompt N tokens (on WebGPU)」、(3) ページを読み直して内訳の「(remembered)」と WebGPU の秒。Android・iPhone・PC で、llm-jp-3 150M と Llama 3.2 1B。コンソールが見られる端末は `gpu:` の行も。
+- **レビュー（Opus xhigh、2026-09-27）: must-fix 2（熱の測り直しがしきい値 17〜64 の帯で GPU の 16 ずつになり CPU を測り直さない: 1.47 倍、`always` なしの道を通る試験が無い: CPU の測りを消しても全部の試験が通った）。should 9（検索の停止、2 つの中央値、測り直しの時機と費用、deviceMemory 8 の読み、鍵の版、gpuTest の表示、gpu:local、行の揺れ、bench と dGPU）。別件の送信ボタンは本物（T114 から）で T172 に。**
+- **直したもの（2026-09-27、Opus medium、本線 13eaa60 に rebase）**:
+  - must-fix 1 と should 3: **測り直しは選ばなかった側で、プロンプトの一部だけ**。最初の判定から 8 回の生成ごとに（スレッドの検索の最中は待つ）、GPU を選んでいれば次の長いプロンプトの最後の 32 トークンを CPU で（最後のブロックは短いもの）、CPU を選んでいれば最初の 64 トークンを GPU で（「GPU、そのあと CPU」の順は許されている）。測れるまで持ち越す。`promptBlock` は判定のとおり（GPU の測り直しの回は最初の 1 つだけ 64）。
+  - must-fix 2: `tests/gpu-default-check.mjs`（偽の GPU の Worker が寝てから制御領域に答えるだけ、llm-jp-3 150M の本物の CPU の forward。GPU の時間は先に測った CPU の ms / トークンの倍数で決める）。GPU が速い: 1 回目は CPU（0）、2〜8 回目は 230 全部、9 回目は最後の 32 だけ CPU（198 ではなく 192: 最後のブロック 38 の頭 6 はしきい値より短く CPU）、短いプロンプトは 0、2 本にすると 0 のあと 230。GPU が遅い: 9 回目だけ 64。しきい値 36 の帯: 測り直しの回 1065 ms、ほか 872 ms（1.22 倍、線 1.5 倍）。**わざと壊すと落ちる**: CPU の測りを消す（GPU を一度も使わない）、初めの形の forward.js（4 回目と 12 回目にプロンプト全体が反対の側、帯で 3.3 倍）。deploy.yml にも足した。
+  - should 1: スレッドの検索は GPU の準備中も続ける（CPU の測りは準備中は数えないまま）。レビューの試験台 `late`（GPU の準備 6 秒、ヒントの 8 本）で、検索は 4 回目の生成まで進み、GPU は 5 回目から。
+  - should 2: 中央値は下側（2 つなら速いほう）。ブロックはほかの仕事で遅くなることはあっても速くはならない。
+  - should 4: `deviceMemory` の 8 は「8 GB 以上」と読んで制限しない。言わないブラウザは 4 GB のまま（下の表、持ち主の判断）。
+  - should 5: 覚えた形の鍵に、その端末で作れるシェーダの文のハッシュ（FNV-1a）を足した（シェーダが変わったデプロイでは選び直す。`?v=` はデプロイごとに変わるので使わない）。
+  - should 6: `?gpuTest=on` のときステータス行の GPU の部分に「(gpuTest)」。
+  - should 7: 覚える名前は `gpu:<id>`、`?hf=` は `gpu:hf:<リポジトリ>@<版>`、フォルダは `gpu:file:<名前>`。
+  - should 8: ステータス行は判定が出たときだけ変わる（CPU の時間が無い間は準備ができたときの文のまま）。しきい値は 16 の倍数に切り上げ、16 以下なら数を出さない。
+  - should 9: `?bench=` のページは GPU の Worker を作らない（最初の読み込みから）。`requestAdapter` は `powerPreference` なし（ノートの 2 つ目の GPU を訪問のあいだ起こし続けない。どのアダプタでも CPU と比べて選ぶ）。
+- **文面の案（持ち主が選ぶ）**: ステータス行の GPU の部分（「tiny-lm 29M · SIMD kernels, int8, relaxed SIMD, 4 threads, ＿＿ · Pyodide …」の ＿＿）。**いま入っているのは案 B**（レビューの直した案）:
+
+  | 場面 | 案 A（最初の仮） | 案 B（いま） |
+  |---|---|---|
+  | 準備中 | prompts on the CPU while the GPU gets ready | prompt on CPU (GPU getting ready) |
+  | 準備ができた、まだ比べていない | prompts on WebGPU where it is faster than the CPU | prompt on GPU when faster |
+  | GPU が速い | prompts on WebGPU | prompt on GPU |
+  | 長いものだけ GPU | prompts of 29 tokens and more on WebGPU | prompt on GPU from 32 tokens |
+  | CPU が速い | prompts on the CPU (faster here than WebGPU) | prompt on CPU (faster here) |
+  | 使えない | prompts on the CPU (<理由>) | prompt on CPU (<理由>) |
+
+  準備完了の内訳の行（ステータス行を開いたところ）: `WebGPU 3.21 s · llama.cpp tiles 32×32, f16 (remembered) · llama.cpp flash attention tiles, f16, subgroups`。答えの下の行は T135 のまま（`prompt 120 tokens on WebGPU`）。
+- **メモリの判定（持ち主の判断: `deviceMemory` を言わないブラウザを 4 GB と見るか）**: 層を GPU にも置いた合計（チェックポイント + `footprint()` + GPU の層）が端末のメモリの半分を越えるなら CPU。`deviceMemory` が 8（8 GB 以上）なら制限しない。レビューの `room.mjs` の見積もり（GB、4096 位置、共有メモリ）:
+
+  | モデル | チェックポイント | 後ろ | GPU の層 | 合計 | 4 GB の端末（と iPhone） | 8 GB 以上 |
+  |---|---:|---:|---:|---:|---|---|
+  | Llama 3.2 1B | 1.39 | 0.38 | 1.09 | 2.86 | CPU | GPU |
+  | TinyLlama 1.1B | 1.24 | 0.21 | 1.09 | 2.54 | CPU | GPU |
+  | llm-jp-3 980M | 1.11 | 0.88 | 0.77 | 2.76 | CPU | GPU |
+  | sarashina2.2 1B | 1.58 | 0.70 | 1.17 | 3.45 | CPU | GPU |
+  | SmolLM2 1.7B | 1.93 | 1.45 | 1.81 | 5.19 | CPU | GPU |
+  | llm-jp-3.1 1.8B | 2.10 | 1.44 | 1.64 | 5.19 | CPU | GPU |
+
+  iPhone の Safari は `deviceMemory` を言わないので、1B 級はどれも CPU（llm-jp-3 150M などの小さいものは GPU を測る）。4 GB と見るのをやめるなら、iPhone の本当のメモリ（6〜8 GB）で落ちないかを持ち主の端末で見る必要がある。
+- **正しさ（直しの後、2026-09-27、この開発機）**: pytest 504、smoke、forward-check（共有と `--plain`）、threads-check、`gpu-choice-check`、`gpu-default-check`、build、`gpu-check` の Dawn + lavapipe、e2e（旗なし、SwiftShader、`gpuTest=on`）。直しの前にも同じ一式と、gpu-check の SwiftShader（作り物のモデル）、`bench-browser.mjs`、`?coi=off` の e2e、わざと壊す 3 つ（フォールバックの判定・鍵の比べ・CPU に戻る道: Dawn でどれも落ちた）を通してある。直しの後: 全部通った。gpu-check の Dawn は 4 モデルとも T147 と同じ数字（作り物のモデルで、遅れた GPU の後に CPU がやり直す、許しの無いフォールバックを 0.3 秒で断る、覚えた形はその鍵のときだけ）。e2e: 旗なしの tiny-lm は「prompt on CPU (no GPU adapter here)」（準備完了 17.3 秒）、SwiftShader を渡した llm-jp-3 150M は準備完了と同時に「prompt on CPU (a fallback adapter: …)」（23.3 秒）、`gpuTest=on` の llm-jp-3 150M は準備完了 36.6 秒、その 180.6 秒後（Dawn の検査と同時に走らせた）に「prompt on GPU (gpuTest)」でプロンプトを GPU で答えた。レビューの試験台 `choice-harness.mjs`（`.tmp/t148/` にパスを直した写し）の faster・slower・late も期待どおり（測り直しの回は最後の 32 だけ CPU、late は検索を続けたまま 5 回目から GPU）。
+- **持ち主の端末で見てもらうこと**（本線に入った後、本番を旗なしで。Android・iPhone・PC、llm-jp-3 150M と Llama 3.2 1B。`?run=` などは付けない）:
+  1. 準備完了がこれまでと同じくらいで出ること（GPU を待たない）。
+  2. ステータス行が「(GPU getting ready)」から変わるまでの秒と、内訳の「WebGPU … s」の行。
+  3. 1000 字ほどの問いを 3 回: 1 回目は CPU（測るため）、2 回目から答えの下の「prompt N tokens on WebGPU」が出るか、ステータス行が何と言うか。
+  4. 100 字ほどの短い問い: CPU のままか（答えの下に「on WebGPU」が出ないか）。
+  5. 読み直した後の内訳の「(remembered)」と、WebGPU の秒が縮むか。
+  6. 10 回ほど問うと 1 回、プロンプトの一部が反対の側で測り直される（遅くならないか）。
+  7. iPhone で 1B が「(the layers on the GPU as well … would not leave this device enough memory)」になること（上の表の判断のため）。コンソールが見られる端末は `gpu:` の行も。
 
 ### T149 [性能] 生成の行列 × ベクトルのシェーダを、帯域の出る形に — 状態: **レビュー済み（must-fix 1 つと should 6 つを直した、2026-09-27、ブランチ `t149-matvec`。ベンチの変種まで。エンジンの経路は T152）。直しの確かめを待って本線へ、持ち主の 3 台で `/benchmark/` の GPU の節を測る**（規模 中）
 - 根拠: 持ち主の Android で、1B の分類器は 27〜36 GB/s 出るのに、w1（16.8MB）は 3.3〜15.7 GB/s。小さい行列ほど帯域が出ていない。CPU の 4 本は 23〜29 GB/s。

@@ -84,7 +84,9 @@ async function start(memory, plan) {
   try {
     const wgsl = await shaders;
     if (!self.navigator?.gpu) return unusable("no WebGPU in a worker here");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    // the browser's own adapter (T148, the review: "high-performance" would keep a laptop's second GPU awake for the
+    // whole visit, for prompts that are mostly short; the device measures whichever it gets against its CPU anyway)
+    const adapter = await navigator.gpu.requestAdapter();
     if (stopping) return end();
     if (!adapter) return unusable("no GPU adapter here");
     // T148: a fallback adapter is the CPU doing the GPU's work (SwiftShader, lavapipe): never faster than the CPU's
@@ -107,7 +109,8 @@ async function start(memory, plan) {
         maxComputeWorkgroupSizeX } });
     device.lost.then((info) => { lost = `the GPU was lost (${info.reason}${info.message ? `: ${info.message}` : ""})`; });
     // T148: what the page keeps of an earlier visit counts only for the same adapter and browser
-    const key = adapterKey(adapter);
+    // (and the shaders of this deployment: a site whose shaders changed chooses anew, the review of T148)
+    const key = `${adapterKey(adapter)}|${shadersKey(wgsl, candidates({ device, wgsl }))}`;
     const remembered = plan.remembered?.key === key ? plan.remembered : null;
     model = { device, memory, plan, wgsl, owned: [], limit, info, fallback, remembered };
     if (stopping) return end();
@@ -152,6 +155,18 @@ const adapterKey = (adapter) => {
   const info = adapter.info ?? {};
   return [info.vendor, info.architecture, info.device, info.description, self.navigator?.userAgent].map((part) => part ?? "").join("|");
 };
+// the shaders' own text (the tiled ones this device can make, and the small steps'), as a short hash (FNV-1a)
+function shadersKey(wgsl, forms) {
+  let hash = 0x811c9dc5;
+  for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.ROPE, wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile)]) {
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+// the tiled shaders of T146 this device can make (shaders.js's promptForms)
+const candidates = ({ device, wgsl }) => wgsl.promptForms({ half: device.features.has("shader-f16"), subgroups: device.features.has("subgroups"),
+  packed: Boolean(navigator.gpu.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product")),
+  memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device) });
 
 function unusable(reason) {
   postMessage({ type: "unusable", reason });
@@ -396,10 +411,8 @@ function halfToFloat(h) {
 // only the device can say), the right ones timed on the model's own gate matrix by a whole block, and the fastest
 // taken. forms: what each came to (ms, or why not), for the console. plan.force.matrices (tests only): that form alone, untimed.
 async function chooseMatrices(m) {
-  const { device, plan, wgsl } = m;
-  const packed = Boolean(navigator.gpu.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product"));
-  let forms = wgsl.promptForms({ half: device.features.has("shader-f16"), subgroups: device.features.has("subgroups"), packed,
-    memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device) });
+  const { plan } = m;
+  let forms = candidates(m);
   if (plan.force.matrices) forms = forms.filter((form) => form.name === plan.force.matrices);
   m.forms = [];
   // T148: the shader the page remembers for this adapter, alone, where it is one this device still makes and it is
