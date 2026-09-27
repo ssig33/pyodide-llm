@@ -693,14 +693,33 @@ function sortNucleus(probs: usize, index: usize, lo: i32, hi: i32): void {
   return count + past;
 }
 
+// kept() for the four of d, the bits of past telling which of them are past the floor (T189)
+// @ts-ignore: decorator
+@inline function keptFour(probs: usize, index: usize, count: i32, d: v128, i: i32, past: i32): i32 {
+  count = kept(probs, index, count, f32x4.extract_lane(d, 0), i, past & 1);
+  count = kept(probs, index, count, f32x4.extract_lane(d, 1), i + 1, (past >> 1) & 1);
+  count = kept(probs, index, count, f32x4.extract_lane(d, 2), i + 2, (past >> 2) & 1);
+  return kept(probs, index, count, f32x4.extract_lane(d, 3), i + 3, past >> 3);
+}
+
 // Draws a token from softmax(logits / temperature), restricted to the nucleus when 0 < topp < 1.
 // random: one number in [0, 1) from Python's generator, so that a seed reproduces. probs and index: scratch of n each.
 export function sample(logits: usize, n: i32, temperature: f32, topp: f32, random: f64, probs: usize, index: usize): i32 {
   let best = load<f32>(logits);
   let i = 0;
   if (n >= 4) {
-    let bests = v128.load(logits);
-    for (i = 4; i + 4 <= n; i += 4) bests = f32x4.max(bests, v128.load(logits + (<usize>i << 2)));
+    // T189: four maxima side by side. x86 has no instruction for f32x4.max (NaN, -0): V8 writes several, and one
+    // maximum waited on itself (on the x86 runners 1.3 ns a logit, three quarters of the walk; the arm64 runner 0.15)
+    let b0 = v128.load(logits), b1 = b0, b2 = b0, b3 = b0;
+    for (i = 4; i + 16 <= n; i += 16) {
+      const at = logits + (<usize>i << 2);
+      b0 = f32x4.max(b0, v128.load(at));
+      b1 = f32x4.max(b1, v128.load(at, 16));
+      b2 = f32x4.max(b2, v128.load(at, 32));
+      b3 = f32x4.max(b3, v128.load(at, 48));
+    }
+    for (; i + 4 <= n; i += 4) b0 = f32x4.max(b0, v128.load(logits + (<usize>i << 2)));
+    const bests = f32x4.max(f32x4.max(b0, b1), f32x4.max(b2, b3));
     best = max(max(f32x4.extract_lane(bests, 0), f32x4.extract_lane(bests, 1)), max(f32x4.extract_lane(bests, 2), f32x4.extract_lane(bests, 3)));
   }
   for (; i < n; i++) best = max(best, load<f32>(logits + (<usize>i << 2)));
@@ -708,19 +727,19 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
   // With a nucleus, tokens less than a ten millionth as probable as the best one cannot matter (ln 1e-7 = -16.118):
   // they are left out before exp(), which is the expensive part
   const floor: f32 = nucleus ? best - temperature * <f32>16.118095 : -f32.MAX_VALUE;
-  // T189: four at a time. Four that all stay below the floor (most of the vocabulary) cost one comparison; of the
-  // others each is written and only those past the floor are counted, in their order, without a branch each
+  // T189: eight at a time. Eight that all stay below the floor (most of the vocabulary) cost two comparisons and one
+  // branch; of the others each is written and only those past the floor are counted, in their order, without a
+  // branch each (whether a token passes is not predictable). A branch for each four was slower (on the arm64 runner
+  // the walk 1.23 times main's where this is 2.1), and none at all slower still (0.45 times)
   const floors = f32x4.splat(floor), shift = f32x4.splat(best);
   let count = 0;
-  for (i = 0; i + 4 <= n; i += 4) {
-    const v = v128.load(logits + (<usize>i << 2));
-    const past = i32x4.bitmask(f32x4.ge(v, floors));
-    if (past == 0) continue;
-    const d = f32x4.sub(v, shift);
-    count = kept(probs, index, count, f32x4.extract_lane(d, 0), i, past & 1);
-    count = kept(probs, index, count, f32x4.extract_lane(d, 1), i + 1, (past >> 1) & 1);
-    count = kept(probs, index, count, f32x4.extract_lane(d, 2), i + 2, (past >> 2) & 1);
-    count = kept(probs, index, count, f32x4.extract_lane(d, 3), i + 3, past >> 3);
+  for (i = 0; i + 8 <= n; i += 8) {
+    const at = logits + (<usize>i << 2);
+    const a = v128.load(at), b = v128.load(at, 16);
+    const pa = f32x4.ge(a, floors), pb = f32x4.ge(b, floors);
+    if (!v128.any_true(v128.or(pa, pb))) continue;
+    count = keptFour(probs, index, count, f32x4.sub(a, shift), i, i32x4.bitmask(pa));
+    count = keptFour(probs, index, count, f32x4.sub(b, shift), i + 4, i32x4.bitmask(pb));
   }
   for (; i < n; i++) {
     const v = load<f32>(logits + (<usize>i << 2));
