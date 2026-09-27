@@ -48,6 +48,20 @@ the answer for this model (the reason is in the console). The prompts can also s
 WebGPU", "prompts on the CPU (faster here than WebGPU)", or "prompts on the CPU (reason)" where the GPU is not used
 at all.
 
+## Models too large to hold twice
+
+A WebAssembly memory cannot shrink, so the page cannot load a model on both sides, measure, and then drop the CPU's
+copy. It decides before the weights arrive. If the weights on both sides fit in half of the memory the device
+reports (a device that reports 8 GB counts as 8 GB here, so 4 GB for both), the page keeps both and measures, as
+above. Otherwise a Llama-shaped int8 model whose tokens the GPU can write goes on the GPU alone: the layers' matrices
+go to the GPU as they are converted or read, and only the rest (the embedding, the norms) stays in the CPU's memory.
+Nothing then runs on the CPU. If the GPU fails, or if `/benchmark/` has measured this device's CPU and its estimate
+of a token (the model's weights read at the CPU section's speed) is faster than the GPU's measured token, the page
+loads the model again on the CPU. A model converted from Hugging Face is kept as it arrives. 6-bit models are not put
+on the GPU alone: the GPU holds them widened to int8, which is larger. The GPU alone still keeps the embedding and a
+copy of the keys and values on the CPU, so for Llama 3.2 3B it takes about 5.3 GB against 4.4 GB on the CPU alone
+(an estimate, not measured).
+
 ## Where the GPU is not used
 
 - The browser has no WebGPU in a worker (Firefox so far, including Firefox 156 on Android).

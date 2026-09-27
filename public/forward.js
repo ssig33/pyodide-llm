@@ -266,7 +266,7 @@ const frameBytes = (arrays) => arrays.reduce((size, [, bytes]) => size + align(b
  * size of a head where it is not dim / heads (T124), 0 where it is. gpu (T135): the page asked for the prompt on the
  * GPU, whose keys and values of a block come back through a place of their own. */
 export function footprint(header, size, { dtype = "float32", arch = "llama", int8 = true, relaxed = true, halfKV = false,
-  kvStart = 256, outliers = 8, head_dim = 0, gpu = false } = {}) {
+  kvStart = 256, outliers = 8, head_dim = 0, gpu = false, direct = false } = {}) {
   const [dim, hidden, layers, heads, kvHeads, signedVocab, seqLen] = header;
   const vocab = Math.abs(signedVocab), headSize = head_dim || dim / heads, kvDim = kvHeads * headSize, qDim = heads * headSize;
   const quantized = dtype === "int8" || dtype === "int6", six = dtype === "int6";
@@ -278,7 +278,8 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   // as many as the scales (a ninth of an int8 file, a seventh of an int6 one), and the float32 columns of the
   // outlier channels (T92); or, off the int8 kernels, every weight widened to float32
   const tables = (signedVocab < 0 ? vocab * dim : 0) + (arch === "gpt2" ? seqLen * dim : 0);
-  const weights = quantized ? size * (six ? 32 / 28 : 32 / 36) - tables : 0;
+  // (T156, direct: the layers' matrices are on the GPU alone; of the matrices, the classifier is here)
+  const weights = !quantized ? 0 : direct ? vocab * dim : size * (six ? 32 / 28 : 32 / 36) - tables;
   if (quantized && onInt8) bytes += (relaxed ? weights / 8 : 0) + Math.min(outliers, dim) * (vocab + 1) * 4;
   else if (quantized) bytes += weights * 4;
   else if (dtype === "float16") bytes += size * 2;
@@ -302,13 +303,152 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   // position 2000, 1.15 to 1.26 on four, CI's x86-64 and arm64; TODO.md's T160): float32 there where the model still
   // fits a 32-bit memory with it (not Qwen2.5 3B: 3.82 GiB, 4.03 in float32), float16 on a 64-bit one (the owner,
   // 2026-09-27: Llama 3.2 3B and the 7B models keep their memory). keysInHalf tells which.
-  const half = halfKV && (kvHeads >= heads || needsWide(size, others + 4 * keys));
+  // (T156, direct: the cache holds the GPU's float16 keys and values as they are)
+  const half = direct || (halfKV && (kvHeads >= heads || needsWide(size, others + 4 * keys)));
   return others + keys * (half ? 2 : 4);
 }
 /** T160: whether the keys and values of a model that may keep them in float16 (footprint's halfKV) do, as footprint
  * counts them. The worker hands this to createForward: what it sized the memory for. */
 export const keysInHalf = (header, size, options = {}) =>
   Boolean(options.halfKV) && footprint(header, size, options) < footprint(header, size, { ...options, halfKV: false });
+// ---- T156: a model on the GPU alone. Where the layers could not be held twice (in this memory and on the GPU), the
+// worker decides before a byte comes that the GPU alone takes them (the owner, 2026-09-27: "大きいモデルは最初から GPU
+// だけ", T156's B): the layers' matrices go to the GPU's worker as they arrive and are never in this memory, the rest
+// (the embedding, the norms, the header) comes here, packed without the holes the matrices leave (place()). Nothing
+// runs on the CPU then; a GPU that fails means the model is loaded again on the CPU (the worker).
+
+/** T156: the bytes the GPU holds of a Llama with this header and form (FORM): its layers' matrices (int8 values and a
+ * float32 scale a group of 32: 1.125 bytes a weight, int6 widened as well, T155), its two norms a layer, its own keys
+ * and values (float16, the whole context), and for a generation's steps (T152) the classifier (and the embedding where
+ * it is another table), RoPE's table of every position and the sampling's three arrays of the vocabulary. forward.js
+ * counts the same of a model it runs (layersOnGpu, tokensUnfit). */
+export function gpuBytes(header, { head_dim = 0, arch = "llama" } = {}) {
+  const [dim, hidden, layers, heads, kvHeads, signedVocab, seqLen] = header;
+  const vocab = Math.abs(signedVocab), headSize = head_dim || dim / heads, qDim = heads * headSize, kvDim = kvHeads * headSize;
+  // (GPT-2's and GPT-NeoX's FFN has no gate: two matrices)
+  const matrices = qDim * dim + 2 * kvDim * dim + dim * qDim + (arch === "llama" ? 3 : 2) * hidden * dim;
+  const layerBytes = layers * matrices * (1 + 4 / 32) + layers * 2 * dim * 4 + 2 * layers * seqLen * kvDim * 2;
+  const table = vocab * dim * (1 + 4 / 32);
+  return layerBytes + table * (signedVocab > 0 ? 1 : 2) + seqLen * headSize * 4 + 3 * vocab * 4;
+}
+
+// the layers' matrices of a Llama, which the GPU alone holds (T156)
+const LAYER_MATRICES = ["wq", "wk", "wv", "wo", "w1", "w2", "w3"];
+/** T156: the stretches of the checkpoint the layers' matrices take ([start, end) of each, in file order: every one is
+ * its values and then its scales, llama2_numpy's Tensor), from the tensors llama2_numpy.external_tensors() places */
+export function layerHoles(tensors) {
+  return LAYER_MATRICES.map((name) => {
+    const t = tensors[name], values = t.shape.reduce((a, b) => a * b, 1);
+    return [t.offset, t.scales + (values / t.group) * 4];
+  }).sort((a, b) => a[0] - b[0]);
+}
+/** T156: where an offset of the checkpoint (outside the holes) is in the memory that holds the rest: less the holes
+ * before it */
+export const placer = (holes) => (offset) => holes.reduce((at, [start, end]) => (end <= offset ? at - (end - start) : at), offset);
+
+/** T156: whether a model goes on the GPU alone, from what is known before its bytes come (the owner's B, 2026-09-27;
+ * TODO.md's T156 has the numbers): both, as before (T148: the layers in this memory and on the GPU, and each block and
+ * step where it is faster), where both fit half of what the device says it has; else the GPU alone where the model can
+ * be (eligible: a Llama the GPU's steps take, T152) and it fits; else the CPU (and the prompts on the GPU where the
+ * layers alone fit, gpuRoom, as before). deviceMemory: navigator.deviceMemory, 4 where the browser does not say
+ * (Safari, Firefox); Chromium says 8 for 8 GB or more: both are then held to 4 GB (the double copy of Qwen2.5 3B, 7.2
+ * GB, on an 8 GB phone, T153's risk), and the GPU alone to nothing, as the CPU alone is (a 7B's 9.2 GB runs on the CPU
+ * there, T132: the GPU alone takes about as much as the CPU alone, the matrices once either way).
+ * cpu: the checkpoint and what the forward pass puts after it (footprint); gpuOnly: the checkpoint without the
+ * matrices and what the forward pass puts after that (footprint with direct); gpu: gpuBytes. Returns { mode: "both" |
+ * "gpu" | "cpu", gpuRoom } */
+export function weightsPlace({ cpu, gpuOnly, gpu, deviceMemory = 4, eligible = false, forced = false }) {
+  const room = (deviceMemory * 2 ** 30) / 2;
+  if (forced && eligible) return { mode: "gpu" };
+  if (cpu + gpu <= room) return { mode: "both", gpuRoom: room - cpu };
+  if (eligible && (deviceMemory >= 8 || gpuOnly + gpu <= room)) return { mode: "gpu" };
+  return { mode: "cpu", gpuRoom: room - cpu };
+}
+
+/** T156: why a model cannot go on the GPU alone, from its header, dtype and form before its bytes come, and the
+ * adapter the worker asked for ({ fallback, limits }); null where it can. A Llama whose steps the GPU takes (T152: no
+ * biases, norms of the heads or a part of a head turned yet), int8 (six bits are for a device short of memory, where
+ * the widened int8 on the GPU, 1.125 bytes a weight against six bits' 0.875, would not fit either: T155's review),
+ * heads of a multiple of 4, and q, k and v and gate and up each one range of a buffer the device binds (gpu.js's
+ * tokensLayout says the last word: a GPU that refuses then means the model is loaded again on the CPU). */
+export function gpuOnlyUnfit(header, dtype, { arch = "llama", bias = false, qk_norm = false, head_dim = 0 } = {}, adapter, force = {}) {
+  const [dim, hidden, , heads, kvHeads] = header;
+  const headSize = head_dim || dim / heads, qDim = heads * headSize, kvDim = kvHeads * headSize;
+  if (!adapter) return "no GPU adapter here";
+  if (adapter.fallback && !force.fallback) return "a fallback adapter";
+  if (arch !== "llama" || bias || qk_norm) return "the GPU's steps do not take this model yet";
+  if (dtype !== "int8") return `${dtype} weights stay on the CPU`;
+  if (headSize % 4) return "heads of a size that is no multiple of 4";
+  const { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment: at } = adapter.limits;
+  const binds = Math.min(maxStorageBufferBindingSize, maxBufferSize);
+  // (a joined matrix's parts start where the device binds, the scales a quarter of the values' count on)
+  const starts = [qDim * dim, (qDim + kvDim) * dim, hidden * dim];
+  if (starts.some((values) => values % at || (values / 8) % at)) return "q, k and v or gate and up would not start where this GPU binds a buffer";
+  if ((qDim + 2 * kvDim) * dim > binds || 2 * hidden * dim > binds || dim * Math.max(qDim, hidden) > binds) return "a layer's matrices are past a buffer of this GPU";
+  return null;
+}
+
+// T156: the GPU's worker takes the layers' bytes as they come, and says in flow[0] how many it has put on the GPU: the
+// loops that write wait (room()) where they are more than FLOW_BYTES ahead (a kept model read from the disk comes
+// faster than a GPU takes it, and what waits in the messages is memory), and give up where nothing was taken for
+// FLOW_STALL_MS. They wait without blocking: a worker made from a worker may not even start while the one that made
+// it blocks (Chromium, gpu-check's first run: the GPU's worker took nothing for 60 s)
+const FLOW_BYTES = 64 * 2 ** 20, FLOW_STALL_MS = 60000;
+/** T156: the weights of a model on the GPU alone. worker: the GPU's worker (gpu.js, told to open with gpuOnlyPlan()),
+ * tensors: llama2_numpy.external_tensors(), size: the checkpoint's bytes. Returns { holes, place, stored, flow,
+ * write(offset, bytes), room(), drained() }: write() puts the bytes outside the holes into memory at base +
+ * place(offset), and posts those in them to the worker (a copy each); room() resolves once the worker is no more than
+ * FLOW_BYTES behind, drained() once it has all of them; stored is what memory holds (the checkpoint less the holes). */
+export function gpuOnlyWeights({ memory, base, size, tensors, worker }) {
+  const holes = layerHoles(tensors), place = placer(holes);
+  const stored = size - holes.reduce((sum, [start, end]) => sum + (end - start), 0);
+  const flow = new SharedArrayBuffer(8), taken = new BigInt64Array(flow);
+  let sent = 0n;
+  const wait = async (ahead) => {
+    let seen = Atomics.load(taken, 0), moved = performance.now();
+    while (sent - seen > ahead) {
+      if (Atomics.waitAsync) await Atomics.waitAsync(taken, 0, seen, 1000).value;
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+      const now = Atomics.load(taken, 0);
+      if (now !== seen) [seen, moved] = [now, performance.now()];
+      else if (performance.now() - moved > FLOW_STALL_MS) throw new Error(`the GPU took no weights for ${FLOW_STALL_MS / 1000} s`);
+    }
+  };
+  const post = (offset, chunk, from, to) => {
+    const bytes = chunk.slice(from, to);
+    worker.postMessage({ type: "weights", offset: offset + from, bytes }, [bytes.buffer]);
+    sent += BigInt(to - from);
+  };
+  return {
+    holes, place, stored, flow,
+    write(offset, chunk) {
+      let at = 0;
+      for (const [start, end] of holes) {
+        if (end <= offset + at || start >= offset + chunk.length) continue;
+        const from = Math.max(start - offset, at), to = Math.min(end - offset, chunk.length);
+        if (from > at) new Uint8Array(memory.buffer, base + place(offset + at), from - at).set(chunk.subarray(at, from));
+        post(offset, chunk, from, to);
+        at = to;
+      }
+      if (at < chunk.length) new Uint8Array(memory.buffer, base + place(offset + at), chunk.length - at).set(chunk.subarray(at));
+    },
+    room: () => wait(BigInt(FLOW_BYTES)),
+    /** every byte posted is on the GPU (or was dropped by a GPU that failed) */
+    drained: () => wait(0n),
+  };
+}
+/** T156: what the GPU's worker opens with (gpu.js's open(): the device, and a buffer for every piece of every layer's
+ * matrices, before a byte comes): each matrix's rows and length and, a layer each, where its values and scales start in
+ * the checkpoint (the offsets the bytes come with); the classifier's size (a token's tables, T152) */
+export function gpuOnlyPlan(header, tensors, force = {}, remembered) {
+  const layers = header[2];
+  const matrices = Object.fromEntries(LAYER_MATRICES.map((name) => {
+    const t = tensors[name], [, rows, n] = t.shape, perLayer = rows * n;
+    return [name, { rows, n, layers: Array.from({ length: layers }, (_, l) => [t.offset + l * perLayer, t.scales + (l * perLayer / t.group) * 4]) }];
+  }));
+  return { layers, matrices, force, remembered };
+}
+
 /** Whether a checkpoint of size bytes and the forward pass after it (footprint) pass the 4 GiB of a 32-bit memory.
  * A model that fits stays there: a 64-bit memory runs the kernels about a tenth slower (T101, measured). */
 export const needsWide = (size, after) => CONTROL_BYTES + size + after > PAGES_32 * PAGE;
@@ -358,13 +498,24 @@ const CHUNKS_PER_THREAD = 4;
 
 /** What Llama(external=) takes: the size of the checkpoint, read() for the few bytes Python looks at itself, and
  * start(plan), which builds the forward pass. */
-export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce, halfKeys }) {
+/** T156 direct ({ place, stored, onLost }, gpuOnlyWeights()): the layers' matrices are on the GPU alone, memory holds
+ * the rest of the checkpoint (stored bytes) packed without them, a tensor at place(its offset in the checkpoint);
+ * onLost(why) is told where the GPU stops (the model has to be loaded again on the CPU). */
+export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce, halfKeys, direct }) {
+  const place = direct?.place ?? ((offset) => offset);
   const outside = {
     size,
-    read: (offset, length) => new Uint8Array(memory.buffer, base + offset, length).slice(),
+    read: (offset, length) => new Uint8Array(memory.buffer, base + place(offset), length).slice(),
     start: (plan) => {
-      outside.engine = createForward({ memory, base, size, kernels, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce, halfKeys,
-        plan: plan.toJs ? plan.toJs({ dict_converter: Object.fromEntries }) : plan });
+      plan = plan.toJs ? plan.toJs({ dict_converter: Object.fromEntries }) : plan;
+      // (T156: every tensor but the layers' matrices where it is in memory; those keep their offsets in the
+      // checkpoint, which only the GPU's worker reads)
+      if (direct) {
+        plan.tensors = Object.fromEntries(Object.entries(plan.tensors).map(([name, t]) => [name, LAYER_MATRICES.includes(name) ? t
+          : { ...t, offset: place(t.offset), ...(t.scales ? { scales: place(t.scales) } : {}) }]));
+      }
+      outside.engine = createForward({ memory, base, size: direct ? direct.stored : size, kernels, spawn, gpu, gpuRoom,
+        memoryUnsaid, gpuRemembered, gpuForce, halfKeys, direct, plan });
       return outside.engine;
     },
   };
@@ -402,8 +553,15 @@ function halfToFloat(h) {
  * first right shader of the matrices untimed, and no block timed (SwiftShader timing Llama 3.2 1B's took more than
  * gpu.js's STEP_MS in CI, T147); pieceBytes (T155), the most bytes of a piece of a matrix on the GPU, so that a small
  * model goes in pieces as a matrix past a buffer of the device does */
+/** direct (T156, external()): the layers' matrices are on the GPU alone: nothing runs on the CPU, every block and step
+ * goes to the GPU (as gpuForce.always), and one the GPU cannot take throws (the worker loads the model again on the CPU) */
 export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, memoryUnsaid, gpuRemembered, gpuForce = {},
-  halfKeys, wrap = (exports) => exports, stalledMs = STALLED_MS, clock = () => performance.now() }) {
+  halfKeys, direct, wrap = (exports) => exports, stalledMs = STALLED_MS, clock = () => performance.now() }) {
+  // every block and step the GPU can take goes there, whatever the CPU's time: the tests' fallback adapter, and a model
+  // on the GPU alone (T156)
+  const always = Boolean(gpuForce.always || direct);
+  // T156: why the GPU stopped under a model on the GPU alone, once it has
+  let directLost = null;
   const { dim, n_layers: layers, n_heads: heads, n_kv_heads: kvHeads, head_size: headSize, vocab_size: vocab,
     seq_len: seqLen, rotary, arch } = plan;
   const hidden = plan.hidden_dim, kvDim = kvHeads * headSize, qDim = heads * headSize;
@@ -480,6 +638,12 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     const t = T[source];
     if (!t) return null;
     const [rows, n] = t.shape.slice(-2);
+    // T156: on the GPU alone: where each layer's values and scales start in the checkpoint (what gpu.js was opened
+    // with), for the plan the GPU's worker is started with; the CPU never multiplies by it
+    if (direct && LAYER_MATRICES.includes(name)) {
+      return { rows, n, int8: true, six: false, group: t.group, onGpu: true,
+        layer: (l) => [t.offset + l * rows * n, t.scales + l * rows * (n / t.group) * 4] };
+    }
     if ((t.kind === "int8" || t.kind === "int6") && plan.int8) {
       const six = t.kind === "int6", rowBytes = six ? n / 32 * 24 : n;
       const values = base + t.offset, scales = base + t.scales, groups = count(t) / t.group;
@@ -732,6 +896,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // computed as it would be alone: the same kernels on the same numbers, only the matmuls of a layer go out once for
   // all of them. The logits, if asked for, are the last token's.
   function run(tokens, pos0, needLogits) {
+    // T156: the layers are on the GPU alone: a block or a step it did not take cannot run here
+    if (direct) {
+      if (!directLost) stopGpu("the GPU did not take a block or a step");  // (the worker loads the model again on the CPU)
+      throw Object.assign(new Error(`The GPU stopped (${directLost}), and this model's weights were on it alone`), { directLost: true });
+    }
     const count = tokens.length;
     if (pos0 + count - 1 >= capacity) grow(pos0 + count - 1);
     views();
@@ -950,7 +1119,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuStatus = note;
       resolve(statusNow());
     };
-    if (gpuWhyNot) settleGpu(`prompts on the CPU (${(gpuReason = gpuWhyNot)})`);
+    // (T156: a model on the GPU alone that the GPU cannot take, or whose steps it cannot, is lost at once)
+    const why = gpuWhyNot ?? (direct ? tokensWhyNot : null);
+    if (why) stopGpu(why);
     else startGpu();
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
@@ -970,7 +1141,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     // (T153, the review: with the GPU's own keys and values, float16, as the prompt may fill the whole context: Qwen3
     // 0.6B's are 0.47 GB at 4096 positions, 95% of its layers')
     const onGpu = layersOnGpu();
-    if (gpuRoom !== undefined && onGpu > gpuRoom) {
+    if (gpuRoom !== undefined && onGpu > gpuRoom && !direct) {
       return `the layers on the GPU as well (${Math.round(onGpu / 1e6)} MB) would not leave this device enough memory`;
     }
     return null;
@@ -1061,7 +1232,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
           gpuChosen.tokens = data.tokens.form;
           gpuChosen.tablePieces = data.tokens.pieces;  // T209: the classifier in pieces past what the device binds
           if (data.tokens.ms !== undefined) steps.gpu(data.tokens.ms);
-          tokenStatus = gpuForce.always ? "gpu" : "untimed";
+          tokenStatus = always ? "gpu" : "untimed";
           const kinds = data.tokens.forms.map((f) => `${f.name} ${f.none ?? (f.remembered ? "remembered" : f.ms ? `${f.ms.toFixed(2)} ms` : "untimed")}`).join("; ");
           console.info(`gpu: a token by ${data.tokens.form} (a step of a run of ${GPU_TOKENS}: ${kinds})`);
         } else if (data.tokensWhy) {
@@ -1074,7 +1245,15 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
           tokenStatus = "why";
           console.info(`gpu: answers on the CPU (${tokensReason})`);
         }
-        settleGpu?.(gpuForce.always ? PROMPTS_GPU : PROMPTS_UNTIMED);
+        // T156: a model on the GPU alone needs its steps there too; and where /benchmark/ measured the CPU here, its
+        // step (the checkpoint read once at the CPU section's fastest, T157's estimate) must not be faster by more
+        // than BETTER's margin (the owner's B: the CPU's side estimated, not measured, for a model that does not fit twice)
+        if (direct && !data.tokens) return stopGpu(data.tokensWhy ?? tokensReason ?? "the GPU did not take the steps");
+        const cpuMs = direct?.cpuGBps > 0 ? direct.size / (direct.cpuGBps * 1e6) : NaN;
+        if (cpuMs < BETTER * data.tokens?.ms) {
+          return stopGpu(`a step ${data.tokens.ms.toFixed(1)} ms on the GPU, and ${cpuMs.toFixed(1)} ms on the CPU as /benchmark/ measured it (${direct.cpuGBps.toFixed(1)} GB/s)`);
+        }
+        settleGpu?.(always ? PROMPTS_GPU : PROMPTS_UNTIMED);
       } else if (data.type === "unusable") {
         stopGpu(data.reason);
       } else if (data.type === "failed") {
@@ -1091,7 +1270,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     worker.postMessage({ type: "start", memory, plan: { dim, hidden, layers, heads, kvHeads, headSize, turned, seqLen,
       kvStart: plan.kv_start, eps: layerNorm ? 1e-5 : eps, layerNorm, parallel: Boolean(parallel), batch: GPU_BLOCK, matrices,
       vectors: gpuVectors(), rows: gpuRows, tokens: gpuIds ? gpuTokensPlan() : null,
-      cos: cosTable, sin: sinTable, staging, force: gpuForce, remembered: gpuRemembered,
+      cos: cosTable, sin: sinTable, staging, force: gpuForce, remembered: gpuRemembered, direct: Boolean(direct),
       words: { done: GPU_DONE, failed: GPU_FAILED, beat: GPU_BEAT, wanted: GPU_WANTED } } });
   }
   // the prompt stays on the CPU from here on (why: what the console says, where it was on the GPU); the GPU's worker
@@ -1099,6 +1278,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function stopGpu(why) {
     clearTimeout(quietTimer);
     if (gpuOn && why) console.warn(`gpu: ${why}: the prompts and the tokens go on on the CPU`);
+    // T156: the layers were on the GPU alone: the worker loads the model again on the CPU (not when it is let go)
+    if (direct && why && !directLost) {
+      directLost = why;
+      direct.onLost?.(why);
+    }
     gpuOn = false;
     tokensOn = false;
     tokenStatus = null;
@@ -1115,7 +1299,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // a prompt where the GPU is to be timed again (recheck)
   function gpuTakes(count, pos0) {
     if (!gpuOn || pos0 > gpuEnd || gpuSide === "cpu") return false;
-    if (gpuForce.always || gpuSide === "gpu") return true;
+    if (always || gpuSide === "gpu") return true;
     const known = times.of(count, threads);
     if (!known) return false;  // the CPU is timed first, on this prompt
     return known.faster || (recheck === "gpu" && pos0 === 0 && count === GPU_BLOCK);
@@ -1125,7 +1309,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // console says it where it changes. Until the CPU is timed, the line stays as the GPU left it
   function verdict() {
     const most = times.of(GPU_BLOCK, threads), from = times.threshold(GPU_BLOCK, threads);
-    if (!most || gpuForce.always) return;
+    if (!most || always) return;
     const status = from > GPU_BLOCK ? PROMPTS_CPU
       : from > BATCH ? `prompts of ${Math.ceil(from / BATCH) * BATCH} tokens and more on WebGPU` : PROMPTS_GPU;
     if (status !== gpuStatus) {
@@ -1182,7 +1366,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // T152: the verdict for a generation's steps, as a generation begins: the status line has it (it changes only there),
   // and the console says it where it changes
   function tokenVerdict() {
-    const known = tokensOn && !gpuForce.always ? steps.of(threads) : null;
+    const known = tokensOn && !always ? steps.of(threads) : null;
     if (!known) return;
     const status = known.faster ? "gpu" : "cpu";
     if (status !== tokenStatus) {
@@ -1194,7 +1378,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // T152: whether the steps of a generation go to the GPU now (see tokenBlock)
   function gpuSteps() {
     if (!tokensOn || !gpuOn || gpuSide === "cpu") return false;
-    if (gpuForce.always || gpuSide === "gpu") return true;
+    if (always || gpuSide === "gpu") return true;
     if (search) return false;
     if (tokenRecheck === "gpu") return true;
     if (tokenRecheck === "cpu") return false;
@@ -1209,7 +1393,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     /** Use n threads from the next token on (stage 2): starts the helpers that are missing. 1 on a memory that is
      * not shared. Resolves to the number in use. */
     async setThreads(n) {
-      if (!shared || lost) return (threads = 1);
+      if (!shared || lost || direct) return (threads = 1);
       search = null;
       if (!(await ensureHelpers(n))) return (threads = 1);
       threads = Math.max(1, n);
@@ -1220,7 +1404,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
      * chose(count) is told the answer, compared(verdict) every comparison on the way. The helpers of the starting count are started (and warmed) before this
      * resolves, so the first tokens do not wait for them. */
     async findThreads({ from, remembered = 0, recheck = 8, chose, compared }) {
-      if (!shared || lost) return 1;
+      if (!shared || lost || direct) return 1;
       onChosen = chose;
       onCompared = compared;
       recheckEvery = recheck;
@@ -1242,7 +1426,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       // T148: halfway between the threads' checks, a prompt goes to the side not chosen, so that its time stays
       // today's (a device that heats up, a GPU timed while the CPU was busy)
       written = 0;
-      const whole = gpuOn && !gpuForce.always ? times.of(GPU_BLOCK, threads) : null;
+      const whole = gpuOn && !always ? times.of(GPU_BLOCK, threads) : null;
       if (whole && ++sinceCheck >= GPU_RECHECK && !recheck && !search) {
         recheck = whole.faster ? "cpu" : "gpu";
         sinceCheck = 0;
@@ -1250,7 +1434,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       }
       // T152: the same for the steps of a generation, the side not chosen taking its first ones
       gpuSampled = 0;
-      const stepsNow = tokensOn && !gpuForce.always ? steps.of(threads) : null;
+      const stepsNow = tokensOn && !always ? steps.of(threads) : null;
       if (stepsNow && ++sinceTokens >= GPU_RECHECK && !tokenRecheck && !search) {
         tokenRecheck = stepsNow.faster ? "cpu" : "gpu";
         cpuRecheck = TOKEN_RECHECK;
@@ -1300,7 +1484,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
      * CPU gains nothing from it) */
     get promptBlock() {
       if (!gpuOn || gpuSide === "cpu") return BATCH;
-      if (gpuForce.always || gpuSide === "gpu") return GPU_BLOCK;
+      if (always || gpuSide === "gpu") return GPU_BLOCK;
       const whole = times.of(GPU_BLOCK, threads);
       return whole && (whole.faster || (recheck === "gpu" && written === 0)) ? GPU_BLOCK : BATCH;
     },

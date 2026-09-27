@@ -160,6 +160,7 @@ function download(model, signal, load) {
         // a chunk that was already on its way when the load was cancelled: its buffer is gone
         signal.throwIfAborted();
         sink ? sink(offset, value) : queue.push([offset, value]);
+        if (sink) await weightsRoom();  // (T156: a model on the GPU alone, its worker no more than FLOW_BYTES behind)
         // the header's bytes that this chunk brings (a part fetched again brings some a second time)
         if (head.length < HEADER_BYTES && offset <= head.length && offset + value.length > head.length) {
           head = new Uint8Array([...head, ...value.subarray(head.length - offset, HEADER_BYTES - offset)]);
@@ -237,6 +238,7 @@ function readFile(model, signal, load) {
           signal.throwIfAborted();
         }
         write(offset, value);
+        await weightsRoom();  // (T156)
         offset += value.length;
         const percent = Math.floor((offset / model.bytes) * 100);
         if (percent !== reported) {
@@ -312,6 +314,18 @@ let forceWide = false;
 // and the first right shader of the matrices taken untimed (SwiftShader timed Llama 3.2 1B's past gpu.js's 180 s)
 const hasWebGpu = Boolean(self.navigator?.gpu);
 let gpuForce = {};
+// T156: the adapter, asked for before a model is loaded ({ fallback, limits } or null): whether a model the device
+// cannot hold twice goes on the GPU alone is decided before its bytes come (forward.js's weightsPlace, gpuOnlyUnfit)
+let gpuAdapter = null;
+const adapterAsked = !hasWebGpu ? Promise.resolve() : navigator.gpu.requestAdapter().then((adapter) => {
+  if (!adapter) return;
+  const { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } = adapter.limits;
+  gpuAdapter = { fallback: Boolean(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter),
+    limits: { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } };
+}, () => {});
+// T156: the models whose GPU failed while they were on it alone, loaded again on the CPU from then on (this visit)
+const cpuOnly = new Set();
+const modelKey = (model) => model.hf ? `hf:${model.hf.repo}@${model.hf.revision}` : model.id ?? model.name;
 // ?bench= (T45): the page measures the CPU's combinations, and no GPU starts beside them
 let benchPage = false;
 // what the page kept of the GPU's shaders for the model asked for ({ remembered }), as threadsRequest
@@ -406,7 +420,8 @@ async function init(search) {
   if (parts >= 1 && parts <= 64) hfPartBytes = Math.round(parts * 1024 * 1024);
   if (connections >= 1 && connections <= 32) hfConnections = Math.floor(connections);
   forceWide = asked.get("wide") === "on";
-  gpuForce = asked.get("gpuTest") === "on" ? { fallback: true, always: true, quick: true } : {};
+  // (T156: ?gpuTest=only, the tests' too: a model the GPU can take on the GPU alone, whatever its size)
+  gpuForce = ["on", "only"].includes(asked.get("gpuTest")) ? { fallback: true, always: true, quick: true, only: asked.get("gpuTest") === "only" } : {};
   benchPage = asked.has("bench");
   const version = await resolvePyodideVersion(search);
   const base = `https://cdn.jsdelivr.net/pyodide/v${version}/full/`;
@@ -595,8 +610,9 @@ function automaticBits(header, form, sizes) {
 }
 
 // header: the checkpoint's 7 ints, options: what it is loaded with (its dtype and arch): what the forward pass puts
-// after the checkpoint follows from them (T115)
-function weightsBuffer(size, header, options) {
+// after the checkpoint follows from them (T115). T156, keep: where a conversion is kept as it comes (kept.js's
+// keeper()), for a model on the GPU alone, whose weights nothing holds whole to keep afterwards
+function weightsBuffer(size, header, options, keep) {
   if (jsKernels && !disabled.includes("kernels")) {
     // a shared memory where the page is cross-origin isolated (stage 3), unless ?threads=1; else one thread
     const wanted = sharedWanted();
@@ -605,6 +621,18 @@ function weightsBuffer(size, header, options) {
     // counted: a model at the edge then runs out of memory near the end of its context (T115)
     const after = afterCheckpoint(header, size, options, wanted);
     const halfKeys = forwardModule.keysInHalf(header, size, forwardOptions(options, wanted));  // T160: what after counts
+    // T148: the layers on the GPU are a second copy of them, in the same memory where the GPU is a phone's or an
+    // Apple's: both, with the rest of this model, within half of what the device says it has (as src/models.js's
+    // weightsFor asks for six bits past half). T156: a model that does not fit so goes on the GPU alone where it can
+    // (the owner's B, 2026-09-27: forward.js's weightsPlace; the device's 8 read as 8 GB, the double copy held to 4),
+    // decided before any memory is made for it (a memory of the whole checkpoint would be one too many, T96)
+    const deviceMemory = self.navigator?.deviceMemory ?? 4;
+    // T205: a browser that does not say (Safari, Firefox) keeps a generation's steps (the classifier and the embedding
+    // on the GPU as well) on the CPU: nor does it put a model on the GPU alone, whose steps are there
+    const memoryUnsaid = self.navigator?.deviceMemory === undefined;
+    const onGpu = gpuOnlyWeightsFor(size, header, options, after, deviceMemory, memoryUnsaid);
+    if (onGpu.mode === "gpu") return gpuOnlyBuffer(size, header, options, onGpu, keep);
+    const gpuRoom = onGpu.gpuRoom;
     const wide = forceWide || forwardModule.needsWide(size, after);
     if (wide && !wideKernels?.plain) {
       throw new Error("This model needs more than 4 GB of memory, which this browser cannot give a web page (no 64-bit " +
@@ -613,14 +641,6 @@ function weightsBuffer(size, header, options) {
     const { memory, base, shared } = pooledWeights(size, after, wanted && (!wide || Boolean(wideKernels.shared)), wide);
     const kernels = wide ? (shared ? wideKernels.shared : wideKernels.plain) : (shared ? sharedKernels : jsKernels);
     const spawn = shared ? spawnThread : undefined;
-    // T148: the layers on the GPU are a second copy of them (T156 will keep one), in the same memory where the GPU is
-    // a phone's or an Apple's: both, with the rest of this model, within half of what the device says it has (as
-    // src/models.js's weightsFor asks for six bits past half). Chromium says 8 for 8 GB or more: no limit then, as
-    // six bits are not asked for either. A browser that does not say (Safari, Firefox): 4 GB (the owner decides, TODO.md)
-    const deviceMemory = self.navigator?.deviceMemory ?? 4;
-    const gpuRoom = deviceMemory >= 8 ? undefined : deviceMemory * 2 ** 30 / 2 - (size + after);
-    // T205: such a browser keeps a generation's steps (the classifier and the embedding on the GPU as well) on the CPU
-    const memoryUnsaid = self.navigator?.deviceMemory === undefined;
     weightsNow = memory;
     return {
       write: (offset, chunk) => new Uint8Array(memory.buffer, base + offset, chunk.length).set(chunk),
@@ -653,12 +673,88 @@ function weightsBuffer(size, header, options) {
   };
 }
 
+// T156: where a model goes ({ mode: "both" | "gpu" | "cpu", gpuRoom }, forward.js's weightsPlace): the GPU alone only
+// for a Llama of int8 the GPU's steps take (gpuOnlyUnfit), on a page with shared memory and the GPU's worker (not the
+// benchmark's rounds), whose GPU did not fail on it alone before (cpuOnly)
+function gpuOnlyWeightsFor(size, header, options, after, deviceMemory, memoryUnsaid) {
+  const { dtype = "float32" } = options, form = { arch: options.arch, bias: options.bias, qk_norm: options.qk_norm, head_dim: options.head_dim };
+  const cpu = size + after, gpu = forwardModule.gpuBytes(header, form);
+  const eligible = hasWebGpu && !memoryUnsaid && !benchPage && !benching && sharedWanted() && Boolean(wideKernels?.shared) && !disabled.includes("int8") && !cpuOnly.has(loadingKey) &&
+    !forwardModule.gpuOnlyUnfit(header, dtype, form, gpuAdapter, gpuForce);
+  if (!eligible) return forwardModule.weightsPlace({ cpu, gpu, deviceMemory });
+  const tensors = placesOf(header, dtype, form), stored = size - forwardModule.layerHoles(tensors).reduce((sum, [a, b]) => sum + b - a, 0);
+  const gpuOnly = stored + afterCheckpoint(header, stored, { ...options, direct: true }, true);
+  return { ...forwardModule.weightsPlace({ cpu, gpuOnly, gpu, deviceMemory, eligible, forced: gpuForce.only }), tensors, stored, gpuOnly };
+}
+// llama2_numpy.external_tensors(): where every tensor of the checkpoint is, from its header alone
+function placesOf(header, dtype, form) {
+  const proxy = llama2_numpy.external_tensors(header, dtype, form);
+  try {
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    proxy.destroy();
+  }
+}
+// T156: the weights of a model on the GPU alone: the layers' matrices to the GPU's worker as they come (forward.js's
+// gpuOnlyWeights), the rest into a memory of their size, and every byte to keep's file where the conversion is kept
+let gpuOnlyNow;
+function gpuOnlyBuffer(size, header, options, { tensors, stored, gpuOnly }, keep) {
+  const after = gpuOnly - stored, wide = forwardModule.needsWide(stored, after);
+  const { memory, base, shared } = pooledWeights(stored, after, true, wide);
+  if (!shared) throw new Error("This browser gave no shared memory for a model on the GPU alone.");
+  const worker = openGpu();
+  worker.onmessage = () => {};  // (forward.js listens from start() on; the worker says nothing before)
+  const weights = forwardModule.gpuOnlyWeights({ memory, base, size, tensors, worker });
+  worker.postMessage({ type: "open", plan: forwardModule.gpuOnlyPlan(header, tensors, gpuForce, gpuRequest?.remembered), flow: weights.flow });
+  // (T156: the checkpoint's size and /benchmark/'s CPU reading, for the estimate the GPU's step is held against)
+  const direct = gpuOnlyNow = { worker, lost: null, stored, size, cpuGBps: gpuRequest?.cpu?.GBps, place: weights.place,
+    room: weights.room, drained: weights.drained, onLost: (why) => { direct.lost = why; } };
+  weightsNow = memory;
+  const kernels = wide ? wideKernels.shared : sharedKernels;
+  return {
+    direct,
+    write(offset, chunk) {
+      weights.write(offset, chunk);
+      keep?.write(offset, chunk);
+    },
+    room: weights.room,
+    drained: weights.drained,  // every byte of the layers on the GPU (or the GPU failed: start() says so)
+    llama: (tokenizer, engineOptions) => {
+      outsideNow = forwardModule.external({ memory, base, size, kernels, spawn: spawnThread, gpu: () => worker, gpuForce, halfKeys: true, direct,
+        gpuRemembered: gpuRequest?.remembered });
+      return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...engineOptions, external: outsideNow });
+    },
+    destroy() {},
+  };
+}
+// T156: where the loops that write the weights can wait for the GPU's worker of a model on the GPU alone (room), and
+// before its engine is built (drained)
+const weightsRoom = () => gpuOnlyNow?.room?.();
+const weightsDrained = () => gpuOnlyNow?.drained?.();
+// T156: after a model on the GPU alone is built: its GPU ready (true), or failed (false: the worker let go of it, and
+// the model goes on the CPU from now on this visit)
+async function gpuOnlyReady(model) {
+  const direct = gpuOnlyNow;
+  if (!direct || outsideNow?.engine === undefined) return true;
+  await outsideNow.engine.gpu;
+  if (!direct.lost) return true;
+  console.warn(`gpu: ${direct.lost}: the model was on the GPU alone, and is loaded again on the CPU`);
+  cpuOnly.add(modelKey(model));
+  // (the GPU's worker let go of its device: stopped by forward.js where it started it, and here where it did not; the
+  // release() of the next load waits for its "ended", T205)
+  direct.worker.postMessage({ type: "stop" });
+  gpuOnlyNow = undefined;
+  return false;
+}
+// the key of the model being loaded (cpuOnly)
+let loadingKey;
+
 // T93: where the converter writes the checkpoint, piece by piece, straight into where the engine will read it (a
 // Python buffer on the way would stay: Pyodide's memory never shrinks). sink is what the converter calls
 // (llama2_convert.Writer), weights what sink.open() made (weightsBuffer), bytes its size; release() lets go of it once
 // (T145: a conversion that failed after sink.open() left a Python buffer of the model's size behind with
 // ?without=kernels). Out of convert() so that tests/worker-sink-check.mjs can follow sink.open() to footprint().
-function checkpointSink() {
+function checkpointSink(keep) {
   const into = {
     weights: undefined, bytes: 0,
     release() {
@@ -670,7 +766,7 @@ function checkpointSink() {
     // form: what lays out the checkpoint and sizes the forward pass besides the header (llama2_numpy.FORM, T115, T144)
     open(bytes, header, dtype, form) {
       into.release();  // an earlier try (another tokenizer) that got this far
-      into.weights = weightsBuffer(bytes, header.toJs(), { dtype, ...form.toJs({ dict_converter: Object.fromEntries }) });
+      into.weights = weightsBuffer(bytes, header.toJs(), { dtype, ...form.toJs({ dict_converter: Object.fromEntries }) }, keep);
       header.destroy();
       form.destroy();
       into.bytes = bytes;
@@ -831,8 +927,9 @@ async function inOrder(url, start, size, feed, signal, arriving = () => {}) {
         signal.throwIfAborted();
         feed(arrived.get(fed));
         arrived.delete(fed++);
-        // the conversion of a part takes a moment: let messages in
+        // the conversion of a part takes a moment: let messages in (T156: and the GPU's worker catch up)
         await breathe();
+        await weightsRoom();
       }
       waiting.splice(0).forEach((resolve) => resolve());
     }
@@ -882,6 +979,7 @@ async function loadConverted(model, signal, id) {
       for (; !part.done; part = await parts.next()) {
         signal.throwIfAborted();
         weights.write(offset, part.value);
+        await weightsRoom();  // (T156)
         offset += part.value.length;
         postMessage({ type: "progress", load: id, received: offset, total: manifest.bytes });
       }
@@ -896,6 +994,7 @@ async function loadConverted(model, signal, id) {
     // template is for the page, not for the engine (see convert())
     const engineOptions = { ...manifest.options };
     delete engineOptions.template;
+    await weightsDrained();  // (T156: a model on the GPU alone: every byte of its layers there)
     llama = weights.llama(tokenizer.buffer, { kernels, disable: disabled, ...engineOptions, ...model.options });
     loadSeconds.construct = since(constructStarted);
     return { template: manifest.options.template, keptIn: kept.where };
@@ -907,7 +1006,8 @@ async function loadConverted(model, signal, id) {
 
 // checkpoint: the weights (weightsBuffer), bytes long; tokenizer: a PyProxy of the converted tokenizer. Returns why
 // nothing was kept, or undefined.
-async function keepConverted(model, checkpoint, bytes, tokenizer, options, signal) {
+// T156, kept: the file of a model on the GPU alone, written as the conversion came (kept.js's keeper)
+async function keepConverted(model, checkpoint, bytes, tokenizer, options, signal, kept) {
   const view = tokenizer.getBuffer("u8");
   const vocabulary = view.data.slice();
   view.release();
@@ -917,6 +1017,7 @@ async function keepConverted(model, checkpoint, bytes, tokenizer, options, signa
   // T136: what this model was kept as before its source changed is never used again, and takes the room it needs
   for (const old of await keptModule.replaced(model).catch(() => [])) await keptModule.forget(old).catch(() => {});
   // slice() copies: the memory it comes from may grow (and so move) while an await waits
+  if (checkpoint.direct) return kept ? kept.finish(manifest, vocabulary) : "the weights went to the GPU alone, and there is no file system here to keep them in as they came";
   return keptModule.keep(converted, manifest, (begin, end) => checkpoint.slice(begin, end), vocabulary, signal);
 }
 
@@ -948,7 +1049,12 @@ async function convert(model, signal, id) {
     return res;
   };
   let first, size, base, conversion, shards;
-  const into = checkpointSink(), { sink } = into;
+  // T156: a model that goes on the GPU alone is kept as it comes (nothing holds its weights whole afterwards): a file
+  // opened for its int8 conversion where it may (the choice is the sink's, once the header is known), let go otherwise
+  const mayKeep = remote && hasWebGpu && gpuAdapter && (model.conversion?.dtype ?? "int8") === "int8";
+  const keep = mayKeep ? await keptModule.keeper({ ...model, conversion: { ...model.conversion, dtype: "int8" } }).catch(() => undefined) : undefined;
+  const into = checkpointSink(keep), { sink } = into;
+  let keptAsItCame = false;  // keep went to keepConverted, which keeps it or lets it go
   // T115: no bits asked for (weightsFor() in src/models.js asks for six only where the device says it has too little
   // memory): int8 where its forward pass fits a 32-bit memory or the browser has a 64-bit one, six bits where neither
   // (T133), once the header is known
@@ -1144,6 +1250,7 @@ async function convert(model, signal, id) {
           signal.throwIfAborted();
         }
         feed(value);
+        await weightsRoom();  // (T156)
       }
     }
     conversion.finish();
@@ -1161,17 +1268,21 @@ async function convert(model, signal, id) {
       ({ template } = options);
       const engineOptions = { ...options };
       delete engineOptions.template;
+      await weightsDrained();  // (T156)
       llama = into.weights.llama(proxies[1], { kernels, disable: disabled, ...engineOptions, ...model.options });
       loadSeconds.construct = since(constructStarted);
       if (remote) {
         postMessage({ type: "status", load: id, text: `${model.name}: keeping the converted model...` });
-        kept = await keepConverted(model, into.weights, into.bytes, proxies[1], options, signal);
+        keptAsItCame = Boolean(into.weights.direct && keep);
+        kept = await keepConverted(model, into.weights, into.bytes, proxies[1], options, signal, into.weights.direct ? keep : undefined);
       }
     } finally {
       proxies.forEach((proxy) => proxy.destroy());
     }
     return { fromCache: false, notKept: kept, keptMiss, template };
   } finally {
+    // (T156: the file kept as it came is let go where it was not the one kept)
+    if (!keptAsItCame) await keep?.drop();
     // the engine keeps what it needs of the checkpoint alive, the rest goes with this; and a feed that failed (the
     // line, a refusal on the way) leaves no Python buffer of the model's size behind (T145)
     into.release();
@@ -1184,6 +1295,9 @@ async function convert(model, signal, id) {
 
 async function load(model, signal, id) {
   signal.throwIfAborted();
+  loadingKey = modelKey(model);
+  gpuOnlyNow = undefined;
+  await adapterAsked;  // (T156: before any weights are placed)
   // let go of the previous model first, so that two never have to fit in memory
   if (llama) {
     // what forward.js holds of Python's, and its software threads (T93); T205: and the GPU's worker, whose buffers and
@@ -1203,6 +1317,7 @@ async function load(model, signal, id) {
     await initialized;
     signal.throwIfAborted();
     const converted = await convert(model, signal, id);
+    if (!(await gpuOnlyReady(model))) return load(model, signal, id);  // T156: the GPU failed on it alone
     await startThreads(model);
     postMessage({
       type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
@@ -1245,6 +1360,7 @@ async function load(model, signal, id) {
   try {
     await checkpoint.into(weights.write);
     const vocabulary = new Uint8Array(await tokenizerBytes);
+    await weightsDrained();  // (T156: a model on the GPU alone: every byte of its layers there)
     signal.throwIfAborted();
     // what the source itself measured: the bytes, without the wait for Pyodide that into() may have spent
     loadSeconds.download = checkpoint.seconds ?? since(downloadStarted);
@@ -1268,6 +1384,7 @@ async function load(model, signal, id) {
     weights.destroy();
     tokenizer?.buffer.destroy();
   }
+  if (!(await gpuOnlyReady(model))) return load(model, signal, id);  // T156: the GPU failed on it alone
   await startThreads(model);
   postMessage({
     type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
@@ -1448,6 +1565,7 @@ async function timedPaths({ prompt, counts, sampled }) {
 
 // the run that is going on, and whether the page asked it to stop
 let generating, stopped = false;
+let lastLoad;  // the load message of the model now (T156)
 let benching = false;  // the benchmark's rounds are running (T45); see the bench message
 let pathing = false;  // T184: the benchmark's page path is being timed; see the paths message
 
@@ -1501,6 +1619,7 @@ self.onmessage = async ({ data }) => {
   let signal;
   try {
     if (data.type === "init" || data.type === "load") {
+      lastLoad = data;  // (T156: loaded again on the CPU where its GPU fails while the model is on it alone)
       threadsRequest = data.threads;
       gpuRequest = data.gpu;
       // The latest choice wins: the download that is going on stops, and its parts that are complete stay in
@@ -1578,6 +1697,15 @@ self.onmessage = async ({ data }) => {
       generating = generate(data);
       try {
         await generating;
+      } catch (err) {
+        // T156: the GPU stopped under a model on it alone: said, and the model loaded again on the CPU
+        const lost = gpuOnlyNow?.lost;
+        if (!lost) throw err;
+        cpuOnly.add(modelKey(lastLoad.model));
+        postMessage({ type: "error", load: lastLoad.load, reloading: true,
+          message: `The GPU stopped (${lost}). This model was on the GPU alone, and is loaded again on the CPU.` });
+        generating = undefined;
+        self.onmessage({ data: lastLoad });
       } finally {
         generating = undefined;
       }

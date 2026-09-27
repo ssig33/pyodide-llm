@@ -12,7 +12,7 @@ from test_neox import VOCAB as NEOX_VOCAB
 from test_neox import neox_model
 
 from llama2_convert import Safetensors, normalize, rotary_dim
-from llama2_numpy import OUTLIER_CHANNELS, Llama, outlier_channels
+from llama2_numpy import OUTLIER_CHANNELS, Llama, external_tensors, outlier_channels
 
 
 class Outside:
@@ -91,6 +91,18 @@ def test_the_plan_points_at_what_the_numpy_engine_reads(name, tensors, published
     # the logits come back into one array of Python's, which the sampling then reads
     logits = engine.forward(7, 0)
     assert logits is engine.forward(3, 1) and logits[0] == 3
+
+
+@pytest.mark.parametrize("dtype", ["float32", "int8", "int6"])
+@pytest.mark.parametrize("name, tensors, published, vocab, options", list(models())[:2], ids=[m[0] for m in models()][:2])
+def test_the_tensors_are_placed_before_the_model_is_built(name, tensors, published, vocab, options, dtype):
+    """T156: the worker places a Llama's tensors from the header alone (to send the layers to the GPU as they come),
+    where Llama(external=) places them once every byte is there"""
+    checkpoint = converted(Safetensors(reader(safetensors_file(tensors))), published, dtype)
+    outside = Outside(checkpoint)
+    Llama(None, pack_tokenizer(tiny_vocab(vocab)), dtype=dtype, external=outside, **options)
+    header = np.frombuffer(checkpoint, dtype=np.int32, count=7).tolist()
+    assert external_tensors(header, dtype, options) == outside.plan["tensors"]
 
 
 def test_a_file_of_the_wrong_size_is_refused():

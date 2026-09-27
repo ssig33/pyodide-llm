@@ -154,7 +154,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 
 <script>
   import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, roundsHere, roundsTable, layerCheckNumbers, layerStepsTable, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
-    matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
+    matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable, CPU_SPEED_KEY } from "../bench.js";
   import { MODELS } from "../models.js";
   import { forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
   import { hiddenLine, wakeKeeper } from "../wake.js";
@@ -817,6 +817,15 @@ const BENCH_MODEL = "llm-jp-3-150m";
         if (name === "memory") forgetMark(tabStorage);
       }
       results[name] = result;
+      // T156: the CPU's reading of the weights here, for the model page (a model on the GPU alone is held against it)
+      const speed = name === "cpu" ? cpuBaseline(result).token : undefined;
+      if (speed?.isolated) {
+        try {
+          localStorage.setItem(CPU_SPEED_KEY, JSON.stringify({ GBps: speed.GBps, threads: speed.threads }));
+        } catch {
+          // no storage here: a model on the GPU alone stays there
+        }
+      }
       progress.box.hidden = true;
       state.className = `state ${result.status}`;
       state.textContent = `${STATE[result.status]} · ${clock(performance.now() - sectionBegan)}`;

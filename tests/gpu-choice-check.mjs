@@ -2,7 +2,8 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { gpuLine, PROMPTS_CPU, PROMPTS_GPU, PROMPTS_UNTIMED, promptTimes, tokenTimes } from "../public/forward.js";
+import { gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, placer, PROMPTS_CPU, PROMPTS_GPU, PROMPTS_UNTIMED,
+  promptTimes, tokenTimes, weightsPlace } from "../public/forward.js";
 import { halvesOf } from "../public/shaders.js";
 
 // a GPU with a fixed cost of 40 ms a block and 0.5 ms a token (16 tokens 48 ms, 64 tokens 72 ms)
@@ -132,5 +133,87 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   assert.equal(gpuLine(PROMPTS_GPU, "untimed"), "prompts on WebGPU, answers on WebGPU where it is faster than the CPU");
   assert.equal(gpuLine("prompts on the CPU (no GPU adapter here)", null), "prompts on the CPU (no GPU adapter here)");
   assert.equal(gpuLine(undefined, null), undefined);
+}
+// T156: where a model goes (the owner's B, 2026-09-27): both where both fit half of the device (8: 8 GB, 4 GB for
+// both), else the GPU alone where the model can be and fits (8: no limit, as the CPU alone has none), else the CPU
+{
+  const GB = 2 ** 30;
+  assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 2.5 * GB }, "Llama 3.2 1B on 8: both");
+  assert.equal(weightsPlace({ cpu: 4.4 * GB, gpuOnly: 1.2 * GB, gpu: 4.1 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "3B on 8: the GPU alone");
+  assert.equal(weightsPlace({ cpu: 9.2 * GB, gpuOnly: 1.5 * GB, gpu: 8 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "7B on 8: no limit");
+  const notEligible = weightsPlace({ cpu: 4.4 * GB, gpu: 4.1 * GB, deviceMemory: 8 });
+  assert.ok(notEligible.mode === "cpu" && Math.abs(notEligible.gpuRoom + 0.4 * GB) < 1, "not eligible: the CPU, no room for the GPU");
+  assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.7 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "cpu", "1B on 4 GB: 2.1 GB past 2");
+  assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.3 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "gpu", "within 2 GB: the GPU alone");
+  assert.equal(weightsPlace({ cpu: 0.1 * GB, gpuOnly: 0.05 * GB, gpu: 0.1 * GB, deviceMemory: 8, eligible: true, forced: true }).mode, "gpu", "?gpuTest=only");
+  assert.equal(weightsPlace({ cpu: 0.1 * GB, gpu: 0.1 * GB, deviceMemory: 8, forced: true }).mode, "both", "forced, not eligible");
+  // gpuBytes: Llama 3.2 1B (dim 2048, hidden 8192, 16 layers, 32 heads, 8 of keys and values, vocab 128256, 4096)
+  const oneB = gpuBytes([2048, 8192, 16, 32, 8, 128256, 4096]);
+  const want = 16 * (2 * 2048 * 2048 + 2 * 512 * 2048 + 3 * 8192 * 2048) * 1.125 + 16 * 2 * 2048 * 4 + 2 * 16 * 4096 * 512 * 2 +
+    128256 * 2048 * 1.125 + 4096 * 64 * 4 + 3 * 128256 * 4;
+  assert.ok(Math.abs(oneB - want) < 1, `gpuBytes ${oneB} against ${want}`);
+  assert.ok(gpuBytes([64, 128, 2, 4, 2, 320, 256], { arch: "gpt2" }) < gpuBytes([64, 128, 2, 4, 2, 320, 256]), "no gate on GPT-2");
+}
+// T156: why a model cannot go on the GPU alone
+{
+  const adapter = { fallback: false, limits: { maxStorageBufferBindingSize: 128 * 2 ** 20, maxBufferSize: 256 * 2 ** 20, minStorageBufferOffsetAlignment: 256 } };
+  const oneB = [2048, 8192, 16, 32, 8, 128256, 4096];
+  assert.equal(gpuOnlyUnfit(oneB, "int8", {}, adapter), null);
+  assert.match(gpuOnlyUnfit(oneB, "int8", {}, undefined), /no GPU adapter/);
+  assert.match(gpuOnlyUnfit(oneB, "int8", {}, { ...adapter, fallback: true }), /fallback/);
+  assert.equal(gpuOnlyUnfit(oneB, "int8", {}, { ...adapter, fallback: true }, { fallback: true }), null, "the tests' leave");
+  assert.match(gpuOnlyUnfit(oneB, "int8", { bias: true }, adapter), /steps/);
+  assert.match(gpuOnlyUnfit(oneB, "int8", { arch: "gpt2" }, adapter), /steps/);
+  assert.match(gpuOnlyUnfit(oneB, "int6", {}, adapter), /int6/);
+  // stories15M (dim 288, 6 heads): k starts at 288 × 288 weights, no multiple of 2048 (T152)
+  assert.match(gpuOnlyUnfit([288, 768, 6, 6, 6, 32000, 256], "int8", {}, adapter), /would not start/);
+  // Qwen2.5 7B's shape (no biases here): gate and up are 135.8 MB (T152's (d)), past 128 MiB
+  assert.match(gpuOnlyUnfit([3584, 18944, 28, 28, 4, 152064, 4096], "int8", {}, adapter), /past a buffer/);
+}
+// T156: the checkpoint's stretches: the layers' matrices to the GPU's worker, the rest packed into memory, whatever the
+// stretches it comes in; each byte posted once, and the writer waits on flow
+{
+  const tensor = (offset, shape, int8) => ({ kind: int8 ? "int8" : "f32", offset, shape, group: int8 ? 32 : 0,
+    scales: int8 ? offset + shape.reduce((a, b) => a * b, 1) : 0 });
+  // a made-up Llama: 2 layers, dim 64, hidden 96, the tensors in file order
+  let end = 28;
+  const tensors = {};
+  for (const [name, shape, int8] of [["token_embedding_table", [100, 64], true], ["rms_att_weight", [2, 64], false], ["wq", [2, 64, 64], true],
+    ["wk", [2, 32, 64], true], ["wv", [2, 32, 64], true], ["wo", [2, 64, 64], true], ["rms_ffn_weight", [2, 64], false], ["w1", [2, 96, 64], true],
+    ["w2", [2, 64, 96], true], ["w3", [2, 96, 64], true], ["rms_final_weight", [64], false]]) {
+    tensors[name] = tensor(end, shape, int8);
+    const count = shape.reduce((a, b) => a * b, 1);
+    end += int8 ? count + count / 8 : count * 4;
+  }
+  const size = end, holes = layerHoles(tensors), place = placer(holes);
+  assert.equal(holes.length, 7);
+  assert.equal(place(tensors.rms_ffn_weight.offset), tensors.wq.offset, "the norm after wo goes where wq began");
+  const checkpoint = Uint8Array.from({ length: size }, (_, i) => (i * 7 + 3) & 255);
+  const memory = new WebAssembly.Memory({ initial: 2, maximum: 4, shared: true }), base = 64;
+  let flow;
+  const posted = new Uint8Array(size), counts = new Uint8Array(size);
+  const worker = {
+    postMessage({ offset, bytes }) {
+      posted.set(bytes, offset);
+      for (let i = 0; i < bytes.length; i++) counts[offset + i]++;
+      Atomics.add(flow, 0, BigInt(bytes.length));
+    },
+  };
+  const weights = gpuOnlyWeights({ memory, base, size, tensors, worker });
+  flow = new BigInt64Array(weights.flow);
+  const steps = [1, 3, 4093, 17, 65536];
+  for (let at = 0, k = 0; at < size; at += steps[k++ % steps.length]) weights.write(at, checkpoint.subarray(at, Math.min(size, at + steps[k % steps.length])));
+  await weights.room();
+  await weights.drained();
+  const inHole = (i) => holes.some(([a, b]) => i >= a && i < b);
+  const stored = new Uint8Array(memory.buffer, base, weights.stored);
+  for (let i = 0; i < size; i++) {
+    if (inHole(i)) assert.ok(counts[i] === 1 && posted[i] === checkpoint[i], `byte ${i} posted once`);
+    else assert.ok(counts[i] === 0 && stored[place(i)] === checkpoint[i], `byte ${i} in memory at ${place(i)}`);
+  }
+  assert.equal(weights.stored, size - holes.reduce((sum, [a, b]) => sum + b - a, 0));
+  // what gpu.js opens with: each layer's values and scales where they start in the checkpoint
+  const plan = gpuOnlyPlan([64, 96, 2, 4, 2, 100, 32], tensors);
+  assert.deepEqual(plan.matrices.w2.layers[1], [tensors.w2.offset + 64 * 96, tensors.w2.scales + (64 * 96 / 32) * 4]);
 }
 console.log("ok");

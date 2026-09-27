@@ -588,6 +588,48 @@ class Tensor:
                 "scales": self.scales}
 
 
+class Places:
+    """Where the tensors of a checkpoint are, taken in file order (Llama's take() with external=, T93): a Tensor for
+    each, from the header's 28 bytes on. dtype: the checkpoint's as numpy has it (int6 is int8 with six=True)."""
+
+    def __init__(self, dtype, six=False):
+        self.dtype, self.six, self.offset = np.dtype(dtype), six, 28
+
+    def take(self, *shape, matrix=True, widen=True):
+        count = math.prod(shape)
+        if self.dtype == np.int8 and matrix:
+            group = 32
+            while shape[-1] % group:
+                group //= 2
+            stored = count * 3 // 4 if self.six else count
+            tensor = Tensor("int6" if self.six else "int8", self.offset, shape, group, self.offset + stored)
+            self.offset += stored + 4 * (count // group)
+            return tensor
+        tensor = Tensor("f16" if self.dtype == np.float16 else "f32", self.offset, shape)
+        self.offset += count * (2 if self.dtype == np.float16 else 4)
+        return tensor
+
+
+def external_tensors(header, dtype, form=None):
+    """Where every tensor of a Llama checkpoint with this header, dtype and form (FORM) is, {name: Tensor.plan()}, as
+    Llama(external=) hands them to public/forward.js, before any of its bytes are there (T156: the worker sends the
+    layers' matrices to the GPU as they come, and keeps the rest; llama_tensors() is the one order)."""
+    form = form_of(form)
+    if form["arch"] != "llama":
+        raise ValueError("Only a Llama's tensors are placed before the model is built.")
+    probe = Llama.__new__(Llama)
+    (probe.dim, probe.hidden_dim, probe.n_layers, probe.n_heads, probe.n_kv_heads, vocab_size,
+     probe.seq_len) = (int(value) for value in header)
+    probe.vocab_size = abs(vocab_size)
+    probe.head_size = int(form["head_dim"]) or probe.dim // probe.n_heads
+    probe.q_dim, kv_dim = probe.n_heads * probe.head_size, probe.n_kv_heads * probe.head_size
+    six = str(dtype) == "int6"
+    places = Places(np.int8 if six else dtype, six)
+    probe.llama_tensors(places.take, vocab_size > 0, True, kv_dim, form["bias"], places.dtype,
+                        lambda width: np.zeros(width // 2), form["qk_norm"])
+    return {name: getattr(probe, name).plan() for name in TENSOR_NAMES if isinstance(getattr(probe, name, None), Tensor)}
+
+
 # the attributes of Llama that are tensors of the file, in no particular order
 TENSOR_NAMES = ("token_embedding_table", "rms_att_weight", "wq", "wk", "wv", "wo", "rms_ffn_weight", "w1", "w2", "w3",
                 "rms_final_weight", "freq_cis_real", "freq_cis_imag", "wcls", "bq", "bk", "bv", "positions",
@@ -789,21 +831,15 @@ class Llama:
         # (only forward.js computes on them: the NumPy forward widens every matrix)
         keep_int8 = external is not None and suitable and dtype == np.int8 and "int8" not in disable
 
+        # only where it is: public/forward.js reads it (and widens what has to be widened) itself
+        places = Places(dtype, six) if external is not None else None
+
         def take(*shape, matrix=True, widen=True):
             nonlocal offset
             count = math.prod(shape)
-            if external is not None:
-                # only where it is: public/forward.js reads it (and widens what has to be widened) itself
-                if dtype == np.int8 and matrix:
-                    group = 32
-                    while shape[-1] % group:
-                        group //= 2
-                    stored = count * 3 // 4 if six else count
-                    tensor = Tensor("int6" if six else "int8", offset, shape, group, offset + stored)
-                    offset += stored + 4 * (count // group)
-                    return tensor
-                tensor = Tensor("f16" if dtype == np.float16 else "f32", offset, shape)
-                offset += count * (2 if dtype == np.float16 else 4)
+            if places is not None:
+                tensor = places.take(*shape, matrix=matrix)
+                offset = places.offset
                 return tensor
             if dtype == np.int8 and matrix:
                 # quantize.py: int8 values, then one float32 scale per group

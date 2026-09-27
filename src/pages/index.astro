@@ -303,7 +303,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
 
 <script>
   import { GROUPS, MODELS, filled, memoryFailure, memoryWarning, weightsFor } from "../models.js";
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, roundsHere, environmentOf, reportUrl, threadsKey as sharedThreadsKey } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, roundsHere, environmentOf, reportUrl, threadsKey as sharedThreadsKey, CPU_SPEED_KEY } from "../bench.js";
 
   declare const __BUILD__: string;
   const $ = (id: string) => document.getElementById(id)!;
@@ -405,7 +405,9 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
   const gpuKey = (entry: any) => `gpu:${entry.id !== "local" ? entry.id : entry.hf?.repo ? `hf:${entry.hf.repo}@${entry.hf.revision}` : `file:${entry.name}`}`;
   const gpuFor = (entry: { id: string }) => {
     try {
-      return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry)) ?? "null") ?? undefined };
+      // (T156: and the CPU's reading of the weights /benchmark/ measured here, which a model on the GPU alone is held against)
+      return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry)) ?? "null") ?? undefined,
+        cpu: JSON.parse(localStorage.getItem(CPU_SPEED_KEY) ?? "null") ?? undefined };
     } catch {
       return {};  // no storage here, or something else under the name: choose again
     }
@@ -907,7 +909,9 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
         return;
       }
       message("model error", data.memory ? memoryFailure(model, data.heap, data.message) : data.message);
-      statusText.textContent = ready ? `${model.name}` : `Could not load ${model.name}`;
+      // T156: the worker loads the model again on the CPU (its GPU stopped while it was on the GPU alone)
+      if (data.reloading) ready = false;
+      statusText.textContent = data.reloading ? `${model.name}: loading again on the CPU...` : ready ? `${model.name}` : `Could not load ${model.name}`;
     }
     // T172: only the messages that end a piece of the worker's work mean it is idle again (a load: ready, the
     // benchmark: bench, a text: done, any of them: error). The others come in the middle of one: status, progress

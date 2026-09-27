@@ -250,6 +250,10 @@ export function cpuTable(r) {
  * or undefined where it has not run. Where it gives nothing to hold against, { why } says so, and no estimate stands
  * in for it.
  */
+/** T156: where /benchmark/ keeps its CPU section's fastest reading of the weights (cpuBaseline().token: { GBps,
+ * threads }) for the model page, which holds a model on the GPU alone against it (the same estimate as the GPU
+ * section's GPU ÷ CPU, T157) */
+export const CPU_SPEED_KEY = "benchmark:cpu";
 export function cpuBaseline(section) {
   if (!section) return { why: "run the CPU section for it" };
   if (section.status !== "ok") return { why: `the CPU section ${STATES[section.status] ?? section.status}` };

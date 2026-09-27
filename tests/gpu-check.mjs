@@ -184,7 +184,7 @@ const K_PACKED = 3, SCALE_LINE = 1e-4, TIE = Math.LN2;
 const { pyodide: py } = await pyodideWithEngine();
 const PYTHON = `
 import base64, gc, struct, numpy as np, llama2_numpy, llama2_convert
-from llama2_numpy import Llama
+from llama2_numpy import Llama, external_tensors
 
 def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0, six=False, **form):
     """A made-up int8 checkpoint and its tokenizer.bin, as quantize.py writes one: grouped-query attention. form
@@ -362,17 +362,23 @@ function caseOf(id, options, reference, bytes) {
   });
   py.runPython(`Llama(None, vocabulary, kernels="simdkernel.so", external=recorder, **OPTIONS).release()`);
   plan.kv_start = KV_START;
+  // T156: a Llama of int8 whose steps the GPU takes goes on the GPU alone too: where its tensors are from its header
+  let places;
+  if ((options.arch ?? "llama") === "llama" && !options.bias && !options.qk_norm && options.dtype === "int8") {
+    py.globals.set("HEADER", py.toPy([...new Int32Array(bytes.slice(0, 28).buffer)]));
+    places = py.runPython(`external_tensors(HEADER, OPTIONS["dtype"], OPTIONS)`).toJs({ dict_converter: Object.fromEntries });
+  }
   for (const [name, value] of Object.entries(plan.derived)) plan.derived[name] = Buffer.from(value).toString("base64");
   const name = path.basename(id), file = path.join(directory, `${name}.bin`);
   fs.writeFileSync(file, bytes);
-  return { id, plan, headDim: options.head_dim ?? 0, arch: options.arch ?? "llama", dtype: options.dtype, checkpoint: `/case/${name}.bin`, file, reference,
+  return { id, plan, places, headDim: options.head_dim ?? 0, arch: options.arch ?? "llama", dtype: options.dtype, checkpoint: `/case/${name}.bin`, file, reference,
     planSeconds: (performance.now() - began) / 1000 };
 }
 
 // ---- the browser: a page that is cross-origin isolated (its own headers), a worker that runs forward.js
 const HARNESS = /* js */ `
 const search = "?v=gpu-check";
-const { compileKernels, createForward, weightsMemory, footprint } = await import("/public/forward.js" + search);
+const { compileKernels, createForward, weightsMemory, footprint, external, gpuOnlyWeights, gpuOnlyPlan } = await import("/public/forward.js" + search);
 const { GPU_DONE, GPU_FAILED, GPU_BEAT, GPU_WANTED } = await import("/public/jobs.js" + search);
 const fetched = async (url) => new Uint8Array(await (await fetch(url)).arrayBuffer());
 const b64 = (floats) => {
@@ -529,6 +535,44 @@ try {
       inner.terminate();
       return out;
     };
+    // T156: the model on the GPU alone, as the worker puts one it cannot hold twice (forward.js's gpuOnlyWeights): the
+    // checkpoint streamed in stretches of odd sizes (a stretch ends in the middle of a word, a matrix, a layer), the
+    // layers' matrices to the GPU's worker and the rest into memory packed without them. The prompt and 4 greedy steps
+    // (none on the CPU); then a step on the CPU, which must throw (the weights are not here). And a GPU that fails as
+    // it opens (pieces of 4096 bytes, fewer than the device's alignment of rows: gpu.js's piecesOf refuses): the bytes
+    // still counted as taken, the GPU lost with the reason as the engine starts, a step on the CPU throws
+    const direct = async (force) => {
+      const worker = openGpu();
+      const weights = gpuOnlyWeights({ memory, base, size, tensors: c.places, worker });
+      worker.postMessage({ type: "open", plan: gpuOnlyPlan(c.reference.header, c.places, force), flow: weights.flow });
+      const began = performance.now(), stretches = [1234567, 777, 3, 65536, 1 << 20];
+      for (let at = 0, k = 0; at < size; at += stretches[k++ % stretches.length]) {
+        weights.write(at, checkpoint.subarray(at, Math.min(size, at + stretches[k % stretches.length])));
+        await weights.room();
+      }
+      await weights.drained();
+      let lostWhy = null;
+      const outside = external({ memory, base, size, kernels, gpu: () => worker, gpuForce: force, halfKeys: true,
+        direct: { place: weights.place, stored: weights.stored, onLost: (why) => { lostWhy = why; } } });
+      const engine = outside.start(structuredClone(plan));
+      const note = await engine.gpu;
+      const out = { note, stored: weights.stored };
+      if (!lostWhy) {
+        for (let at = 0; at < n; at += 16) engine.forwardMany(tokens.slice(at, Math.min(at + 16, n)), at);
+        const { keys, values } = engine.keysAndValues(0, n);
+        Object.assign(out, { keys: b64(keys), values: b64(values), gpuTokens: engine.gpuTokens, status: engine.gpuStatus,
+          first: engine.generateMany(tokens[n], n, tokens.slice(-64), tokens.length, 4, 0, 0.9, 1, [], []) });
+      }
+      out.lost = lostWhy;  // (before the step on the CPU below, which loses the GPU: the worker would load it again)
+      try {
+        engine.forward(tokens[n], n);
+      } catch (error) {
+        out.threw = String(error?.message ?? error);
+      }
+      out.seconds = (performance.now() - began) / 1000;
+      engine.release();
+      return out;
+    };
     const gpu = [];
     // (the forced ones untimed, T153: a block of 64 tokens of Qwen3 0.6B took more than the 180 s of a step on lavapipe)
     for (const form of [undefined, ...forms]) gpu.push(await run(openGpu, form ? { matrices: form, quick: true } : {}, undefined, !form));
@@ -558,7 +602,15 @@ try {
       const first = gpu[0].ready ?? {}, kept = { key: first.key, matrices: first.matrices, attention: first.attention };
       remembered = { same: (await run(openGpu, {}, kept)).ready, other: (await run(openGpu, {}, { ...kept, key: kept.key + "|another" })).ready };
     }
-    results.push({ id: c.id, cpu: await run(undefined), gpu, late: c.id === "synthetic" ? await late() : undefined, refused, remembered });
+    const cpu = await run(undefined), lateRun = c.id === "synthetic" ? await late() : undefined;
+    // T156: the model on the GPU alone, last (it packs the memory the others read the checkpoint whole from)
+    let alone;
+    const tokenRun = gpu.find((r) => r.steps?.forced === tokenForms[0] && r.steps?.first);
+    if (c.places && tokenRun && !c.wide && !c.force) {
+      const force = { ...TESTS, matrices: forms[0], quick: true, tokens: tokenForms[0], pieceBytes: Infinity, tablePieceBytes: Math.ceil((plan.vocab_size * plan.dim) / 3) };
+      alone = { right: await direct(force), pieces: await direct({ ...force, pieceBytes: 4096 }), keys: tokenRun.keys, values: tokenRun.values, first: tokenRun.steps.first };
+    }
+    results.push({ id: c.id, cpu, gpu, late: lateRun, refused, remembered, alone });
   }
   postMessage({ results, forms });
 } catch (error) {
@@ -716,7 +768,7 @@ function scaleOff(got, want) {
 // (T152: "prompts and answers on WebGPU", or "prompts on WebGPU, answers on the CPU")
 const promptsOnGpu = (note) => /^prompts (and answers )?on WebGPU($|, )/.test(note ?? "");
 let failed = false;
-for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
+for (const { id, cpu, gpu: runs, late, refused, remembered, alone } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;
   const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (c.headDim || dim / heads) * kvHeads;
   const exact = { keys: ref.keys, values: ref.values };
@@ -771,6 +823,20 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     const { whileStarting: w } = refused;
     console.log(`  a GPU let go while it got ready: ${w.ended ? "its worker ended" : "its worker did not say it ended"} in ${w.seconds.toFixed(1)} s${w.ended ? "" : " — FAILED"}`);
     failed ||= !w.ended;
+  }
+  if (alone) {
+    // T156: on the GPU alone the same shaders on the same weights write the same keys and values and ids as the run
+    // with every byte in memory, to the bit; a step on the CPU throws; a GPU that fails as it opens is lost at once,
+    // and says why
+    const { right: r, pieces: p } = alone;
+    const same = r.keys === alone.keys && r.values === alone.values && JSON.stringify(r.first) === JSON.stringify(alone.first);
+    const good = !r.lost && r.gpuTokens === n && same && /^prompts and answers on WebGPU/.test(r.status ?? "") && /on it alone/.test(r.threw ?? "")
+      && Boolean(p.lost) && /on it alone/.test(p.threw ?? "");
+    console.log(`  on the GPU alone (${(r.stored / 1e6).toFixed(2)} MB here): ${r.lost ? `lost (${r.lost})` : `${r.gpuTokens} tokens of the prompt, keys and values ` +
+      `${r.keys === alone.keys && r.values === alone.values ? "the same to the bit" : "NOT the same"} as with the weights here, steps ${JSON.stringify(r.first)} ` +
+      `(${JSON.stringify(alone.first)}), "${r.status}", a step on the CPU ${r.threw ? "threw" : "ran"}`}; a GPU that fails as it opens: ${p.lost ? `lost (${p.lost})` : "not lost"}, ` +
+      `a step on the CPU ${p.threw ? "threw" : "ran"}${good ? "" : " — FAILED"}`);
+    failed ||= !good;
   }
   if (remembered) {
     const right = remembered.same?.remembered === true && remembered.other?.remembered === false;

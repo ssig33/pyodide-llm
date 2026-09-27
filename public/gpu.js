@@ -72,7 +72,9 @@ let model = null;  // what is on the GPU for the model: the device, the plan, th
 let starting = false, stopping = false, lost = null;
 
 onmessage = ({ data }) => {
-  if (data.type === "start") start(data.memory, data.plan);
+  if (data.type === "open") open(data.plan, data.flow);
+  else if (data.type === "weights") take(data);
+  else if (data.type === "start") start(data.memory, data.plan);
   else if (data.type === "prompt") prompt(data);
   else if (data.type === "tokens") generate(data);
   else if (data.type === "stop") stop();
@@ -95,23 +97,22 @@ function within(promise, what) {
   });
 }
 
-async function start(memory, plan) {
-  const began = performance.now();
-  starting = true;
-  try {
+// The device, the model's record (model), and the error scopes the layers' buffers go up in; undefined where there is
+// none (say(why): unusable() by default) or the worker is stopping
+async function openDevice(plan, say = unusable) {
     const wgsl = await shaders;
-    if (!self.navigator?.gpu) return unusable("no WebGPU in a worker here");
+    if (!self.navigator?.gpu) return say("no WebGPU in a worker here");
     // the browser's own adapter (T148, the review: "high-performance" would keep a laptop's second GPU awake for the
     // whole visit, for prompts that are mostly short; the device measures whichever it gets against its CPU anyway)
     const adapter = await navigator.gpu.requestAdapter();
     if (stopping) return end();
-    if (!adapter) return unusable("no GPU adapter here");
+    if (!adapter) return say("no GPU adapter here");
     // T148: a fallback adapter is the CPU doing the GPU's work (SwiftShader, lavapipe): never faster than the CPU's
     // own kernels, and its compilation of the shaders alone took 2 to 4 minutes (T147). Refused before anything is
     // made on it, but where a test asks for it (it is the only WebGPU of CI and of the development machine)
     const info = adapter.info ?? {};
     const fallback = Boolean(info.isFallbackAdapter ?? adapter.isFallbackAdapter);
-    if (fallback && !plan.force.fallback) return unusable("a fallback adapter: the CPU in the GPU's place");
+    if (fallback && !plan.force.fallback) return say("a fallback adapter: the CPU in the GPU's place");
     // the largest buffer the device binds (T155: a matrix larger than it goes in pieces, piecesOf)
     const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
     // shader-f16 and subgroups where the adapter has them (a device refuses a feature it lacks), and the adapter's
@@ -127,12 +128,115 @@ async function start(memory, plan) {
     // (and the shaders of this deployment: a site whose shaders changed chooses anew, the review of T148)
     const key = `${adapterKey(adapter)}|${shadersKey(wgsl, candidates({ device, wgsl }))}`;
     const remembered = plan.remembered?.key === key ? plan.remembered : null;
-    model = { device, memory, plan, wgsl, owned: [], limit, info, fallback, remembered };
+    model = { device, plan, wgsl, owned: [], limit, info, fallback, remembered, adapter, key };
     if (stopping) return end();
     // a buffer the device cannot give fails quietly, as an error of these scopes
     device.pushErrorScope("out-of-memory");
     device.pushErrorScope("validation");
-    const bytes = await upload(model);
+    return model;
+}
+
+// ---- T156: a model on the GPU alone. open() makes the device and every buffer of the layers' matrices before a byte
+// of them comes (plan: forward.js's gpuOnlyPlan(): each matrix's rows and length, and where a layer's values and scales
+// start in the checkpoint; the layers are joined for a token, as a model on the GPU alone always runs its steps here),
+// and take() writes each stretch of them to its buffer as the worker posts it (routes: [start, end) in the checkpoint,
+// the buffer and the offset in it). flow[0] counts the bytes on the GPU (the worker waits on it: a disk read faster
+// than the GPU takes it would pile up in the messages). What comes before the buffers are made waits (backlog). A
+// failure (no adapter, a buffer the device refused) takes the rest as if written, and start() says it
+let opening = null, opened = false, failure = null, flow = null;
+const backlog = [];
+function open(plan, shared) {
+  starting = true;
+  flow = new BigInt64Array(shared);
+  opening = (async () => {
+    try {
+      if (!(await openDevice({ ...plan, tokens: true }, (reason) => { failure = reason; }))) {
+        failure ??= "the GPU's worker was stopped";
+        return;
+      }
+      model.direct = { routes: [], partial: new Map(), bytes: 0 };
+      model.direct.bytes = await uploadLayers(model);
+      if (stopping) failure ??= "the GPU's worker was stopped";
+    } catch (error) {
+      failure = String(error?.message ?? error);
+    } finally {
+      opened = true;
+      starting = startAsked;  // (a start() waiting on this is still starting)
+      for (const data of backlog.splice(0)) take(data);
+      if (stopping) end();
+    }
+  })();
+}
+// the bytes at offset of the checkpoint (bytes: a Uint8Array of their own) onto the buffers whose routes they fall in.
+// writeBuffer takes whole words: the bytes of a word a stretch begins or ends in the middle of wait for the rest of it
+// (partial), which another message brings
+function take(data) {
+  if (!opened) return void backlog.push(data);
+  const { offset, bytes } = data;
+  if (!failure) {
+    try {
+      const { routes } = model.direct, end = offset + bytes.length;
+      let lo = 0, hi = routes.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (routes[mid][1] <= offset) lo = mid + 1;
+        else hi = mid;
+      }
+      for (let i = lo; i < routes.length && routes[i][0] < end; i++) {
+        const [start, stop, target, at] = routes[i];
+        let a = Math.max(start, offset) - offset, here = at + (a + offset - start);
+        const b = Math.min(stop, end) - offset;
+        for (; a < b && here % 4; a++, here++) partialByte(target, here, bytes[a]);
+        const whole = (b - a) & ~3;
+        if (whole) model.device.queue.writeBuffer(target, here, bytes, a, whole);
+        for (let k = a + whole; k < b; k++) partialByte(target, here + (k - a), bytes[k]);
+      }
+    } catch (error) {
+      failure = String(error?.message ?? error);
+    }
+  }
+  const count = BigInt(bytes.length), done = () => {
+    Atomics.add(flow, 0, count);
+    Atomics.notify(flow, 0);
+  };
+  if (failure) done();
+  else model.device.queue.onSubmittedWorkDone().then(done, done);
+}
+// a byte of target at the byte offset at, the word it is in written once all four of its bytes are there
+function partialByte(target, at, value) {
+  const { partial } = model.direct, word = at - (at % 4);
+  if (!partial.has(target)) partial.set(target, new Map());
+  const words = partial.get(target);
+  if (!words.has(word)) words.set(word, { bytes: new Uint8Array(4), count: 0 });
+  const held = words.get(word);
+  held.bytes[at % 4] = value;
+  if (++held.count < 4) return;
+  model.device.queue.writeBuffer(target, word, held.bytes);
+  words.delete(word);
+  if (!words.size) partial.delete(target);
+}
+
+let startAsked = false;
+async function start(memory, plan) {
+  const began = performance.now();
+  starting = startAsked = true;
+  try {
+    let bytes;
+    if (plan.direct) {
+      // T156: opened before the checkpoint came, its layers written as they came (the worker waited for the last)
+      await opening;
+      if (failure && !stopping) return unusable(`the layers did not go up to the GPU (${failure})`);
+      if (stopping || !model) return end();
+      if (model.direct.partial.size) return unusable("the layers' bytes did not all come to the GPU");
+      model.memory = memory;
+      model.plan = plan;
+      bytes = model.direct.bytes + (await uploadRest(model));
+    } else {
+      if (!(await openDevice(plan))) return;
+      model.memory = memory;
+      bytes = await upload(model);
+    }
+    const { device, adapter, key } = model;
     if (stopping) return end();
     await prepare(model);
     await chooseAttention(model);
@@ -253,11 +357,11 @@ function narrowIn(m, target, address, values, offset = 0) {
     m.device.queue.writeBuffer(target, offset + done * 2, narrowed, 0, n);
   }
 }
-async function readBack(m, source, bytes) {
+async function readBack(m, source, bytes, from = 0) {
   const target = m.device.createBuffer({ size: Math.ceil(bytes / 4) * 4, usage: MAP_READ | COPY_DST });
   try {
     const encoder = m.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(source, 0, target, 0, Math.ceil(bytes / 4) * 4);
+    encoder.copyBufferToBuffer(source, from, target, 0, Math.ceil(bytes / 4) * 4);
     m.device.queue.submit([encoder.finish()]);
     await target.mapAsync(MAP_READ);
     return target.getMappedRange().slice(0, bytes);
@@ -301,46 +405,75 @@ function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
 // layer of a token reads them so: shaders.js's fusedMatVec and fusedDp4aMatVec, T150 and T175), each a range of it for
 // the prompt's tiled shaders (tokensLayout), and the classifier, the embedding, the final norm and RoPE's table go up
 // as well (uploadTokens)
+// T156, a model on the GPU alone (m.direct): the layers' buffers are made as the worker opens, before a byte comes, and
+// each stretch of the checkpoint they hold is a route ([start, end) in the checkpoint, the buffer and its offset) that
+// take() writes the bytes to as they come; the rest (the tables, the norms) goes up from the shared memory as start()
+// is asked (uploadRest)
 async function upload(m) {
+  try {
+    const bytes = await uploadLayers(m);
+    if (stopping) return bytes;
+    return bytes + (await uploadRest(m));
+  } finally {
+    m.widen?.done();
+  }
+}
+async function uploadLayers(m) {
   const { plan } = m, group = m.wgsl.GROUP;
   let bytes = 0;
   m.matrices = Object.fromEntries(Object.entries(plan.matrices).map(([name, { rows, n }]) =>
     [name, { rows, n, pieces: piecesOf(m, rows, n).map(([first, count]) => ({ first, rows: count, layers: [] })) }]));
   const together = plan.tokens ? tokensLayout(m) : null;
-  const tables = together ? Object.values(tablesOf(plan)) : [];
+  m.together = together;
+  // (a model on the GPU alone opens before its tables are placed, and is int8: T156)
+  const tables = together && !m.direct ? Object.values(tablesOf(plan)) : [];
   const six = [...Object.values(plan.matrices), ...tables].some((matrix) => matrix.six);
-  const widen = six ? await widener(m, tables) : null;
-  try {
-    for (let l = 0; l < plan.layers; l++) {
-      // a layer's matrices that are one (T152): a buffer of values and one of scales for all of them
-      const joined = together && Object.fromEntries(Object.entries(together.sizes).map(([name, [valueBytes, scaleBytes]]) =>
-        [name, [buffer(m, valueBytes, STORAGE | COPY_DST), buffer(m, scaleBytes, STORAGE | COPY_DST)]]));
-      if (joined) (m.joined ??= []).push(joined);
-      for (const [name, matrix] of Object.entries(plan.matrices)) {
-        const [valuesAt, scalesAt] = matrix.layers[l];
-        const home = together?.homes[name];
-        for (const piece of m.matrices[name].pieces) {
-          const valueBytes = piece.rows * matrix.n, scaleBytes = (valueBytes / group) * 4;
-          // its own buffers, or its range of the layer's joined ones
-          const [values, scales] = home
-            ? joined[home.joined].map((b, i) => ({ buffer: b, offset: home.at[i], size: i ? scaleBytes : valueBytes }))
-            : [buffer(m, valueBytes, STORAGE | COPY_DST), buffer(m, scaleBytes, STORAGE | COPY_DST)];
+  // (kept for the tables, uploadRest; upload() lets it go)
+  const widen = m.widen = six ? await widener(m, tables) : null;
+  // (T156: a model on the GPU alone reads its first layer back to check a token's layer against: firstLayer)
+  const usage = STORAGE | COPY_DST | (m.direct ? COPY_SRC : 0);
+  for (let l = 0; l < plan.layers; l++) {
+    // a layer's matrices that are one (T152): a buffer of values and one of scales for all of them
+    const joined = together && Object.fromEntries(Object.entries(together.sizes).map(([name, [valueBytes, scaleBytes]]) =>
+      [name, [buffer(m, valueBytes, usage), buffer(m, scaleBytes, usage)]]));
+    if (joined) (m.joined ??= []).push(joined);
+    for (const [name, matrix] of Object.entries(plan.matrices)) {
+      const [valuesAt, scalesAt] = matrix.layers[l];
+      const home = together?.homes[name];
+      for (const piece of m.matrices[name].pieces) {
+        const valueBytes = piece.rows * matrix.n, scaleBytes = (valueBytes / group) * 4;
+        // its own buffers, or its range of the layer's joined ones
+        const [values, scales] = home
+          ? joined[home.joined].map((b, i) => ({ buffer: b, offset: home.at[i], size: i ? scaleBytes : valueBytes }))
+          : [buffer(m, valueBytes, usage), buffer(m, scaleBytes, usage)];
+        const from = [valuesAt + piece.first * matrix.n, scalesAt + (piece.first * matrix.n / group) * 4];
+        if (m.direct) {
+          // (T156: int8 alone, whose bytes are the buffer's as they come)
+          m.direct.routes.push([from[0], from[0] + valueBytes, values.buffer ?? values, values.offset ?? 0],
+            [from[1], from[1] + scaleBytes, scales.buffer ?? scales, scales.offset ?? 0]);
+        } else {
           // an int6 row is 3/4 of an int8 one (24 bytes a group of 32)
           if (matrix.six) widen.into(values, valuesAt + (piece.first * matrix.n * 3) / 4, valueBytes / group);
-          else copyIn(m, values.buffer ?? values, valuesAt + piece.first * matrix.n, valueBytes, values.offset ?? 0);
-          copyIn(m, scales.buffer ?? scales, scalesAt + (piece.first * matrix.n / group) * 4, scaleBytes, scales.offset ?? 0);
-          piece.layers.push([values, scales]);
-          bytes += valueBytes + scaleBytes;
+          else copyIn(m, values.buffer ?? values, from[0], valueBytes, values.offset ?? 0);
+          copyIn(m, scales.buffer ?? scales, from[1], scaleBytes, scales.offset ?? 0);
         }
+        piece.layers.push([values, scales]);
+        bytes += valueBytes + scaleBytes;
       }
-      // what was written waits in memory until the GPU takes it: let it, before more comes
-      await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
-      if (stopping) return bytes;
     }
-    if (together) bytes += await uploadTokens(m, widen);
-  } finally {
-    widen?.done();
+    if (m.direct) continue;
+    // what was written waits in memory until the GPU takes it: let it, before more comes
+    await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
+    if (stopping) return bytes;
   }
+  m.direct?.routes.sort((a, b) => a[0] - b[0]);
+  return bytes;
+}
+// the tables of a token (where the layers are joined for them, T152), and the norms, from the shared memory
+async function uploadRest(m) {
+  const { plan } = m;
+  let bytes = 0;
+  if (m.together) bytes += await uploadTokens(m, m.widen);
   m.vectors = {};
   for (const [name, { at, size }] of Object.entries(plan.vectors)) {
     const vectorBytes = plan.layers * size * 4;
@@ -1095,6 +1228,9 @@ async function runTokens(m, dispatches, { count, pos, state, settings, randoms, 
 async function chooseTokens(m) {
   const { plan, wgsl } = m;
   m.gen = await tokenBuffers(m);
+  // T156: the first layer's matrices of a model on the GPU alone are not in the shared memory: checkTokens reads them
+  // back from the GPU
+  if (m.direct) m.firstLayer ??= await within(firstLayer(m), "reading the first layer back");
   let forms = tokenCandidates(m);
   if (plan.force.tokens) forms = forms.filter((form) => form.name === plan.force.tokens);
   const kept = !plan.force.tokens && forms.find((form) => form.name === m.remembered?.tokens);
@@ -1169,18 +1305,37 @@ async function timeTokens(m, forms) {
 //      random number's share of the mass (T151's line: the GPU's exp and its float32 sums).
 // The reason it is wrong, or null.
 const LAYER_LINE = 2e-3, LOGITS_LINE = 1e-3, DP4A_LINE = 2e-2;
+// T156: the first layer's matrices, { name: [values, scales] } as an Int8Array and a Float32Array each, read back from
+// their buffers (a piece after another: the rows in order)
+async function firstLayer(m) {
+  const group = m.wgsl.GROUP, out = {};
+  for (const [name, { n, pieces }] of Object.entries(m.matrices)) {
+    const rows = pieces.reduce((sum, piece) => sum + piece.rows, 0);
+    const values = new Int8Array(rows * n), scales = new Float32Array((rows * n) / group);
+    for (const piece of pieces) {
+      const [v, s] = piece.layers[0], valueBytes = piece.rows * n, scaleBytes = (valueBytes / group) * 4;
+      values.set(new Int8Array(await readBack(m, v.buffer ?? v, valueBytes, v.offset ?? 0)), piece.first * n);
+      scales.set(new Float32Array(await readBack(m, s.buffer ?? s, scaleBytes, s.offset ?? 0)), (piece.first * n) / group);
+    }
+    out[name] = [values, scales];
+  }
+  return out;
+}
 async function checkTokens(m, form) {
   const { plan, wgsl, gen: g, device } = m, vocab = g.vocab, dim = plan.dim, headSize = plan.headSize, half = headSize / 2;
   const qDim = plan.heads * headSize, kvDim = plan.kvHeads * headSize, line = form.dp4a ? DP4A_LINE : LAYER_LINE;
   const floats = (address, n) => Float64Array.from(new Float32Array(m.memory.buffer, address, n));
   const round16 = Math.f16round ?? ((x) => x);
   // a matrix's rows ({ n, six }, its values and scales at [valuesAt, scalesAt]) times x, the rows given
+  // (T156: or the values and scales themselves, read back from the GPU: firstLayer)
   const product = ({ n, six }, [valuesAt, scalesAt], x, rows) => {
     const q = form.dp4a ? wgsl.quantizedLikeCpu(Float32Array.from(x)) : null, perRow = n / wgsl.GROUP;
+    const read = typeof valuesAt !== "number";
     return Float64Array.from(rows, (r) => {
-      const w = six ? wgsl.sixValues(new Uint8Array(m.memory.buffer, valuesAt + (r * n * 3) / 4, (n * 3) / 4))
-        : new Int8Array(m.memory.buffer, valuesAt + r * n, n);
-      const s = new Float32Array(m.memory.buffer, scalesAt + r * perRow * 4, perRow);
+      const w = read ? valuesAt.subarray(r * n, (r + 1) * n)
+        : six ? wgsl.sixValues(new Uint8Array(m.memory.buffer, valuesAt + (r * n * 3) / 4, (n * 3) / 4))
+          : new Int8Array(m.memory.buffer, valuesAt + r * n, n);
+      const s = read ? scalesAt.subarray(r * perRow, (r + 1) * perRow) : new Float32Array(m.memory.buffer, scalesAt + r * perRow * 4, perRow);
       let sum = 0;
       for (let b = 0; b < perRow; b++) {
         let part = 0;
@@ -1191,7 +1346,7 @@ async function checkTokens(m, form) {
     });
   };
   const all = (n) => [...Array(n).keys()];
-  const matmul = (name, x) => product(plan.matrices[name], plan.matrices[name].layers[0], x, all(plan.matrices[name].rows));
+  const matmul = (name, x) => product(plan.matrices[name], m.firstLayer?.[name] ?? plan.matrices[name].layers[0], x, all(plan.matrices[name].rows));
   const rms = (x, weights) => {
     const s = 1 / Math.sqrt(x.reduce((sum, v) => sum + v * v, 0) / x.length + plan.eps);
     return x.map((v, i) => weights[i] * (s * v));

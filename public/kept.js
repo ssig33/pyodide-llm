@@ -206,6 +206,67 @@ export async function keep(model, kept, slice, tokenizer, signal) {
   }
 }
 
+/** T156: a conversion kept as it comes, for a model whose weights go to the GPU alone (nothing holds them whole to
+ * copy from afterwards, as keep() does): write(offset, bytes) as they come, in any order; finish(kept, tokenizer) writes
+ * the tokenizer and the manifest last (a folder without one is rubbish, as keep()'s) and returns why nothing was kept,
+ * or undefined; drop() lets go of it. On OPFS alone (a sync access handle): undefined where there is none. Whatever
+ * was kept under the name before is removed first (openKept did not find it serving, or there would be no conversion) */
+export async function keeper(model) {
+  if (!opfsWritable()) return undefined;
+  const directory = await folders(true);
+  if (!directory) return undefined;
+  const name = keptName(model);
+  await directory.removeEntry(name, { recursive: true }).catch(() => {});
+  const folder = await directory.getDirectoryHandle(name, { create: true });
+  let handle = await (await folder.getFileHandle("model.bin", { create: true })).createSyncAccessHandle();
+  let failed = null;
+  const put = (target, bytes, at) => {
+    if (target.write(bytes, { at }) !== bytes.length) throw new Error("the origin private file system took only part of a write");
+  };
+  const close = () => {
+    handle?.close();
+    handle = null;
+  };
+  const drop = async () => {
+    close();
+    await directory.removeEntry(name, { recursive: true }).catch(() => {});
+  };
+  return {
+    write(offset, bytes) {
+      if (failed || !handle) return;
+      try {
+        put(handle, bytes, offset);
+      } catch (error) {
+        failed = String(error.message ?? error);  // (the model goes on; it is not kept)
+      }
+    },
+    async finish(kept, tokenizer) {
+      const manifest = { ...kept, converter: CONVERTER };
+      try {
+        if (failed) throw new Error(failed);
+        handle.flush();
+        close();
+        for (const [file, bytes] of [["tokenizer.bin", tokenizer], ["manifest.json", new TextEncoder().encode(JSON.stringify(manifest))]]) {
+          const target = await (await folder.getFileHandle(file, { create: true })).createSyncAccessHandle();
+          try {
+            target.truncate(0);
+            put(target, bytes, 0);
+            target.flush();
+          } finally {
+            target.close();
+          }
+        }
+        const held = await (await folder.getFileHandle("model.bin")).getFile();
+        if (held.size !== manifest.bytes) throw new Error(`the origin private file system holds ${held.size} of ${manifest.bytes} bytes after writing`);
+        return undefined;
+      } catch (error) {
+        await drop();
+        return String(error.message ?? error);
+      }
+    },
+    drop,
+  };
+}
 /** Delete a kept model (one of keptModels()). */
 export async function forget({ name, where }) {
   if (where === "opfs") {
