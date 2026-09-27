@@ -9,9 +9,10 @@
 # character, as float32 with the kernels. Where each model comes from, its prompt and template are read from
 # src/models.js (with Node), so nothing here can drift from the list.
 #
-#   python3 tests/fixed_outputs.py <directory for the downloads> [--write]
+#   python3 tests/fixed_outputs.py <directory for the downloads> [--write] [--only=<id>,<id>]
 #
 # --write records what the models write now, into tests/fixtures/fixed-outputs.json: do that only after reading it.
+# --only runs those models alone (a broken converter tried on the one model it should break, T204).
 import json
 import subprocess
 import sys
@@ -31,8 +32,11 @@ FIXTURES = HERE / "fixtures" / "fixed-outputs.json"
 NEW_TOKENS = 16
 CHUNK = 8 << 20
 # one per architecture and way in: GPT-NeoX, GPT-2, a Llama from a GGUF (T74), a Llama with a Unigram tokenizer.json,
-# and a Qwen3 (T124: the norms of q and k, heads of 128 in a dim of 1024)
-MODELS = ["hf-pythia-70m", "hf-gpt2", "hf-smollm2-135m-instruct", "hf-llm-jp-3-150m-instruct3", "hf-qwen3-0.6b"]
+# and a Qwen3 (T124: the norms of q and k, heads of 128 in a dim of 1024). Pythia and GPT-2 come from GGUFs since
+# T136's third stage, so a GPT-2 from a safetensors file too (T204): rinna's, whose names begin with "transformer.",
+# whose Conv1D matrices the plan transposes as they come, and whose sentencepiece model normalizes as nmt_nfkc.
+MODELS = ["hf-pythia-70m", "hf-gpt2", "hf-japanese-gpt2-small", "hf-smollm2-135m-instruct", "hf-llm-jp-3-150m-instruct3",
+          "hf-qwen3-0.6b"]
 
 
 def entries():
@@ -139,9 +143,14 @@ def written(entry, conversion, checkpoint):
 
 def main():
     directory, write = Path(sys.argv[1]), "--write" in sys.argv
+    only = [arg.split("=", 1)[1].split(",") for arg in sys.argv if arg.startswith("--only=")]
+    if write and only:
+        sys.exit("--write records every model: not with --only")
     expected = json.loads(FIXTURES.read_text()) if FIXTURES.exists() else {}
     got, failures = {}, []
     for entry in entries():
+        if only and entry["id"] not in only[0]:
+            continue
         text = written(entry, *converted(entry, directory))
         got[entry["id"]] = {"prompt": entry["prompt"], "text": text}
         same = expected.get(entry["id"], {}).get("text") == text
