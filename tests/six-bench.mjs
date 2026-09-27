@@ -1,7 +1,7 @@
-// T166: the int6 matrix products (matmul_q6r with relaxed SIMD, matmul_q6 without) with the widening of main's
-// kernels/six.ts, this tree's, and the candidate forms below, in one process, taking turns (AGENTS.md: the old and the
-// new side by side), with matmul_q8r (int8) for the ratio T98 wrote down (0.45). Every form's output must be main's
-// to the bit. Compiles each form with AssemblyScript into .tmp/six-bench/ (needs `npm ci`; `make kernels` not).
+// T166: the int6 matrix products (matmul_q6r with relaxed SIMD, matmul_q6 without) with main's kernels and this
+// tree's, in one process, taking turns (AGENTS.md: the old and the new side by side), with matmul_q8r (int8) for the
+// ratio T98 wrote down (0.45). The tree's output must be main's to the bit. (The forms T166 measured and dropped are
+// in TODO.md's T166: put another kernels/six.ts in the tree to compare one.) Compiles each form with AssemblyScript into .tmp/six-bench/ (needs `npm ci`; `make kernels` not).
 //
 //   node tests/six-bench.mjs [--rounds 3] [--turns 7]
 //
@@ -18,29 +18,6 @@ const option = (name, value) => (args.includes(name) ? Number(args[args.indexOf(
 const rounds = option("--rounds", 3), turns = option("--turns", 7);
 const work = root + ".tmp/six-bench/";
 
-// The candidates (T166). "and-or": no bitselect (the form of llama.cpp's Q6_K on arm64, vandq + vshlq + vorrq; x86
-// makes a bitselect three instructions). "two-mul": the first half's top put at bits 6-7 by a second multiply, not
-// a shift (on Neoverse N1 the shifts take one pipe and the multiplies the other).
-const header = "// @ts-ignore: decorator\n@inline export function";
-const candidates = {
-  "and-or": `
-${header} sixTops(p: usize): v128 { return i16x8.mul(v128.load64_splat(p + 16), i16x8(4, 4, 4, 4, 1, 1, 1, 1)); }
-${header} sixFirst(low: v128, t: v128): v128 {
-  return v128.or(v128.and(i16x8.shl(t, 4), i8x16.splat(-64)), v128.and(i16x8.shl(low, 2), i8x16.splat(60)));
-}
-${header} sixSecond(low: v128, t: v128): v128 {
-  return v128.or(v128.and(t, i8x16.splat(-64)), v128.and(i16x8.shr_u(low, 2), i8x16.splat(60)));
-}`,
-  "two-mul": `
-${header} sixTops(p: usize): v128 { return v128.load64_splat(p + 16); }
-${header} sixFirst(low: v128, h: v128): v128 {
-  return v128.bitselect(i16x8.mul(h, i16x8(64, 64, 64, 64, 16, 16, 16, 16)), i8x16.shl(low, 2), i8x16.splat(-64));
-}
-${header} sixSecond(low: v128, h: v128): v128 {
-  return v128.bitselect(i16x8.mul(h, i16x8(4, 4, 4, 4, 1, 1, 1, 1)), v128.and(i16x8.shr_u(low, 2), i8x16.splat(60)), i8x16.splat(-64));
-}`,
-};
-
 // main's kernels (CI checks out one commit: fetch main's)
 try { execFileSync("git", ["fetch", "--depth=1", "origin", "+main:refs/remotes/origin/main"], { cwd: root, stdio: "inherit" }); } catch {}
 const forms = { main: {}, tree: {} };
@@ -48,7 +25,6 @@ for (const file of ["kernel.ts", "kernel_relaxed.ts", "six.ts"]) {
   forms.main[file] = execFileSync("git", ["show", `origin/main:kernels/${file}`], { cwd: root, encoding: "utf8" });
   forms.tree[file] = fs.readFileSync(`${root}kernels/${file}`, "utf8");
 }
-for (const [name, six] of Object.entries(candidates)) forms[name] = { ...forms.tree, "six.ts": six };
 
 const asc = ["asc", "-O3", "--noAssert", "--runtime", "stub", "--importMemory", "--noExportMemory", "--initialMemory", "1"];
 const memory = new WebAssembly.Memory({ initial: 1, maximum: 4096 });
