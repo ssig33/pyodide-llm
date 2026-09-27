@@ -61,7 +61,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
         <h2>GPU</h2>
         <p class="about">WebGPU: the adapter, its shaders checked against JavaScript, how fast it reads int8 weights, and
           a token's work of three model sizes against the CPU. Then the same token with the next token chosen on the GPU,
-          one layer of a token as separate steps and fused into fewer dispatches, tokens generated on the GPU (the
+          one layer of a token as separate steps and fused into fewer dispatches, where that layer's time goes step
+          by step, tokens generated on the GPU (the
           sampling too) each read back as it comes or several at once, what a token costs besides its
           weights, the device's ceilings (loops of multiply-adds, int8 dots or reads alone), and a prompt's tokens all
           at once, with the share of its ceiling each shader reaches. The weights are random bytes.</p>
@@ -151,7 +152,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 </style>
 
 <script>
-  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
+  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, layerStepsTable, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
     matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
   import { forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
@@ -471,9 +472,9 @@ const BENCH_MODEL = "llm-jp-3-150m";
         const why = steps[0].error ?? (info?.worker ? "navigator.gpu gave no adapter" : "no WebGPU in a worker here");
         return { status: "none", markdown: why };
       }
-      // the adapter, the check, the shapes, the tokens, the ways, a layer, the tokens generated, besides the weights,
+      // the adapter, the check, the shapes, the tokens, the ways, a layer, its steps (T202), the tokens generated, besides the weights,
       // the ceilings, a prompt, the bridge (T192: the tokens generated were left out, and the last two read "N / N")
-      of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 6;
+      of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 7;
       // T182: a fallback adapter (SwiftShader in CI: the CPU in a GPU's place) checks the shaders against JavaScript and
       // times nothing: its times are no GPU's, and they took about 4 minutes a browser (the owner, 2026-09-27: what CI
       // needs to know is that the GPU's path works). The timings are for a real GPU, on the owner's devices.
@@ -489,6 +490,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
       for (const [label, how] of GPU_WAYS) await step(`a token of Llama 3.2 1B, ${label}`, { step: "token", model: "Llama 3.2 1B", kind: "widen", ...how });
       // T150: a layer of a token as separate steps and fused into fewer dispatches
       await step("a layer of a token", { step: "layer" });
+      // T202: where a layer's time goes, step by step
+      await step("the steps of a layer", { step: "layer steps" });
       // T151: tokens generated on the GPU, each read back as it comes against several a submission read back once
       await step("tokens generated on the GPU", { step: "generate" });
       await step("what a token costs besides the weights", { step: "overhead" });
@@ -549,6 +552,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const gpu = { fallback: r.fallback, lost, check: check?.result };
     lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline, gpu));
     lines.push("", ...layerTable(steps.find((s) => s.name === "a layer of a token"), check?.result, ceilings, gpu));
+    lines.push("", ...layerStepsTable(steps.find((s) => s.name === "the steps of a layer"), check?.result, ceilings, gpu));
     lines.push("", ...generateTable(steps.find((s) => s.name === "tokens generated on the GPU"), check?.result, gpu));
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
       "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),

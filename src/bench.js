@@ -414,6 +414,76 @@ export function layerTable(step, check, ceilings, gpu = {}) {
         `${GBps(row)} | ${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
 }
 
+// T202: a time of layerSteps() in ms (undefined where it failed or is not a positive number)
+const stepMs = (one) => (one && !one.error && Number.isFinite(one.ms) && one.ms > 0 ? one.ms : undefined);
+const less = (a, b) => (a === undefined || b === undefined ? undefined : a - b);
+// T202: a form's layer (r: layerSteps()'s result) and its parts in ms: the steps one by one (steps) as the matrices
+// with what they write (matrices), the attention and the norms and quantizing (small); the four matrices alone
+// (alone); the chain (the layer less its steps). undefined where a part was not timed.
+function layerSplit(r, form) {
+  const byName = new Map(r.steps.map((one) => [one.step, one]));
+  const sum = (kinds) => form.steps.filter(({ step }) => kinds.includes(byName.get(step)?.kind))
+    .reduce((total, { step, count }) => (total === undefined || stepMs(byName.get(step)) === undefined ? undefined : total + count * byName.get(step).ms), 0);
+  const aloneRows = r.steps.filter((one) => one.kind === "alone");
+  const alone = aloneRows.length && aloneRows.every((one) => stepMs(one) !== undefined) ? aloneRows.reduce((total, one) => total + one.ms, 0) : undefined;
+  const layer = stepMs(form), steps = sum(["matrix", "attention", "small"]);
+  return { layer, steps, matrices: sum(["matrix"]), attention: sum(["attention"]), small: sum(["small"]), alone, chain: less(layer, steps) };
+}
+
+/**
+ * T202: the GPU section's table of where a layer's time goes (public/benchmark/gpu.js's layerSteps()): each step of
+ * the fused forms a token would run on this device alone, the four matrices alone, a dispatch of one workgroup, and
+ * the whole layer, timed in turn. step: {name, result: {model, pos, layers, GB, dp4a, forms: [{form, check, normApart,
+ * dispatches, steps: [{step, count}], ms, unsteady} or {form, check, error}], steps: [{step, kind ("matrix",
+ * "attention", "small", "alone", "floor"), matrix, ms, unsteady} or {step, kind, error}]}} or {name, error}; check:
+ * the shaders against JavaScript (a form's verdict under its check); ceilings: T168's (the share of the buffer's reads
+ * the matrices alone read the weights at); gpu: {fallback, lost}. Under the table, for each form: the layer, its
+ * steps' sum and what the chain costs beyond it, the matrices alone and the layer less them split into what the
+ * matrices' writes add, the attention, the norms and quantizing, and the chain.
+ */
+export function layerStepsTable(step, check, ceilings, gpu = {}) {
+  if (!step) return [];
+  const title = "**Where a layer's time goes**";
+  if (step.error || !step.result) return [`${title}: ${tableCell(step.error ?? "not measured")}`];
+  const r = step.result, none = noRatios(gpu);
+  const reads = !gpu.lost && ceilings && !ceilings.fallback && !ceilings.global?.unsteady ? ceilings.global?.GBps : undefined;
+  const wrong = (form) => Boolean(check && check[form.check] && !check[form.check].ok);
+  const microseconds = (one) => (one?.error ? `failed: ${tableCell(one.error)}` : `${one?.unsteady ? "unsteady: " : ""}${stepMs(one) === undefined ? "?" : number(1000 * one.ms, 1)}`);
+  const floor = r.steps.find((one) => one.kind === "floor"), forms = r.forms.filter((form) => !form.error);
+  const GBps = (took) => (took === undefined ? "?" : `${number(r.GB / (took / 1000))} GB/s${reads ? `, ${number((100 * r.GB) / (took / 1000) / reads)}% of the buffer's reads (${number(reads)} GB/s)` : ""}`);
+  const lines = [`${title} (T202; ${r.model}'s width at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights a layer, ` +
+    `the layers a token would run here: on ${r.dp4a ? "ONNX Runtime's DP4A (the packed int8 dot is here)" : "llama.cpp's matrix × vector (no packed int8 dot here)"}, fused and fused with the norms apart). ` +
+    "Each step of a layer alone, as a submission of 2n of its one dispatch less one of n; the four matrices alone (the plain matrix × vector over all of a matrix's rows, " +
+    "nothing folded into what it writes: what the matrices themselves take); a dispatch of one workgroup that does next to nothing (what a step costs for being a dispatch in a chain); " +
+    "and the whole layer: all timed in turn, the weights read from copies of them in turn, the residual stream written back before every submission. " +
+    "Each step alone, not the layer less that step: a small step is 1 or 2% of a layer, about what a layer's time moves from one pair of submissions to the next, " +
+    "so the difference of two layers could not tell it; alone it is repeated until a submission takes long enough. What the steps alone leave out is the layer less their sum: " +
+    "what a chain of different dispatches, each waiting for the one before, costs beyond each on its own. The attention reads one cache (the positions up to this one) every time, in the GPU's caches as in the layer table.",
+  ...(none ? [`Read nothing from these times: ${none.replace(/^none:? /, "")}.`] : []), "",
+  `| step | µs each | ${forms.map((form) => `in "${tableCell(form.form)}"${wrong(form) ? " (WRONG in the check)" : ""}, µs a layer`).join(" | ")} |`,
+  `|---|---:|${forms.map(() => "---:|").join("")}`,
+  ...r.steps.map((one) => `| ${tableCell(one.step)} | ${microseconds(one)} | ${forms.map((form) => {
+    const count = form.steps.find((s) => s.step === one.step)?.count;
+    return count ? `${count} × = ${stepMs(one) === undefined ? "?" : number(1000 * count * one.ms, 1)}` : "";
+  }).join(" | ")} |`), ""];
+  for (const form of r.forms) {
+    if (form.error) {
+      lines.push(`- "${tableCell(form.form)}": failed: ${tableCell(form.error)}`);
+      continue;
+    }
+    const { layer, steps, matrices, attention, small, alone: aloneMs, chain } = layerSplit(r, form);
+    const signed = (value) => (value === undefined ? "?" : `${value < 0 ? "−" : ""}${number(Math.abs(value), 2)}`);
+    lines.push(`- "${tableCell(form.form)}"${wrong(form) ? " (WRONG in the check)" : ""}, ${form.dispatches} dispatches: the layer ${form.unsteady ? "(unsteady) " : ""}${signed(layer)} ms. ` +
+      `Its steps one by one ${signed(steps)} ms (the matrices with what they write ${signed(matrices)}, the attention ${signed(attention)}, the norms and quantizing ${signed(small)}); ` +
+      `the layer less them, what the chain costs beyond each step alone: ${signed(chain)} ms. ` +
+      `The matrices alone ${signed(aloneMs)} ms (${GBps(aloneMs)}); the layer less them, ${signed(less(layer, aloneMs))} ms, is ` +
+      `what the matrices' writes add ${signed(less(matrices, aloneMs))} + the attention ${signed(attention)} + the norms and quantizing ${signed(small)} + the chain ${signed(chain)}. ` +
+      `A dispatch of one workgroup takes ${microseconds(floor)} µs: ${form.dispatches} of them ${stepMs(floor) === undefined ? "?" : number(form.dispatches * floor.ms, 2)} ms.`);
+  }
+  if (r.steps.some((one) => one.unsteady) || r.forms.some((form) => form.unsteady)) lines.push("", "Unsteady: the pairs of a submission of n and of 2n were not about twice each other, so those times are rough.");
+  return lines;
+}
+
 /**
  * T151: the GPU section's table of tokens generated on the GPU (public/shaders.js's EMBED, fusedMatVec and SAMPLE: the
  * sampling on the GPU too, the state carried from token to token there). step: {name, result: {model, layers, vocab,
@@ -632,6 +702,15 @@ export function gpuSummary(steps, baseline = {}, gpu = {}) {
     one && most && `generated ${number(one.msPerToken, 2)} ms a token one a submission, ${number(most.msPerToken, 2)} with ${most.perSubmission}` +
       (none || samplingWrong ? "" : ` (${times(one.msPerToken / most.msPerToken)})`)].filter(Boolean);
   if (layerParts.length) lines.push(`GPU, ${layerParts.join("; ")}`);
+  // T202: where the time of the fastest layer the steps' table broke down goes
+  const split = find("the steps of a layer")?.result;
+  const splitForm = (split?.forms ?? []).filter((form) => stepMs(form) !== undefined && !form.unsteady && !(check?.[form.check] && !check[form.check].ok))
+    .sort((x, y) => x.ms - y.ms)[0];
+  if (splitForm && !none) {
+    const parts = layerSplit(split, splitForm), two = (value) => (value === undefined ? "?" : number(value, 2));
+    lines.push(`GPU, where the time of a layer ${splitForm.form} goes: ${two(parts.layer)} ms, the matrices alone ${two(parts.alone)}, their writes ${two(less(parts.matrices, parts.alone))}, ` +
+      `the attention ${two(parts.attention)}, the norms and quantizing ${two(parts.small)}, the chain ${two(parts.chain)}`);
+  }
   const prompt = find("a prompt all at once")?.result;
   const promptTokens = Math.max(0, ...(prompt?.rows ?? []).filter((row) => row.tokens).map((row) => row.tokens));
   const fastestPrompt = (prompt?.rows ?? []).filter((row) => row.tokens === promptTokens && !row.again && row.msPerToken > 0 && !(check?.[row.shader] && !check[row.shader].ok))

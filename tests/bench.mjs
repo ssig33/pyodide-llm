@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, PASTE, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, gpuSummary, lineSummary,
          loginUrl, parseReport, reportBody, shortReport, storageSummary,
-         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, threadsLine, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerCheckNumbers, layerStepsTable, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, threadsLine, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -258,6 +258,64 @@ assert.equal(fasterOf(layerTable(layerStep, layerWrong), "DP4A, fused (T175)"), 
 assert.ok(layerTable(layerStep, layerWrong).some((line) => line.startsWith("| DP4A, fused (T175) (WRONG in the check) |")));
 // the separate steps WRONG: nothing right to hold the fused one against
 assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, DP4A, separate steps": { ok: false } }), "DP4A, fused (T175)"), "");
+
+// T202: where a layer's time goes. The times are multiples of 1/64 ms, so that every sum below is exact: the fused
+// form's steps sum to 3.25 ms (matrices 2.75, attention 0.25, norms and quantizing 0.25), its layer 3.5 (the chain
+// 0.25), the matrices alone 2.0 (their writes 0.75); the form with the norms apart sums to 3.375 against a layer of
+// 3.25 (the chain less than nothing, as it can come out)
+const NQ = "the norm with its quantizing (NORM_QUANTIZE)", NORM = "the norm (RMSNORM)", QD = "a vector of 2048 quantized (QUANTIZE)",
+  QH = "a vector of 8192 quantized (QUANTIZE)", QKV = "q, k and v with RoPE and the cache", ATT = "the attention (flash attention's tile)",
+  O = "o with the residual's add", GLU = "gate and up with SwiGLU", DOWN = "down with the residual's add";
+const stepsStep = { name: "the steps of a layer", result: { model: "Llama 3.2 1B", pos: 127, layers: 16, copies: 2, GB: 0.0684, dp4a: true,
+  forms: [
+    { form: "DP4A, fused (T175), the norms apart", check: "a layer, DP4A, fused (T175), the norms apart", normApart: true, dispatches: 11, ms: 3.25, n: 8,
+      steps: [[NORM, 2], [QD, 3], [QKV, 1], [ATT, 1], [O, 1], [GLU, 1], [QH, 1], [DOWN, 1]].map(([step, count]) => ({ step, count })) },
+    { form: "DP4A, fused (T175)", check: "a layer, DP4A, fused (T175)", normApart: false, dispatches: 9, ms: 3.5, n: 8,
+      steps: [[NQ, 2], [QKV, 1], [ATT, 1], [QD, 1], [O, 1], [GLU, 1], [QH, 1], [DOWN, 1]].map(([step, count]) => ({ step, count })) }],
+  steps: [
+    { step: NORM, kind: "small", ms: 0.0625 }, { step: QD, kind: "small", ms: 0.0625 }, { step: QKV, kind: "matrix", matrix: "qkv", ms: 0.25 },
+    { step: ATT, kind: "attention", ms: 0.25 }, { step: O, kind: "matrix", matrix: "o", ms: 0.25 }, { step: GLU, kind: "matrix", matrix: "gateUp", ms: 1.5 },
+    { step: QH, kind: "small", ms: 0.0625 }, { step: DOWN, kind: "matrix", matrix: "down", ms: 0.75 }, { step: NQ, kind: "small", ms: 0.0625 },
+    { step: "q, k and v alone", kind: "alone", matrix: "qkv", ms: 0.125 }, { step: "o alone", kind: "alone", matrix: "o", ms: 0.125 },
+    { step: "gate and up alone", kind: "alone", matrix: "gateUp", ms: 1.25 }, { step: "down alone", kind: "alone", matrix: "down", ms: 0.5 },
+    { step: "a dispatch of one workgroup (SMALL: a vector of dim added)", kind: "floor", ms: 0.015625 }] } };
+const stepsLines = layerStepsTable(stepsStep, layerRight, layerCeilings);
+const stepsText = stepsLines.join("\n");
+assert.ok(stepsLines.includes(`| ${NQ} | 62.5 |  | 2 × = 125.0 |`), stepsText);
+assert.ok(stepsLines.includes(`| ${QD} | 62.5 | 3 × = 187.5 | 1 × = 62.5 |`), stepsText);
+assert.ok(stepsLines.includes("| gate and up alone | 1250.0 |  |  |"), stepsText);
+assert.ok(stepsText.includes('- "DP4A, fused (T175)", 9 dispatches: the layer 3.50 ms. Its steps one by one 3.25 ms (the matrices with what they write 2.75, ' +
+  "the attention 0.25, the norms and quantizing 0.25); the layer less them, what the chain costs beyond each step alone: 0.25 ms. " +
+  "The matrices alone 2.00 ms (34.2 GB/s, 85.5% of the buffer's reads (40.0 GB/s)); the layer less them, 1.50 ms, is what the matrices' writes add 0.75 " +
+  "+ the attention 0.25 + the norms and quantizing 0.25 + the chain 0.25. A dispatch of one workgroup takes 15.6 µs: 9 of them 0.14 ms."), stepsText);
+assert.ok(stepsText.includes('- "DP4A, fused (T175), the norms apart", 11 dispatches: the layer 3.25 ms. Its steps one by one 3.38 ms'), stepsText);
+assert.ok(stepsText.includes("what the chain costs beyond each step alone: −0.13 ms"), stepsText);
+// every row as wide as the head, nothing undefined, NaN or empty: right, a lost device, a fallback adapter, no check,
+// a step that failed, one unsteady, and a form that failed
+const stepsFailed = { ...stepsStep, result: { ...stepsStep.result, steps: stepsStep.result.steps.map((one) => (one.step === ATT ? { step: ATT, kind: "attention", error: "a | b\nc" } : one)) } };
+const stepsUnsteady = { ...stepsStep, result: { ...stepsStep.result, steps: stepsStep.result.steps.map((one) => (one.step === GLU ? { ...one, unsteady: true } : one)) } };
+const stepsFailedForm = { ...stepsStep, result: { ...stepsStep.result, forms: [stepsStep.result.forms[0], { form: "DP4A, fused (T175)", check: "a layer, DP4A, fused (T175)", error: "refused" }] } };
+for (const [label, lines] of [["right", stepsLines], ["lost", layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" })],
+  ["fallback", layerStepsTable(stepsStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true })], ["no check", layerStepsTable(stepsStep)],
+  ["a step failed", layerStepsTable(stepsFailed, layerRight, layerCeilings)], ["unsteady", layerStepsTable(stepsUnsteady, layerRight, layerCeilings)],
+  ["a form failed", layerStepsTable(stepsFailedForm, layerRight, layerCeilings)]]) {
+  const rowsOf = lines.filter((line) => line.startsWith("|"));
+  assert.equal(rowsOf.length, 2 + stepsStep.result.steps.length, label);
+  for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
+  assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), label);
+}
+// a step that failed says so in its row, and the sums it is in are "?" rather than a number that leaves it out
+const stepsFailedLines = layerStepsTable(stepsFailed, layerRight, layerCeilings);
+assert.ok(stepsFailedLines.includes(`| ${ATT} | failed: a \\| b c | 1 × = ? | 1 × = ? |`), stepsFailedLines.join("\n"));
+assert.ok(stepsFailedLines.join("\n").includes("Its steps one by one ? ms"), stepsFailedLines.join("\n"));
+assert.ok(layerStepsTable(stepsUnsteady, layerRight, layerCeilings).includes(`| ${GLU} | unsteady: 1500.0 | 1 × = 1500.0 | 1 × = 1500.0 |`));
+assert.ok(layerStepsTable(stepsUnsteady, layerRight, layerCeilings).some((line) => line.startsWith("Unsteady:")));
+assert.ok(layerStepsTable(stepsFailedForm, layerRight, layerCeilings).includes('- "DP4A, fused (T175)": failed: refused'));
+// no share of the buffer's reads after a lost device; a form the check found WRONG says so
+assert.ok(!layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" }).join("\n").includes("of the buffer's reads"));
+assert.ok(layerStepsTable(stepsStep, layerRight, layerCeilings, { lost: "lost" }).some((line) => line.includes("the device was lost")));
+assert.ok(layerStepsTable(stepsStep, layerWrong, layerCeilings).join("\n").includes('in "DP4A, fused (T175)" (WRONG in the check), µs a layer'));
+assert.deepEqual(layerStepsTable({ name: "the steps of a layer", error: "no | here" }), ["**Where a layer's time goes**: no \\| here"]);
 const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.form === "llama.cpp, fused (T150)" ? { ...row, unsteady: true } : row)) } };
 assert.ok(layerTable(unsteadyStep, layerRight).includes("| llama.cpp, fused (T150) | 5 | unsteady: 2.10 | 32.6 | 33.6 |  |"));
 // a fallback adapter's few hundredths of a GB/s still show
@@ -457,6 +515,12 @@ const onFallbackAdapter = gpuSummary([{ ...aSteps[0], result: { ...aSteps[0].res
 assert.ok(onFallbackAdapter[0].includes("a fallback adapter: nothing timed") && !onFallbackAdapter.slice(1).join().includes("the CPU)") && !onFallbackAdapter.join().includes("% of"), onFallbackAdapter.join("\n"));
 const afterLost = gpuSummary(aSteps, aBaseline, { lost: "gone" });
 assert.ok(afterLost[0].endsWith("; the device was lost (gone)") && !/\(\d[\d.]*×/.test(afterLost.join()) && !afterLost.join().includes("% of"), afterLost.join("\n"));
+// T202: the summary says where the fastest broken-down layer's time goes (the norms apart: 3.25 ms, its small steps
+// 0.375, its chain −0.125), not after a lost device
+const withSteps = gpuSummary([...aSteps, stepsStep], aBaseline);
+assert.ok(withSteps.includes("GPU, where the time of a layer DP4A, fused (T175), the norms apart goes: 3.25 ms, the matrices alone 2.00, their writes 0.75, " +
+  "the attention 0.25, the norms and quantizing 0.38, the chain -0.13"), withSteps.join("\n"));
+assert.ok(!gpuSummary([...aSteps, stepsStep], aBaseline, { lost: "gone" }).join().includes("where the time"));
 const wrongDp4a = gpuSummary(aSteps.map((s) => (s.name === "the shaders against JavaScript" ? { ...s, result: { ...aCheck, "ORT DP4A small M, 4 rows": { ok: false, worstRelative: 1 }, "ORT DP4A 64×64, subgroups": { ok: false, worstRelative: 1 } } } : s)), aBaseline);
 assert.ok(wrongDp4a[0].includes("the check 18 of 20 ok (ORT DP4A small M, 4 rows WRONG, ORT DP4A 64×64, subgroups WRONG)"), wrongDp4a[0]);
 assert.ok(!wrongDp4a[1].includes("ORT DP4A small M") && !wrongDp4a[3].includes("ORT DP4A 64×64, subgroups"), wrongDp4a.join("\n"));
