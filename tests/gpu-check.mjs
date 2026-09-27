@@ -25,7 +25,7 @@
 //   - T147: a request forward.js gave up on (a GPU that answers late) writes nothing (the made-up model only);
 //   - T187: the scale of the first layer's keys and values against NumPy's (SCALE_LINE, see there);
 //   - the logits of the prompt's last token (the CPU's in both runs, on the GPU's keys and values in one): NumPy's
-//     most likely token or a near tie, and their KL divergence from NumPy's no more than KL_LINE (see there).
+//     most likely token or a near tie (their KL divergence from NumPy's is printed, not held to a line: see there).
 // "synthetic": a made-up int8 model with grouped-query attention (4 heads, 2 of keys and values; none of the models
 // of this directory has it). T153: "synthetic-qwen2", the same with biases of q, k and v (Qwen2's) and an epsilon of
 // 1e-6; "synthetic-qwen3", the norms of every head of q and k (Qwen3's), heads of 32 where dim / heads is 16 (q and
@@ -49,9 +49,10 @@
 // how far NumPy's answer moves when nothing but its cache is rounded to float16 (answer(half=True), T153's review), and
 // for each model a table of the keys and values by layer, a column E16 and one a run (the CPU's, and the GPU's lettered
 // A, B...) against NumPy's, another against NumPy's with its cache in float16, a line a run with its form, its line and
-// the ratio to it, how many E16 it is, its logits against the CPU's and its most likely token, and the seconds of
-// every step. T187: Q8 (NumPy's with the inputs of the layers' matrices in 8 bits as well) beside E16, the first
-// layer's scale, the logits' KL divergence and the difference of the ten most likely.
+// the ratio to it, how many E16 it is and its most likely token, and the seconds of every step. T187: Q8 (NumPy's
+// with the inputs of the layers' matrices in 8 bits as well) beside E16 and a table against it, the first layer's
+// scale, the logits' KL divergence and the difference of the ten most likely (in place of the logits' ratio to the
+// CPU's).
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -125,16 +126,24 @@ const K = { float32: 4, f16: 8 };
 //     against NumPy's (the packed shaders' against Q8's, whose own scale moves by up to 4.4e-4), sum(g·w) / sum(w·w),
 //     which the rounding of single values leaves at 1 within its noise over thousands of values. |s − 1|: 3.8e-9 to
 //     3.3e-5 as it should be; RMSNorm over n − 1 5.2e-4 to 1.0e-2, LayerNorm's variance over n − 1 5.4e-4 to 7.4e-3.
-//     The line SCALE_LINE: n − 1 goes past it up to a dim of 5000.
-//   - the logits of the prompt's last token (on the CPU in every run, on the GPU's keys and values in the GPU's) by
-//     what sampling sees: the KL divergence of their softmax from NumPy's, and the most likely token NumPy's, or one
-//     NumPy gives at least half the probability of its most likely (a near tie: T147's stories15M at 149 tokens). The
-//     CPU's own 7-bit last token is most of it (the CPU alone: 1.3e-6 to 1.5e-2), and a GPU as it should be is 1.8e-6
-//     to 2.2e-2 (the made-up Qwen2's flat logits the most, the real models 5.2e-4 at most); a wrong bias on Qwen2.5
-//     0.5B 9.3 to 11.7. The line KL_LINE (nats): a check of the whole, which the keys and values' lines make fine.
-//     Printed beside them: the largest difference of the logits of NumPy's ten most likely tokens over NumPy's largest
-//     |logit| (the old measure took all of them: GPT-2's went past on a token some 50 logits below the top).
-const K_PACKED = 2, SCALE_LINE = 1e-4, KL_LINE = 0.05, TIE = Math.LN2;
+//     The line SCALE_LINE: n − 1 goes past it up to a dim of 5000. Only where f32 rounds to f16 to the nearest, as
+//     SwiftShader and lavapipe do (the review, 2026-09-27): WGSL (15.7.6) leaves the direction open, and a GPU that
+//     rounds toward zero shrinks every value, which does not average out. A throwaway branch that truncates the
+//     cache's pack2x16float and the f16 tiles' operands (run 36320147208) read s − 1 = −3.4e-4 to −3.9e-4 on the
+//     float32 and packed shaders and −9.5e-4 to −1.1e-3 on the f16 ones, every model, with every other line held: on
+//     such a GPU this line fails a GPU as it should be (then hold the scale against NumPy's rounded toward zero too,
+//     and the f16 shaders to about 2e-3).
+//   - the logits of the prompt's last token (on the CPU in every run, on the GPU's keys and values in the GPU's): the
+//     most likely token NumPy's, or one NumPy gives at least half the probability of its most likely (a near tie:
+//     T147's stories15M at 149 tokens). Their KL divergence from NumPy's is printed and held to no line (the review,
+//     2026-09-27): the CPU computes that last token with its 7-bit activations, so the KL is the CPU's arithmetic,
+//     not the GPU's. The CPU alone is 9.1e-5 to 9.8e-2 on the made-up models (synthetic-6bit the most), and on keys and
+//     values that are 1.0 E16 (TF.js) synthetic-wide read 0.22 to 0.27 on every job of run 36320963317, where a line
+//     of 0.05 failed it. A wrong bias on Qwen2.5 0.5B reads 9.3 to 11.7, and fails the keys and values' lines 1569
+//     times over and the most likely token as well. Printed beside it: the largest difference of the logits of
+//     NumPy's ten most likely tokens over NumPy's largest |logit| (the old measure took all of them: GPT-2's went past
+//     on a token some 50 logits below the top).
+const K_PACKED = 2, SCALE_LINE = 1e-4, TIE = Math.LN2;
 
 // ---- Node: the plans and NumPy's answers
 const { pyodide: py } = await pyodideWithEngine();
@@ -654,9 +663,6 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       failures.push(`the first layer's keys and values are scaled by 1 + ${gpuScale.toExponential(2)} and 1 + ${againScale.toExponential(2)} of ${name} (line ${SCALE_LINE})`);
     }
     const gpuLogits = logits(gpu.logits), againLogits = logits(gpu.again.logits);
-    if (!(gpuLogits.kl <= KL_LINE) || !(againLogits.kl <= KL_LINE)) {
-      failures.push(`the logits on the GPU's keys and values are KL ${gpuLogits.kl.toExponential(2)} and ${againLogits.kl.toExponential(2)} from NumPy's (line ${KL_LINE})`);
-    }
     if (!near(gpuLogits.token) || !near(againLogits.token)) failures.push(`another most likely token (${gpuLogits.token}, ${againLogits.token}) than NumPy's ${top}, and not a near tie`);
     console.log(`  ${gpu.form ?? "no form"}, ${gpu.attention ?? "no attention"}: keys and values ${gpuKv.toExponential(2)} (all at once ${againKv.toExponential(2)}, ` +
       `the first layer ${gpuFirst.toExponential(2)} from ${name}, the CPU's ${firstKv(cpu).toExponential(2)}; ${(gpuKv / e16).toFixed(1)} E16, ${(gpuKv / q8).toFixed(2)} Q8), ` +
