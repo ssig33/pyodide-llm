@@ -502,8 +502,8 @@ export function gpuSkipped(why = "") {
  * { threads, how (threadsHow()), perCount (threadsLine()), gpu: { seconds, matrices, attention, lost? } or { why },
  * status (the status line's words of the GPU),
  * rows: [{ what: "prompt" | "generation", tokens, chosen, cpu, gpu }] } where a cell is { speed, low, high, gpuTokens,
- * unsteady }, { same: "cpu" } (one path: timed once) or { skip: why }; or { error }. The writing's GPU cell stays open
- * for T152 (a token on the GPU): the same row, timed where it has a speed. A GPU that stopped while the sides were timed
+ * unsteady }, { same: "cpu" } (one path: timed once) or { skip: why }; or { error }. The writing's GPU cells (T152: the
+ * steps of a generation on the GPU) are timed where the GPU takes them, else the reason. A GPU that stopped while the sides were timed
  * (gpu.lost) leaves no ratio anywhere: its later times are no GPU's (T157). */
 export function pathTable(paths, name = "") {
   const title = `**The model page's path**${name ? ` (${name})` : ""}`;
