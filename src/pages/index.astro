@@ -885,7 +885,10 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       ], used.temperature ? used.seed : undefined);
     } else if (data.type === "error") {
       // the console keeps where it happened, for a failed run's record (T82's artifacts, T96)
-      console.error(`worker error (weights memory ${data.weights} bytes):`, data.stack);
+      // (T156's review: the worker's word that it loads a model on the GPU alone again on the CPU is no error of its own,
+      // and has no memory or stack to say: tests/e2e.mjs counted it as a console error)
+      if (data.reloading) console.warn(data.message);
+      else console.error(`worker error (weights memory ${data.weights} bytes):`, data.stack);
       benchmarking = false;  // a round that failed ends the benchmark: the run button must not stay off (the review of T76)
       // Pyodide that never finishes loading under the service worker (iOS Safari, 2026-09-25: its NumPy step): once,
       // the page goes on without the worker, which is the one-core version the site runs on anyway (policy 6)
