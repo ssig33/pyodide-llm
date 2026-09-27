@@ -1890,6 +1890,14 @@ class Conversion:
         self = cls.__new__(cls)
         self.config = config
         check_config(normalize(config))  # a GPT-2's is in config.json's own spelling (T136's third stage)
+        for token in ("bos", "eos"):
+            # the review of T203: every text begins with the BOS, and the answer stops at it and at the EOS (start()).
+            # A GGUF that names none would have tokens 1 and 2 there, '"' and '#' of a byte-level BPE vocabulary:
+            # unsloth's Qwen3 GGUFs name no BOS, and every answer ended at its first lone '"'. The list takes those
+            # with their original's config.json (gguf_weights), whose BOS is the original's
+            if not isinstance(metadata.get(f"tokenizer.ggml.{token}_token_id"), int):
+                raise ValueError(f"This GGUF names no {token.upper()} token, which the engine needs: open it with its "
+                                 f"original's vocabulary and config.json.")
         if not callable(dtype):
             check_dtype(dtype)
         self.tokenizer, options, tokenizer_config, specials = gguf_tokenizer(metadata, config["vocab_size"])

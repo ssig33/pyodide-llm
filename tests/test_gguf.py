@@ -51,10 +51,10 @@ def gguf_name(name):
     return f"blk.{layer}.{LAYER['.'.join(rest[:-1])]}.{rest[-1]}"
 
 
-def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=10000.0, more=(), extra=None):
+def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=10000.0, more=(), extra=None, bos=1, eos=2):
     """A GGUF v3 of these Hugging Face tensors, and the tensors as the GGUF holds them (Q8_0 rounds).
     more: further metadata (key, GGUF type, value); extra: {GGUF name: float32 values} written as they are
-    (rope_freqs.weight)."""
+    (rope_freqs.weight). bos, eos: None leaves the token out (unsloth's Qwen3 GGUFs name no BOS)."""
     string = lambda text: struct.pack("<Q", len(text.encode())) + text.encode()
     heads = {"q_proj": published["num_attention_heads"], "k_proj": published["num_key_value_heads"]}
     metadata = [("general.architecture", 8, arch), (f"{arch}.block_count", 4, published["num_hidden_layers"]),
@@ -64,8 +64,9 @@ def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=1
                 (f"{arch}.attention.head_count", 4, published["num_attention_heads"]),
                 (f"{arch}.attention.head_count_kv", 4, published["num_key_value_heads"]),
                 (f"{arch}.rope.freq_base", 6, theta), ("tokenizer.ggml.model", 8, "gpt2"),
-                ("tokenizer.ggml.pre", 8, pre), ("tokenizer.ggml.bos_token_id", 4, 1),
-                ("tokenizer.ggml.eos_token_id", 4, 2), *more]
+                ("tokenizer.ggml.pre", 8, pre),
+                *[(f"tokenizer.ggml.{key}_token_id", 4, id) for key, id in (("bos", bos), ("eos", eos)) if id is not None],
+                *more]
     tokens = [f"w{i}" for i in range(vocab_size)]
     out = [b"GGUF", struct.pack("<IQQ", 3, len(tensors) + len(extra or {}), len(metadata) + 3)]
     for key, kind, value in metadata:
@@ -285,14 +286,14 @@ def test_a_rope_freqs_table_that_is_not_the_originals_scaling_is_refused():
 
 
 # ---- T203 (T136's fourth stage): a Qwen3, whose GGUF holds q, k and the norms of their heads in Hugging Face's order
-def qwen3_gguf(head_size, eps=1e-6):
+def qwen3_gguf(head_size, eps=1e-6, bos=1, eos=2):
     from test_qwen3 import qwen3
     config, weights = synthetic_weights(n_kv_heads=2, head_size=head_size)
     tensors, published = qwen3(config, weights, True)
     published["rms_norm_eps"] = eps
     # llama.cpp writes the size of a head as the length of a key, whatever it is, and always the epsilon
     more = [("qwen3.attention.key_length", 4, config["head_size"]), ("qwen3.attention.layer_norm_rms_epsilon", 6, eps)]
-    file, same = gguf_file(tensors, published, config["vocab_size"], "qwen3", pre="qwen2", more=more)
+    file, same = gguf_file(tensors, published, config["vocab_size"], "qwen3", pre="qwen2", more=more, bos=bos, eos=eos)
     return config, published, file, same
 
 
@@ -326,6 +327,19 @@ def test_a_qwen3_gguf_alone_converts_to_the_checkpoint_of_the_same_values(head_s
     assert bytes(conversion.checkpoint) == converted(Safetensors(reader(safetensors_file(same))), published, "int8")
     assert conversion.options["qk_norm"] is True and conversion.options.get("head_dim") == (head_size or None)
     assert conversion.options["rms_norm_eps"] == pytest.approx(1e-6)
+
+
+@pytest.mark.parametrize("token", ["bos", "eos"])
+def test_a_gguf_alone_that_names_no_bos_or_eos_is_refused(token):
+    """The review of T203: unsloth's Qwen3 GGUFs name no BOS (add_bos_token false, no bos_token_id). Alone, the
+    conversion took token 1 for it and stopped at it: '"' of a byte-level BPE vocabulary, every answer cut at its first
+    lone one. The list takes them with their original's config.json, whose BOS and EOS it has, as before."""
+    config, published, file, same = qwen3_gguf(16, **{token: None})
+    with pytest.raises(ValueError, match=f"names no {token.upper()} token"):
+        fed(file, "int8")
+    published = {**published, "bos_token_id": 5, "eos_token_id": 6}
+    got = with_original(file, published, unigram(config["vocab_size"]), "tokenizer.json", "int8")
+    assert got.options["bos"] == 5 and got.options["stop_tokens"] == [5, 6]
 
 
 @pytest.mark.parametrize("change, what", [
