@@ -202,7 +202,7 @@ export function cpuTable(r) {
     "for each group of 32 weights a tile loads the four rows' weights once for the four tokens and the four tokens' activations once for the four rows, " +
     "32 relaxed_dots on 16 loads of data (and 12 of scales and corrections), where the loop below loads two for each dot. " +
     "So a prompt can pass 100% of that loop. Its bound lies between that loop and relaxed_dot on registers alone, " +
-    "and below the second by the tile's own work: each row, token and group's sum is turned, scaled and added (on arm64, 32 of the 108 vector instructions a tile spends on a group are dots).", "",
+    "and below the second by the tile's own work: each row, token and group's sum is turned, scaled and added (on arm64, 32 of the 96 vector instructions a tile spends on a group are dots).", "",
     "| software threads | ms a token | GB/s | tok/s | ms a token of a prompt, 16 at once | G MAC/s of the prompt |", "|---:|---:|---:|---:|---:|---:|",
     ...r.rows.map((row) => (row.none ? `| ${row.asked} | ${tableCell(row.none)} | | | | |`
       : `| ${row.threads} | ${number(row.msPerToken)} | ${number(row.GBps)}${share(read(row), readAt(row.threads))} | ${number(1000 / row.msPerToken)} | ` +
