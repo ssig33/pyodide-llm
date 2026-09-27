@@ -205,6 +205,14 @@ for size in (fast.vocab_size, fast.vocab_size - 3):
         single = np.full(size, -100.0, dtype=np.float32)
         single[where] = 5.0
         assert fast.sample(single, 0.7, 0.9, generator) == where, (size, where)
+# a maximum left out shows only where exp() overflows (softmax does not care what is taken away from all the logits):
+# two tokens far above the rest, in the same lane of the same one of the four maxima (16 apart), drawn with two
+# random numbers that both land on the more probable one (its share is 1 / (1 + 1/e) = 0.73)
+for first in range(4, 20):
+    pair = np.zeros(fast.vocab_size, dtype=np.float32)
+    pair[first], pair[first + 16] = 300.0, 299.0
+    for value in (0.3, 0.6):
+        assert fast.sample(pair, 1.0, 0.9, Fixed(value)) == first, (first, value)
 # T178: a few tokens above the floor and a low top-p (count * topp < 1): llama2.c's cutoff (1 - topp) / (count - 1)
 # was above all of them, and the kernel drew a word from outside the vocabulary, NumPy an IndexError. The nucleus is
 # the most probable token alone (the others add up to less than 1 - topp)
