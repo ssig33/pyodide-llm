@@ -419,7 +419,7 @@ def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0, sp
             part, head = divmod(first // size, split_heads)
             source = (head * 3 + part) * size
             moved = hf.rows(target, source, source + size).reshape(size, *shape[1:]).astype(np.float32)
-            if not order:
+            if not order and source != first:  # the first head's q is where it is in either order: not that block
                 order = "split (q, k, v)" if relative(values, moved) < relative(values, original) else "as Hugging Face"
             if order.startswith("split"):
                 original = moved
