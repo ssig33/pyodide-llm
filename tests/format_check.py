@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -51,14 +52,16 @@ KNOWN = {
     "hf-rakutenai-2.0-mini-instruct": {"why": "no dummy space before the first piece (T131)", "first_piece": True},
     # the page asks for the answer's channel at the end of the format (T132): the real text with it is the page's
     "hf-llm-jp-4-8b-instruct": {"why": "the page ends with <|channel|>final<|message|> (T132)",
-                                "text": lambda text: text + "<|channel|>final<|message|>"},
+                                "text": lambda text, prompt: text + "<|channel|>final<|message|>"},
     # the list's own ChatML has no system turn; the real template writes its default one
     "hf-smollm2-135m-instruct": {"why": "the list's ChatML, without the default system turn",
-                                 "text": lambda text: re.sub(r"^<\|im_start\|>system\n.*?<\|im_end\|>\n", "", text, flags=re.S)},
+                                 "text": lambda text, prompt: re.sub(r"^<\|im_start\|>system\n.*?<\|im_end\|>\n", "", text, flags=re.S)},
     # tokenizer.model's NFKC where the real tokenizer.json has none (the page follows the former), and the template
-    # strips the whole turn, which trims only the end of what was typed (T138)
+    # strips the whole turn, which trims only the end of what was typed where the page trims both ends (T138). T192:
+    # the real text with those two done to it must be the page's, so that another break in those prompts still shows
+    # (the two prompts were taken out whole before)
     "hf-swallow-ms-7b-instruct": {"why": "NFKC of tokenizer.model, and the turn stripped as a whole (T138)",
-                                  "prompts": {"  leading and trailing spaces  ", "ＡＢＣ１２３ｶﾀｶﾅ①"}},
+                                  "text": lambda text, prompt: unicodedata.normalize("NFKC", trimmed(text, prompt))},
 }
 # The reference of a GGUF that has its own vocabulary: the original at the revision the list had before the GGUF
 # (T136's first stage; T144). A GGUF with the original's vocabulary (hf.vocabulary, T136's second stage) says its own.
@@ -237,7 +240,7 @@ def main():
             matches = lambda real: page == real or page[1:] == real
             if matches(real):
                 same += 1
-            elif "text" in known and matches(encoded(known["text"](text))) or prompt in known.get("prompts", ()):
+            elif "text" in known and matches(encoded(known["text"](text, prompt))):
                 explained += 1
             elif known.get("first_piece") and first_piece(reference.convert_ids_to_tokens(page[1:]),
                                                           reference.convert_ids_to_tokens(real)):
@@ -259,6 +262,15 @@ def main():
     if failed:
         print(f"{len(failed)} differ beyond what KNOWN says: {' '.join(failed)}")
     sys.exit(1 if failed or stale else 0)
+
+
+def trimmed(text, prompt):
+    """The real text with what was typed trimmed at both ends, as the page's {prompt:trim} writes it (T192): the real
+    template strips the whole turn, which leaves the start of what was typed as it was."""
+    for typed in (prompt, prompt.rstrip(), prompt.lstrip()):
+        if typed and typed in text:
+            return text.replace(typed, prompt.strip(), 1)
+    return text
 
 
 def first_piece(page, real):
