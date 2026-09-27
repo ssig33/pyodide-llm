@@ -2508,7 +2508,10 @@ export function samplingSettings({ vocab, temperature, topp, penalty = 1, stops 
 }
 
 // the token's row of the embedding (int8, groups of 32 with a float32 scale each, 4 to a u32) into the stream x.
-// Bindings: 0 the table, 1 its scales, 2 the state (its token), 3 x, 4 the row's width (x of a vec4)
+// Bindings: 0 the table, 1 its scales, 2 the state (its token), 3 x, 4 the row's width (x of a vec4). T209: a table in
+// pieces of rows (past what the device binds: Llama 3.2 3B's 394 MB on the owner's Android, which binds 256 MiB) is
+// one dispatch a piece, y its first row and z its rows: the piece that holds the token writes its row, the others
+// nothing (z 0: the whole table, as before). llama.cpp's get_rows reads one table; the range is ours (T209)
 export const EMBED = /* wgsl */ `
 ${STATE}
 @group(0) @binding(0) var<storage, read> table: array<u32>;
@@ -2525,7 +2528,10 @@ fn get_byte_i32(value: u32, index: u32) -> i32 {
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let n = shape.x;
     let words = n / 4u;
-    let row = state.token;
+    let row = state.token - shape.y;
+    if (shape.z != 0u && row >= shape.z) {
+        return;
+    }
     for (var word = lid.x; word < words; word += 256u) {
         let q_packed = table[row * words + word];
         let d = scales[(row * n + word * 4u) / 32u];

@@ -163,7 +163,7 @@ async function start(memory, plan) {
     const g = model.gen;
     postMessage({ type: "ready", adapter: describe(adapter), key, bytes, seconds: (performance.now() - began) / 1000,
       form: model.form.name, attention: model.attention.name, forms: model.forms, remembered: Boolean(model.form.remembered), blocks,
-      tokens: g?.form ? { form: g.form.name, ms: g.ms, forms: g.forms, remembered: g.forms.some((f) => f.remembered) } : null,
+      tokens: g?.form ? { form: g.form.name, ms: g.ms, forms: g.forms, remembered: g.forms.some((f) => f.remembered), pieces: model.tables.classifier.length } : null,
       tokensWhy: plan.tokens ? model.tokensWhy ?? null : undefined });
   } catch (error) {
     unusable(String(error?.message ?? error));
@@ -358,8 +358,8 @@ async function upload(m) {
 // w1, is 68 MB): llama.cpp's WebGPU keeps each tensor in one buffer within maxStorageBufferBindingSize and refuses a
 // larger one (ggml-webgpu.cpp, ggml_backend_webgpu_buffer_type_get_max_size, commit 2145525a, MIT; no line copied),
 // where this cuts it by rows, as T94's design had it for a classifier past a buffer
-function piecesOf(m, rows, n) {
-  const bytes = Math.min(m.limit, m.plan.force.pieceBytes ?? Infinity), align = m.device.limits.minStorageBufferOffsetAlignment / 4;
+function piecesOf(m, rows, n, most = m.plan.force.pieceBytes) {
+  const bytes = Math.min(m.limit, most ?? Infinity), align = m.device.limits.minStorageBufferOffsetAlignment / 4;
   if (rows * n <= bytes) return [[0, rows]];
   const step = Math.floor(bytes / n / align) * align;
   if (!step) throw new Error(`${align} rows of ${n} weights are more than a buffer of this GPU (${bytes} bytes)`);
@@ -374,8 +374,8 @@ const tablesOf = (plan) => ({ classifier: plan.tokens.classifier, ...(plan.token
 // and each matrix's range of them (homes: its offsets in bytes), which the prompt's tiled shaders bind as a matrix of
 // its own. A range must start where the device binds a buffer (minStorageBufferOffsetAlignment: a matrix of a
 // multiple of 2048 weights, the values and the scales alike at 256; stories15M's k starts at 82944 weights, T150's
-// (b)), and a matrix a token reads must be one piece (T155), as must the tables. null where it cannot, and why in
-// m.tokensWhy: the prompts go on the GPU as before, the tokens stay on the CPU
+// (b)), and a matrix a token reads must be one piece (T155). The tables may be in pieces (T209: uploadTokens). null
+// where it cannot, and why in m.tokensWhy: the prompts go on the GPU as before, the tokens stay on the CPU
 function tokensLayout(m) {
   const { plan } = m, align = m.device.limits.minStorageBufferOffsetAlignment, group = m.wgsl.GROUP;
   const why = (reason) => {
@@ -399,26 +399,27 @@ function tokensLayout(m) {
     if (values > m.limit) return why(`${names.join(" and ")} together are past a buffer of this GPU`);
     sizes[joined] = [values, scales];
   }
-  for (const [name, { rows, n }] of Object.entries(tablesOf(plan))) {
-    if (rows * n > m.limit) return why(`the ${name} is past a buffer of this GPU`);
-  }
   return { homes, sizes };
 }
 // T152: the tables onto the GPU (int6 widened as a layer's matrices are), the final norm's weights, and RoPE's table
 // of every position, a row a position: the cos of its headSize / 2 angles, then their sin (shaders.js's fusedMatVec
 // reads it so, T151; from the CPU's two tables, Llama 3's scaling in them)
+// T209: a table in pieces of rows where it is past what the device binds (piecesOf: Llama 3.2 3B's classifier is
+// 394 MB, the owner's Android binds 256 MiB; T152's review (e)), [{ first, rows, values, scales }] each. The
+// classifier is then a dispatch a piece into its range of the logits, and EMBED one a piece (tokenPass)
 async function uploadTokens(m, widen) {
   const { plan } = m, group = m.wgsl.GROUP, half = plan.headSize / 2;
   let bytes = 0;
-  const table = ({ rows, n, six, at: [valuesAt, scalesAt] }) => {
-    const valueBytes = rows * n, scaleBytes = (valueBytes / group) * 4;
-    const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
-    if (six) widen.into(values, valuesAt, valueBytes / group);
-    else copyIn(m, values, valuesAt, valueBytes);
-    copyIn(m, scales, scalesAt, scaleBytes);
-    bytes += valueBytes + scaleBytes;
-    return { values, scales };
-  };
+  const table = ({ rows, n, six, at: [valuesAt, scalesAt] }) =>
+    piecesOf(m, rows, n, plan.force.tablePieceBytes ?? plan.force.pieceBytes).map(([first, count]) => {
+      const valueBytes = count * n, scaleBytes = (valueBytes / group) * 4;
+      const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
+      if (six) widen.into(values, valuesAt + (first * n * 3) / 4, valueBytes / group);
+      else copyIn(m, values, valuesAt + first * n, valueBytes);
+      copyIn(m, scales, scalesAt + (first * n / group) * 4, scaleBytes);
+      bytes += valueBytes + scaleBytes;
+      return { first, rows: count, values, scales };
+    });
   const classifier = table(plan.tokens.classifier);
   m.tables = { classifier, embedding: plan.tokens.embedding ? table(plan.tokens.embedding) : classifier };
   m.finalNorm = buffer(m, plan.dim * 4, STORAGE | COPY_DST);
@@ -979,9 +980,9 @@ async function tokenBuffers(m) {
   new Uint32Array(flash, 0, 2).set([plan.heads, plan.kvHeads]);
   new Float32Array(flash, 8, 1)[0] = 1 / Math.sqrt(plan.headSize);
   const layers = [...Array(plan.layers)].map((_, l) => l * plan.dim);
-  g.u = { embed: uniform(m, new Uint32Array([plan.dim, 0, 0, 0])), flash: uniform(m, flash), o: params(plan.dim, qDim), down: params(plan.dim, plan.hidden),
+  g.u = { embed: m.tables.embedding.map((piece) => uniform(m, new Uint32Array([plan.dim, piece.first, piece.rows, 0]))), flash: uniform(m, flash), o: params(plan.dim, qDim), down: params(plan.dim, plan.hidden),
     qkv: layers.map((at) => params(qDim + 2 * kvDim, plan.dim, 0, at)), gateUp: layers.map((at) => params(plan.hidden, plan.dim, plan.hidden, at)),
-    norm: layers.map(norm), final: norm(0), classifier: params(vocab, plan.dim),
+    norm: layers.map(norm), final: norm(0), classifier: m.tables.classifier.map((piece) => params(piece.rows, plan.dim)),
     // QUANTIZE's (n, xStride): the attention's output, SwiGLU's
     quantizeAttention: uniform(m, new Uint32Array([qDim, qDim, 0, 0])), quantizeGate: uniform(m, new Uint32Array([plan.hidden, plan.hidden, 0, 0])),
     quantizeNormed: uniform(m, new Uint32Array([plan.dim, plan.dim, 0, 0])) };
@@ -1008,7 +1009,9 @@ function tokenPass(m, form, { from = 0, to = m.plan.layers, head = true, embed =
       : [[P.normQuantize, bindAt(m, P.normQuantize, [[0, g.h], [1, weights], [2, g.xq], [3, g.xs], [4, params], [5, g.step]]), 1, 1]]);
   const quantized = (x, params, n) => (form.dp4a
     ? [[m.quantize, bindAt(m, m.quantize, [[0, x], [1, g.xq], [2, g.xs], [3, params], [4, g.step]]), Math.ceil(n / wgsl.GROUP / 64), 1]] : []);
-  const list = embed ? [[g.embed, bindAt(m, g.embed, [[0, m.tables.embedding.values], [1, m.tables.embedding.scales], [2, g.state], [3, g.h], [4, g.u.embed]]), 1, 1]] : [];
+  // (T209: a dispatch a piece of the table, each writing the row where the token is in its rows)
+  const list = !embed ? [] : m.tables.embedding.map((piece, i) =>
+    [g.embed, bindAt(m, g.embed, [[0, piece.values], [1, piece.scales], [2, g.state], [3, g.h], [4, g.u.embed[i]]]), 1, 1]);
   for (let l = from; l < to; l++) {
     const { qkv, gateUp } = m.joined[l], [o] = m.matrices.wo.pieces, [down] = m.matrices.w2.pieces;
     list.push(...normed(V.attention, g.u.norm[l]),
@@ -1021,7 +1024,9 @@ function tokenPass(m, form, { from = 0, to = m.plan.layers, head = true, embed =
   }
   if (head) {
     list.push(...normed(m.finalNorm, g.u.final),
-      matrix(P.classifier, [m.tables.classifier.values, m.tables.classifier.scales], read(g.h, m.finalNorm), g.u.classifier, g.vocab, [[5, g.logits]]),
+      // (T209: a piece at a time into its range of the logits: its first row is where the device binds, piecesOf)
+      ...m.tables.classifier.map((piece, i) => matrix(P.classifier, [piece.values, piece.scales], read(g.h, m.finalNorm), g.u.classifier[i], piece.rows,
+        [[5, { buffer: g.logits, offset: piece.first * 4, size: piece.rows * 4 }]])),
       [g.sample, bindAt(m, g.sample, [[0, g.logits], [1, g.probs], [2, g.order], [3, g.state], [4, g.chosen], [5, g.randoms], [6, g.settings]]), 1, 1]);
   }
   return list;

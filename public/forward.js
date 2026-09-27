@@ -1059,6 +1059,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         if (data.tokens) {
           tokensOn = true;
           gpuChosen.tokens = data.tokens.form;
+          gpuChosen.tablePieces = data.tokens.pieces;  // T209: the classifier in pieces past what the device binds
           if (data.tokens.ms !== undefined) steps.gpu(data.tokens.ms);
           tokenStatus = gpuForce.always ? "gpu" : "untimed";
           const kinds = data.tokens.forms.map((f) => `${f.name} ${f.none ?? (f.remembered ? "remembered" : f.ms ? `${f.ms.toFixed(2)} ms` : "untimed")}`).join("; ");

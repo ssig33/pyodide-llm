@@ -423,7 +423,7 @@ try {
         const h = history(before);
         return engine.generateMany(token, pos, h.slice(-64), h.length, count, ...settings, randoms, stops);
       };
-      const out = { form: engine.gpuReady?.tokens, first: ask(tokens[n], n, [], 4) };
+      const out = { form: engine.gpuReady?.tokens, pieces: engine.gpuReady?.tablePieces, first: ask(tokens[n], n, [], 4) };
       if (out.first && out.first.every((id, i) => id === greedy[i])) {
         // the CPU's step, on the keys and values the GPU wrote back; then the GPU's, from the CPU's position up
         engine.forward(greedy[3], n + 4);
@@ -482,7 +482,7 @@ try {
       const logits = engine.logits().slice(), { keys, values } = engine.keysAndValues(0, n);
       const out = { note, ready, form: engine.gpuForm, attention: engine.gpuAttention, promptMs, gpuTokens, logits: b64(logits), keys: b64(keys), values: b64(values) };
       // T152: a generation's steps on the GPU, where this run takes them (steps)
-      if (gpu && steps) out.steps = { ...generation(engine), forced: gpuForce.tokens };
+      if (gpu && steps) out.steps = { ...generation(engine), forced: gpuForce.tokens, cut: Boolean(gpuForce.tablePieceBytes) && plan.vocab_size >= 192 };
       if (gpu) {
         // the same prompt again from position 0, all of it at once (one block of the GPU's): the GPU's keys and values
         // of the first run are written over
@@ -535,8 +535,11 @@ try {
     // T152: every form of a token's layer, forced, where the model's steps go to the GPU (not Qwen's, GPT-2's, GPT-NeoX's
     // yet); in one piece each (a token's layer reads a matrix whole: the first run's pieces, T155, left the steps on
     // the CPU)
+    // T209: the classifier and the embedding in pieces of about a third of the table (as a table past what the device
+    // binds: Llama 3.2 3B's on the owner's Android), so that EMBED's and the classifier's pieces are what the steps read
     if (gpu[0].steps?.planned !== false) {
-      for (const form of tokenForms) gpu.push(await run(openGpu, { matrices: forms[0], quick: true, tokens: form, pieceBytes: Infinity }, undefined, true));
+      const tablePieceBytes = Math.ceil((plan.vocab_size * plan.dim) / 3);
+      for (const form of tokenForms) gpu.push(await run(openGpu, { matrices: forms[0], quick: true, tokens: form, pieceBytes: Infinity, tablePieceBytes }, undefined, true));
     }
     // the attention without subgroups or f16 (the lanes of the workgroup stand for a subgroup), where the adapter
     // has them and so chose the other
@@ -929,7 +932,9 @@ function stepsRight(c, steps, { e16s, q8s, kvDim, prompt }) {
     failures.push(`sampled at 0.02 and 0.98: ${low?.[0]} and ${high?.[0]}, of NumPy's nucleus of ${walk.tokens.length}, which are to differ`);
   }
   said.push(`sampled ${low?.[0]} and ${high?.[0]}`);
-  console.log(`  a token by ${steps.form}: ${said.join(", ")}${failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""}`);
+  // T209: the tables were cut where the run asked for it (a vocabulary of 192 rows or more is 3 pieces of 64)
+  if (steps.cut && !(steps.pieces > 1)) failures.push(`the tables in ${steps.pieces} piece, not cut`);
+  console.log(`  a token by ${steps.form}${steps.pieces > 1 ? ` (the tables in ${steps.pieces} pieces)` : ""}: ${said.join(", ")}${failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""}`);
   return !failures.length;
 }
 
