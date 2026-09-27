@@ -235,8 +235,8 @@ const generateStep = { name: "tokens generated on the GPU", result: { model: "Ll
   sampling: { vocab: 128256, msEach: 0.31, over: 5114, flat: { msEach: 1.2, over: 128256, unsteady: true } } } };
 const generateRight = { sampling: { ok: true }, "tokens on the GPU": { ok: true } };
 const generateLines = generateTable(generateStep, generateRight);
-assert.ok(generateLines.includes("| 1, each read back as it comes | 14.20 | 5.10 |  |"), generateLines.join("\n"));
-assert.ok(generateLines.includes("| 16, read back once | 9.40 | 4.80 | 1.5× |"), generateLines.join("\n"));
+assert.ok(generateLines.includes("| 1, each read back as it comes | 14.20 | 5.10 | 5.10 |  |"), generateLines.join("\n"));
+assert.ok(generateLines.includes("| 16, read back once | 9.40 | 4.80 | 0.30 | 1.5× |"), generateLines.join("\n"));
 assert.ok(generateLines.at(-1).includes("9.10 ms") && generateLines.at(-1).includes("0.310 ms (5114 tokens over the floor)"), generateLines.at(-1));
 assert.ok(generateLines.at(-1).includes("on flat logits, unsteady: 1.200 ms (128256 tokens over the floor)."), generateLines.at(-1));
 assert.ok(generateTable({ ...generateStep, result: { ...generateStep.result, sampling: { vocab: 128256, msEach: 0.31 } } }, generateRight).at(-1).endsWith("0.310 ms."));
@@ -252,7 +252,7 @@ for (const [label, lines] of [["right", generateLines], ["lost", generateTable(g
   }
 }
 const noisy = { ...generateStep, result: { ...generateStep.result, rows: [generateStep.result.rows[0], { perSubmission: 8, msPerToken: 9.0, fixedMs: -0.8 }] } };
-assert.ok(generateTable(noisy, generateRight).includes("| 8, read back once | 9.00 | under the noise | 1.6× |"), generateTable(noisy, generateRight).join("\n"));
+assert.ok(generateTable(noisy, generateRight).includes("| 8, read back once | 9.00 | under the noise | under the noise | 1.6× |"), generateTable(noisy, generateRight).join("\n"));
 assert.ok(generateTable(generateStep, { ...generateRight, "tokens on the GPU": { ok: false } }).some((line) => line.startsWith("| 4, read back once (WRONG in the check) |")));
 assert.ok(generateTable(generateStep, generateRight, { fallback: true }).some((line) => line.includes("none on a fallback adapter")));
 assert.equal(generateTable({ name: "x", error: "a | b" })[0], "**Tokens generated on the GPU**: a \\| b");

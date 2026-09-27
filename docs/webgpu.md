@@ -90,7 +90,9 @@ say only that the shaders are right, not how fast a GPU is.
 ## Next
 
 In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
-GPU with the CPU's random numbers so that a seed gives the same text, is in the benchmark); then Qwen2 and Qwen3, GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
+GPU with the CPU's random numbers, is in the benchmark: a seed gives the same text again on the same device and the
+same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
+activations to 7 or 8 bits)); then Qwen2 and Qwen3, GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
 instead of twice. The tasks are in [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself

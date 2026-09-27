@@ -1340,8 +1340,9 @@ function madeUpLogits(vocab, spread, peaks = 20) {
 // penalizeLikeCpu, which tests/smoke.mjs holds to the kernel): the same logits, history and random number must pick
 // the same token. Where a float32 sum in another order moves a border, a token next to it is as right: the token
 // passes when it is what the CPU picks, or where the CPU's walk (walkLikeCpu, with top-p as it is and moved by EDGE)
-// passes it within EDGE of the mass of the random number's share (a relative 1e-4: a wrong border moves the draw by a
-// token's probability, 1e-3 of the mass or more), or a token of the same logit (equal probabilities, which the CPU
+// passes it within EDGE of the mass of the random number's share (a relative 1e-4: about 3 times the worst the GPU's
+// float32 sums and exp() can be off by, 501 × 2^-24 ≈ 3.0e-5 of a thread's run and 3.3e-5 with the rest; a wrong
+// border moves the draw by a token's probability, 1e-3 of the mass or more), or a token of the same logit (equal probabilities, which the CPU
 // takes in no set order); temperature 0 (the most likely token): the first index of the largest logit and, where
 // logits come from the GPU's own forward pass, any within `band` of it (and of a token acceptable otherwise). The
 // count of tokens that passed by an edge only is in the verdict.
@@ -1477,14 +1478,18 @@ async function checkSampling() {
         judge(c, logits, history, [random], await sampled(c, logits, history, [random], 1));
         postMessage({ alive: true });
       }
-      // runs: the i-th random number for the i-th token, and a stop token (the run's third token, taken again)
+      // runs: the i-th random number for the i-th token, and a stop token (the run's third token, taken again), second
+      // of two and last of eight: the settings hold the stop tokens four to a vec4, and the list's models have up to
+      // five (sarashina2.2, CAT-Translate, llm-jp-4: T151's review)
       for (const vocab of [1003, 128256]) {
         const c = { vocab, spread: 1, topp: 0.9, temperature: 0.7, penalty: 1.3 }, logits = madeUpLogits(vocab, 1, 40);
         const history = [...Array(20)].map(() => (Math.random() * vocab) | 0), draws = [0.05, 0.95, 0.5, 0.25];
         const got = await sampled(c, logits, history, draws, 4);
         judge(c, logits, history, draws, got);
         const stop = got.ids[2];
-        judge(c, logits, history, draws, await sampled(c, logits, history, draws, 4, [123456, stop]), [123456, stop]);
+        for (const stops of [[NOT_A_TOKEN, stop], [...Array(WGSL.STOPS_MOST - 1)].map((_, i) => NOT_A_TOKEN + i).concat(stop)]) {
+          judge(c, logits, history, draws, await sampled(c, logits, history, draws, 4, stops), stops);
+        }
       }
     });
   } catch (error) {
@@ -1495,6 +1500,8 @@ async function checkSampling() {
   return { worstRelative: 0, ok: wrong === 0, tokens: checked, edge, ...(problems.length ? { problems: problems.slice(0, 3) } : {}) };
 }
 const SENTINEL_ID = 0xdeadbeef;
+// stop tokens past any vocabulary: the list's before the one that stops the run
+const NOT_A_TOKEN = 200000;
 // The check of a run of tokens on the GPU (T151): the check's small model (two layers of 256, 4 heads of 64 and 2 of
 // K and V, a vocabulary of 1003) generates 6 tokens in one submission from position 5, greedy and sampled (top-p 0.9,
 // the penalty), and each token is held to what the CPU's sampling picks from the logits of the same forward pass in
@@ -1576,10 +1583,11 @@ async function checkGeneration() {
         }
         if (got.state[5] !== count || got.state[1] !== pos + count || got.state[7] !== 0) problems.push(`T ${settings.temperature}: the state ${[...got.state.subarray(0, 8)].join(" ")}`);
         if (settings.temperature) {
-          // the fourth token a stop token (where it is not among the first three)
+          // the fourth token a stop token (where it is not among the first three), sixth in the list of stop tokens
           const stop = got.ids[3];
           if (!got.ids.subarray(0, 3).includes(stop)) {
-            const again = await runOnce([stop]);
+            // the stop token sixth of six (in the second vec4 of the settings)
+            const again = await runOnce([...Array(5)].map((_, i) => NOT_A_TOKEN + i).concat(stop));
             const same = again.ids.subarray(0, 4).every((id, k) => id === got.ids[k]);
             if (!same || again.state[5] !== 4 || again.state[7] !== 1 || again.state[1] !== pos + 3) {
               problems.push(`a stop token: ${[...again.ids.subarray(0, 4)].join(" ")} against ${[...got.ids.subarray(0, 4)].join(" ")}, the state ${[...again.state.subarray(0, 8)].join(" ")}`);

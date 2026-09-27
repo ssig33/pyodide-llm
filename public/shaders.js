@@ -2019,6 +2019,8 @@ ${rope ? `    // a pair of neighbouring rows a thread: q's turned into q; k's tu
 // (https://github.com/mlc-ai/mlc-llm, commit 9fa644f5, 2026-08-17), and from the sampling of WebLLM
 // (https://github.com/mlc-ai/web-llm, src/llm_chat.ts) and Apache TVM (python/tvm/relax/frontend/nn/op.py,
 // https://github.com/apache/tvm, commit e0ed4aad), under the Apache License, Version 2.0. Changed as described above.
+// Copyright (c) 2023-2025 by MLC LLM Contributors (MLC LLM's NOTICE)
+// Copyright 2019-2023 The Apache Software Foundation (Apache TVM's NOTICE)
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
@@ -2456,10 +2458,14 @@ export function walkLikeCpu(logits, temperature, topp) {
   const probs = [], index = [];
   for (let i = 0; i < n; i++) {
     if (logits[i] >= lowest) {
-      probs.push(f(Math.exp(f(f(logits[i] - best) * inverse))));
+      probs.push(f(f(logits[i] - best) * inverse));
       index.push(i);
     }
   }
+  // kernel.ts's exp(): four at a time (vexp) holds x at -87 at least, the last count % 4 one by one (fexp) are 0 under
+  // it. Only a random number of 0 draws such a token (tests/smoke.mjs found one: T151's review round)
+  const simd = probs.length - (probs.length % 4);
+  probs.forEach((x, k) => (probs[k] = x < -87 ? (k < simd ? f(Math.exp(-87)) : 0) : f(Math.exp(x))));
   let total = 0;
   for (const p of probs) total += p;
   let order = probs.map((_, k) => k), last = probs.length - 1;
