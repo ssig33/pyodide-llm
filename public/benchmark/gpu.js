@@ -1053,6 +1053,13 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
 // eps under LAYER_LINE; the timing keeps EPS). Larger channels (±60) make the attention's softmax steep enough that a
 // key or value of the position rounded the other way in float16 moves the stream by up to 2e-4 (lavapipe, 2026-09-27);
 // at ±30 both forms stay within 1e-6 over 45 draws
+// T175 (Fable): the stream's first group of 32 is all zeros, so that the first quantized vector (the normed stream
+// before q, k and v) has a group whose scale is 0 (NORM_QUANTIZE's and QUANTIZE's select of 1 / scale: a division by
+// 0 there makes NaN, which quantizedOff holds to quantize_x's 0). And the two DP4A fused forms, which differ only in
+// NORM_QUANTIZE against RMSNORM then QUANTIZE (the same expressions weight × (s × x), the largest / 127 and the
+// rounding, in one dispatch or two), must agree to the bit in everything they leave (the stream, the position's keys
+// and values, the four quantized vectors): a rounding that differs between them (a product reassociated, a tie
+// rounded up) is under quantizedOff's lines (1e-3 of a scale, 1% of the values off by 1) and shows here alone
 const LAYER_CHECK = { dim: 2112, hidden: 2080, heads: 33, kvHeads: 3 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
 const LAYER_CHECK_OUTLIERS = Math.round((3 * LAYER_CHECK.dim) / 256), LAYER_CHECK_OUTLIER = 30, LAYER_CHECK_EPS = 1;
 async function checkLayer() {
@@ -1061,9 +1068,18 @@ async function checkLayer() {
   for (let i = 0; i < LAYER_CHECK_OUTLIERS; i++) {
     data.h[Math.floor((i + 0.5) * shape.dim / LAYER_CHECK_OUTLIERS)] = LAYER_CHECK_OUTLIER * (i % 2 ? -1 : 1);
   }
+  data.h.fill(0, 0, GROUP);
   for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
     data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01 * Math.sqrt(256 / n)) };
   }
+  // what the DP4A fused form with the norms apart left, for the fused form to be held to (bit for bit)
+  let normsApart;
+  const sameBytes = (a, b) => {
+    const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    return x.length === y.length && x.every((byte, i) => byte === y[i]);
+  };
+  const sameAs = (got, other) => sameBytes(got.h, other.h) && sameBytes(got.keys, other.keys) && sameBytes(got.values, other.values)
+    && got.quantized.every((q, i) => sameBytes(q.xq, other.quantized[i].xq) && sameBytes(q.xs, other.quantized[i].xs));
   for (const form of layerForms()) {
     if (form.none) continue;
     try {
@@ -1113,9 +1129,15 @@ async function checkLayer() {
         }
       }
       const cache = Math.max(keyOff, valueOff);
+      // the DP4A fused form against the one with the norms apart, bit for bit (undefined where that one was not run)
+      let agreed;
+      if (form.dp4a && form.fused) {
+        if (form.normApart) normsApart = got;
+        else if (normsApart) agreed = sameAs(got, normsApart);
+      }
       // on DP4A, how each quantized vector held (for CI's logs): the worst scale apart and the values off by 1
-      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length,
-        stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}),
+      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length && agreed !== false,
+        stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}), ...(agreed === undefined ? {} : { sameAsNormsApart: agreed }),
         ...(quantizing.length ? { quantized: quantizing.map(([point, q]) => `${point}: ${q.wrong ?? `scales ${q.scale.toExponential(1)}, ${q.apart} of ${q.of} values off by 1`}`).join("; ") } : {}) };
     } catch (error) {
       verdicts[layerCheck(form)] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
