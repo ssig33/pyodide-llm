@@ -1,9 +1,10 @@
 // T173: the page-memory section of /benchmark/ in Chromium, on a limit a runner holds well below its own: (1) ?run=memory
 // holds all it is asked to and removes its mark, "Run all" leaves it out; (2) a page left while it grows (a reload)
 // leaves no mark: a visitor's reload is no limit; (3) a page hidden while it grows stops at once and says so; (4) a
-// tab ended while it grows (the renderer crashed by DevTools' Page.crash, no event in the page, as a phone's jetsam or
-// low-memory killer ends it) is loaded again in the same tab: the page reports the last step it held, from the mark,
-// and does not run the section again although the address still says ?run=memory.
+// tab ended while it grows (its renderer killed with SIGKILL, no event in the page, as a phone's jetsam or low-memory
+// killer ends it) is loaded again in the same tab: the page reports the last step it held, from the mark, and does not
+// run the section again although the address still says ?run=memory. (DevTools' Page.crash did not end the tab in
+// Playwright's Chromium: no crash came in 30 s.)
 // With --ended <MiB> (T173's review) the run is the section's own 4 GiB and the tab is ended by the kernel for its
 // memory: the workflow puts the whole browser in a cgroup of that many MiB with no swap (preview.yml), and the page
 // must report a number below it. Never on the development machine (AGENTS.md: gigabytes held there take the machine
@@ -12,6 +13,7 @@
 //   node tests/page-memory-check.mjs [url of a site | --dist] [--ended <MiB>]
 //     --dist serves dist/ (npm run build) itself, as tests/bench-check.mjs does
 import http from "node:http";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,14 +73,23 @@ async function pressRun(page, query) {
   await page.click('section[data-section="memory"] .head button');
 }
 
-// a tab ended while it grew: the page's own session crashes it (or the kernel ends it) and loads it again in the same
-// tab, where Playwright's page is gone (a crashed page takes no more calls): what the loaded page says is read by the
+// the renderer that holds the most: the page's, which holds the section's memory (Linux: the CI's runner)
+function killRenderer() {
+  const renderers = execFileSync("ps", ["-eo", "pid=,rss=,args="], { encoding: "utf8" }).split("\n")
+    .filter((line) => line.includes("--type=renderer")).map((line) => line.trim().split(/\s+/).map(Number))
+    .sort((a, b) => b[1] - a[1]);
+  if (!renderers.length) throw new Error("no renderer process to end");
+  console.log(`ending the renderer ${renderers[0][0]} (${Math.round(renderers[0][1] / 1024)} MiB resident) with SIGKILL`);
+  process.kill(renderers[0][0], "SIGKILL");
+}
+// a tab ended while it grew: the test kills its renderer (or the kernel does) and loads it again in the same tab,
+// where Playwright's page is gone (a crashed page takes no more calls): what the loaded page says is read by the
 // DevTools session, which lives on in the tab
-async function endedAndLoaded(context, page, url, crash) {
+async function endedAndLoaded(context, page, url, kill) {
   const cdp = await context.newCDPSession(page);
   const ended = new Promise((resolve) => page.once("crash", resolve));
-  if (crash) cdp.send("Page.crash").catch(() => {});  // the renderer never answers it
-  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("the tab was not ended")), (crash ? 30 : 600) * 1000));
+  if (kill) killRenderer();
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("the tab was not ended")), (kill ? 30 : 600) * 1000));
   await Promise.race([ended, timeout]);
   await cdp.send("Page.navigate", { url });
   const read = `(() => { const b = window.__benchmark; if (!b?.done) return null;
@@ -162,12 +173,13 @@ try {
           `a hidden page stops the run (${three?.data?.stop}, held ${three?.data?.held / MiB} MiB)`);
     check(b.mark === null, "and leaves no mark");
 
-    // (4) a tab ended while it grew: crashed, and loaded again in the same tab with ?run=memory still in the address
+    // (4) a tab ended while it grew: its renderer killed, and loaded again in the same tab with ?run=memory still in
+    // the address
     const url = `${site}benchmark/?run=memory&memoryMB=2048`;
     await page.goto(url);
     await markAt(page, 128 * MiB);
     const marked = JSON.parse(await page.evaluate((mark) => sessionStorage.getItem(mark), MARK));
-    console.log(`crashing the tab at the mark: held ${marked.held / MiB} MiB, trying ${marked.trying / MiB} MiB`);
+    console.log(`ending the tab at the mark: held ${marked.held / MiB} MiB, trying ${marked.trying / MiB} MiB`);
     reportsTheMark(await endedAndLoaded(context, page, url, true), marked.held, 2048 * MiB);
   }
 } catch (error) {
