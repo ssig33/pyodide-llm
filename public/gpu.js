@@ -31,7 +31,8 @@
 //                                    in the control area as a prompt's. Where plan.tokens asks for it, "ready" says
 //                                    tokens ({ form, ms, forms, remembered }: the layer of a token chosen here and its
 //                                    ms a step) or tokensWhy (why they stay on the CPU)
-//   { type: "stop" }                 every buffer and the device let go, and the worker ends
+//   { type: "stop" }                 every buffer and the device let go, and the worker ends; T205: it says
+//                                    { type: "ended" } as it does (so does a start that ends as "unusable")
 //
 // A block goes as one submission: per layer the RMSNorm, the matrices of q, k and v (each weight read once for the
 // block's tokens, by the tiled shader chosen on this device: see chooseMatrices), T153: their biases (Qwen2) and the
@@ -206,7 +207,9 @@ function stop() {
   stopping = true;
   if (!starting) end();  // else start() ends at its next step
 }
-// every buffer and the device let go (T94: a model changed for another leaves nothing on the GPU), and this worker ends
+// every buffer and the device let go (T94: a model changed for another leaves nothing on the GPU), and this worker ends.
+// T205: it says { type: "ended" } first, for forward.js's release() to read the next model after it. Every way out of
+// start() comes here (a stop in the middle of it at its next step), and a stop before or after start() at once
 function end() {
   if (model) {
     model.owned.forEach((buffer) => buffer.destroy());
@@ -214,6 +217,7 @@ function end() {
     model.device.destroy();
     model = null;
   }
+  postMessage({ type: "ended" });
   self.close();
 }
 

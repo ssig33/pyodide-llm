@@ -496,7 +496,8 @@ try {
         engine.forwardMany(tokens.slice(0, 2), n + 1);
         out.past = { gpuTokens: engine.gpuTokens };
       }
-      engine.release();
+      // T205: the GPU's worker says it let go of its device before the next model is read (false: not within 5 s)
+      out.ended = await engine.release();
       // T183: the seconds of the run, and of those until the GPU's worker said it was ready (its shaders compiled)
       return { ...out, seconds: (performance.now() - started) / 1000, readySeconds };
     };
@@ -546,8 +547,11 @@ try {
     let refused, remembered;
     if (c.id === "synthetic") {
       const began = performance.now(), engine = createForward({ memory, base, size, kernels, plan, gpu: openGpu });
-      refused = { note: await engine.gpu, seconds: (performance.now() - began) / 1000 };
-      engine.release();
+      refused = { note: await engine.gpu, seconds: (performance.now() - began) / 1000, ended: await engine.release() };
+      // T205: a model let go while its GPU is still getting ready (gpu.js's start() stops at its next step and says so)
+      const starting = createForward({ memory, base, size, kernels, plan, gpu: openGpu, gpuForce: TESTS });
+      const stopped = performance.now();
+      refused.whileStarting = { ended: await starting.release(), seconds: (performance.now() - stopped) / 1000 };
       const first = gpu[0].ready ?? {}, kept = { key: first.key, matrices: first.matrices, attention: first.attention };
       remembered = { same: (await run(openGpu, {}, kept)).ready, other: (await run(openGpu, {}, { ...kept, key: kept.key + "|another" })).ready };
     }
@@ -756,9 +760,14 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
   }
   if (refused) {
     // T148: refused before anything was compiled (SwiftShader compiles a shader in 10 to 90 s): within a few seconds
-    const right = /a fallback adapter/.test(refused.note) && refused.seconds < 30;
-    console.log(`  a fallback adapter without the tests' leave: ${refused.note} in ${refused.seconds.toFixed(1)} s${right ? "" : " — FAILED"}`);
+    const right = /a fallback adapter/.test(refused.note) && refused.seconds < 30 && refused.ended;
+    console.log(`  a fallback adapter without the tests' leave: ${refused.note} in ${refused.seconds.toFixed(1)} s, ` +
+      `${refused.ended ? "its worker ended" : "its worker did not say it ended"}${right ? "" : " — FAILED"}`);
     failed ||= !right;
+    // T205: stopped while it got ready, it ends and says so (within forward.js's 5 s)
+    const { whileStarting: w } = refused;
+    console.log(`  a GPU let go while it got ready: ${w.ended ? "its worker ended" : "its worker did not say it ended"} in ${w.seconds.toFixed(1)} s${w.ended ? "" : " — FAILED"}`);
+    failed ||= !w.ended;
   }
   if (remembered) {
     const right = remembered.same?.remembered === true && remembered.other?.remembered === false;
@@ -770,6 +779,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     const failures = [];
     if (!promptsOnGpu(gpu.note)) failures.push(`the GPU did not take it: ${gpu.note}`);
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
+    if (gpu.ended === false) failures.push("the GPU's worker did not say it ended within 5 s of the release (T205)");
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const kind = /DP4A/.test(gpu.form ?? "") ? "packed" : /f16/.test(gpu.form ?? "") ? "f16" : "float32";
     // T187: the packed shaders' first layer and scale against Q8, their own arithmetic, and all their layers against

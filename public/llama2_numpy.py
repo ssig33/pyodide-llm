@@ -976,11 +976,13 @@ class Llama:
 
     def release(self):
         """Let go of what JavaScript holds for this engine (the forward pass of forward.js and the array it fills).
-        The worker calls it before it drops a model (T93)."""
+        The worker calls it before it drops a model (T93). T205: what forward.js answers (a promise, settled once the
+        GPU's worker let go of the device), for the worker to wait on before it reads the next model; else None."""
         external = getattr(self, "_external", None)
-        if external is not None:
-            external[0].release()
-            self._external = None
+        if external is None:
+            return None
+        self._external = None
+        return external[0].release()
 
     def forward(self, token, pos, need_logits=True):
         n_kv_heads, head_size = self.n_kv_heads, self.head_size

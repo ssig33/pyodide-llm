@@ -626,7 +626,8 @@ function weightsBuffer(size, header, options) {
       llama: (tokenizer, options) => {
         // (not on the benchmark's page, ?bench=, T45: it times the CPU's combinations, which a GPU starting beside
         // them would slow down with its upload and compilation; its first load is one of them)
-        // (nor under the rounds of /benchmark/'s model section, T184: the same; its page path starts the GPU after them)
+        // (nor under the rounds of /benchmark/'s model section, T184: the same; its page path, timed on the first load
+        // before the rounds, has the GPU, and T205: the rounds' loads wait for that GPU to let go of its device)
         outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage && !benching ? openGpu : undefined, gpuRoom,
           gpuRemembered: gpuRequest?.remembered, gpuForce, halfKeys });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
@@ -1183,12 +1184,17 @@ async function load(model, signal, id) {
   signal.throwIfAborted();
   // let go of the previous model first, so that two never have to fit in memory
   if (llama) {
-    llama.release?.();  // what forward.js holds of Python's, and its software threads (T93)
+    // what forward.js holds of Python's, and its software threads (T93); T205: and the GPU's worker, whose buffers and
+    // device the next model waits for (up to forward.js's GPU_END_MS): an iPhone's tab went down in /benchmark/'s rounds
+    // where the one before still held them as the next came from the cache
+    const released = llama.release?.();
     llama.destroy();
     llama = undefined;
     outsideNow = undefined;  // the engine goes; the memory stays for the next model (T96)
     // the engine's closures and the model refer to each other, so only the cycle collector frees the weights
     pyodide.runPython("import gc; gc.collect()");
+    await released;
+    signal.throwIfAborted();
   }
   if (model.hf) {
     postMessage({ type: "status", load: id, text: `${model.name}: ${model.hf.repo ? "fetching from Hugging Face and converting" : "converting"}...` });

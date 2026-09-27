@@ -23,6 +23,9 @@ const STALLED_MS = 10000;
 // of which it gives up itself after 180 s (gpu.js's STEP_MS, T147: SwiftShader compiles a shader in up to 90 s). A
 // worker quiet for longer than that is one the browser ended
 const GPU_QUIET_MS = 200000;
+// T205: the most release() waits for the GPU's worker to say it let go of its buffers and its device ("ended"), before
+// the next model is read; one that says nothing by then (a compilation that does not return) is terminated
+const GPU_END_MS = 5000;
 // T147: the most tokens of a prompt the GPU takes at once: the tokens of the largest tile (T146's 64 × 64), whose
 // sixteen blocks left three quarters of it idle. Python hands a prompt over this many at a time where the GPU is on
 // (promptBlock), BATCH where it is not: the worker answers nothing while one call runs (T108)
@@ -917,6 +920,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // T148: by default (AGENTS.md's policy 9), and without waiting for it: the model is ready on the CPU at once, and the
   // GPU takes the blocks of a prompt from the first one after it is ready (a block past gpuEnd stays on the CPU, so a
   // GPU that is ready in the middle of a prompt changes nothing of it). Which blocks it takes: promptTimes above.
+  // T205: gpuEnded, settled once the last GPU's worker made has let go of its buffers and its device (or never began)
+  let gpuEnded = Promise.resolve(), gpuLast = null, quietTimer;
   let gpuWorker = null, gpuOn = false, gpuEnd = 0, gpuSerial = 0, gpuTokens = 0, settleGpu = null, gpuChosen = null;
   // T148: what the status line says of the GPU now, and whether this generation checks the side not chosen again
   // recheck: the side not chosen that a part of the next long prompt goes to, to time it again ("cpu": the last
@@ -1021,16 +1026,20 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     // (six, T155: the values at a layer's address are int6, packed as llama2_numpy.pack6 packs them)
     const matrices = Object.fromEntries(Object.entries(gpuMatrices()).map(([name, m]) =>
       [name, { rows: m.rows, n: m.n, six: m.six, layers: Array.from({ length: layers }, (_, l) => m.layer(l).slice(0, 2)) }]));
-    let quiet;
     const listen = () => {
-      clearTimeout(quiet);
-      quiet = setTimeout(() => stopGpu(`the GPU said nothing for ${GPU_QUIET_MS / 1000} s`), GPU_QUIET_MS);
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(() => stopGpu(`the GPU said nothing for ${GPU_QUIET_MS / 1000} s`), GPU_QUIET_MS);
     };
-    gpuWorker = gpu();
+    const worker = gpuLast = gpuWorker = gpu();
+    let ended;
+    gpuEnded = new Promise((resolve) => { ended = resolve; });
     gpuStatus = "prompts on the CPU while the GPU gets ready";
-    gpuWorker.onmessage = ({ data }) => {
+    worker.onmessage = ({ data }) => {
+      // T205: its buffers and its device let go (gpu.js's end()), and nothing more from it after a stop
+      if (data.type === "ended") return ended();
+      if (worker !== gpuWorker) return;
       if (data.type === "progress") return listen();
-      clearTimeout(quiet);
+      clearTimeout(quietTimer);
       if (data.type === "ready") {
         gpuOn = true;
         if (data.blocks.length) times.started(data.blocks);
@@ -1065,11 +1074,14 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         console.warn(`gpu: ${data.reason}`);
       }
     };
-    gpuWorker.onerror = (event) => stopGpu(`the GPU's worker did not start (${event.message ?? "an error"})`);
+    worker.onerror = (event) => {
+      ended();  // a worker that did not start holds nothing
+      if (worker === gpuWorker) stopGpu(`the GPU's worker did not start (${event.message ?? "an error"})`);
+    };
     listen();
     // T154: LayerNorm's epsilon is the CPU's layernorm kernel's and NumPy's, 1e-5 (GPT-2's and GPT-NeoX's
     // layer_norm_epsilon); parallel: GPT-NeoX's parallel residual
-    gpuWorker.postMessage({ type: "start", memory, plan: { dim, hidden, layers, heads, kvHeads, headSize, turned, seqLen,
+    worker.postMessage({ type: "start", memory, plan: { dim, hidden, layers, heads, kvHeads, headSize, turned, seqLen,
       kvStart: plan.kv_start, eps: layerNorm ? 1e-5 : eps, layerNorm, parallel: Boolean(parallel), batch: GPU_BLOCK, matrices,
       vectors: gpuVectors(), rows: gpuRows, tokens: gpuIds ? gpuTokensPlan() : null,
       cos: cosTable, sin: sinTable, staging, force: gpuForce, remembered: gpuRemembered,
@@ -1078,6 +1090,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // the prompt stays on the CPU from here on (why: what the console says, where it was on the GPU); the GPU's worker
   // lets go of the device and ends
   function stopGpu(why) {
+    clearTimeout(quietTimer);
     if (gpuOn && why) console.warn(`gpu: ${why}: the prompts and the tokens go on on the CPU`);
     gpuOn = false;
     tokensOn = false;
@@ -1411,12 +1424,26 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       view.data.set(new Float32Array(memory.buffer, logits, vocab));
       view.release();
     },
-    /** Python's array goes back (Llama.release()), the helper threads end, and the GPU's worker (T135) */
+    /** Python's array goes back (Llama.release()), the helper threads end, and the GPU's worker (T135). T205: resolves
+     * once the GPU's worker has let go of its buffers and its device, or after GPU_END_MS (the worker is terminated
+     * then), true where it said so: the next model is read after it (an iPhone's tab went down where the GPU of the
+     * one before still held up to 189 MB as the next came from the cache) */
     release() {
       bound?.destroy?.();
       bound = null;
       this.stopThreads();
       if (gpuWorker) stopGpu();
+      const worker = gpuLast;
+      let timer;
+      const late = new Promise((resolve) => { timer = setTimeout(() => resolve(false), GPU_END_MS); });
+      return Promise.race([gpuEnded.then(() => true), late]).then((ended) => {
+        clearTimeout(timer);
+        if (!ended) {
+          console.warn(`gpu: the GPU's worker did not end within ${GPU_END_MS / 1000} s: terminated`);
+          worker?.terminate?.();
+        }
+        return ended;
+      });
     },
     /** the logits in this memory, for callers without Python (tests) */
     logits: () => new Float32Array(memory.buffer, logits, vocab),

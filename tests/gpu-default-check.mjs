@@ -71,7 +71,15 @@ parentPort.on("message", (data) => {
     Atomics.store(ctl, words.failed, fail ? 1 : 0);
     Atomics.store(ctl, words.done, data.serial);
     Atomics.notify(ctl, words.done);
-  } else if (data.type === "stop") process.exit(0);
+  } else if (data.type === "stop") {
+    // T205: as gpu.js's end(): { type: "ended" } once its device is let go (endAfter ms: a slow let-go; never: a worker
+    // that hangs in a compilation), then the worker ends
+    if (line.endAfter === Infinity) return;
+    setTimeout(() => {
+      parentPort.postMessage({ type: "ended" });
+      parentPort.close();
+    }, line.endAfter ?? 0);
+  }
 });`;
 
 if (isMainThread) {
@@ -137,7 +145,7 @@ if (isMainThread) {
     const gpu = () => {
       const fake = new Worker(FAKE, { eval: true, workerData: line });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
-        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
     };
     const engine = createForward({ memory, base, size, kernels, plan, spawn, gpu });
     await engine.setThreads(1);
@@ -339,7 +347,7 @@ if (isMainThread) {
     const gpu = () => {
       const fake = new Worker(FAKE, { eval: true, workerData: line });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
-        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
     };
     const engine = createForward({ memory, base, size, kernels, plan, spawn, gpu });
     await engine.setThreads(1);
@@ -373,6 +381,41 @@ if (isMainThread) {
     expect(`the status line says why the prompts are on the CPU, and nothing of the answers (${seen.status})`,
       /^prompts on the CPU \(.*failed on a token/.test(seen.status) && !/answers/.test(seen.status), true);
   }
+  // T205: the next model is read after the GPU's worker let go of its device (an iPhone's tab went down in
+  // /benchmark/'s rounds where the one before still held it). release() waits for its "ended": a slow let-go of 400 ms
+  // is waited for; one that never comes is given up after 5 s and the worker terminated; a model let go while its GPU
+  // is getting ready waits the same (the late "ready" after the stop changes nothing)
+  {
+    const fast = { fixed: 10 * perToken, perToken: 0.05 * perToken, step: 0.2 * cpuStep };
+    const released = async (more, ready = true) => {
+      let exited = false;
+      const gpu = () => {
+        const fake = new Worker(FAKE, { eval: true, workerData: { ...fast, ...more } });
+        fake.once("exit", () => { exited = true; });
+        return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
+          set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
+      };
+      const warned = console.warn;
+      console.warn = () => {};  // the line forward.js writes of a worker that did not end
+      const engine = createForward({ memory, base, size, kernels, plan, gpu });
+      if (ready) await engine.gpu;
+      const began = performance.now(), ended = await engine.release(), ms = performance.now() - began;
+      console.warn = warned;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      say(`T205: a GPU's worker ${more.endAfter === Infinity ? "that never ends" : `ending ${more.endAfter} ms after the stop`}` +
+        `${ready ? "" : ", stopped while it got ready"}: release() ${ended ? "saw it end" : "gave it up"} in ${ms.toFixed(0)} ms` +
+        `, the worker ${exited ? "gone" : "still there"}; status ${engine.gpuStatus}`);
+      return { ended, ms, exited, status: engine.gpuStatus };
+    };
+    const slow = await released({ endAfter: 400 });
+    expect("release() waits for a slow GPU's worker to end", [slow.ended, slow.ms >= 380 && slow.ms < 2500, slow.exited], [true, true, true]);
+    const hung = await released({ endAfter: Infinity });
+    expect("release() gives up a GPU's worker that never ends after 5 s, and terminates it",
+      [hung.ended, hung.ms >= 4900 && hung.ms < 7000, hung.exited], [false, true, true]);
+    const early = await released({ endAfter: 200 }, false);
+    expect("a model let go while its GPU gets ready: waited for, and the late ready ignored",
+      [early.ended, early.ms >= 180 && early.ms < 2500, early.exited, /WebGPU/.test(early.status ?? "") && !/CPU/.test(early.status ?? "")], [true, true, true, false]);
+  }
   // T152: Python's generate() through forward.js's external() (as the page's worker has it) on the made-up GPU far
   // faster: the steps go to it (Python draws the random numbers and hands the history over as the made-up GPU expects),
   // and the text and the counts are those of the steps
@@ -388,7 +431,7 @@ if (isMainThread) {
     const gpuOf = (workerData) => () => {
       const fake = new Worker(FAKE, { eval: true, workerData });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
-        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
     };
     const outside = external({ memory, base, size, kernels, gpu: gpuOf(line) });
     py.globals.set("OUTSIDE", outside);
