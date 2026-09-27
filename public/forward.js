@@ -785,24 +785,30 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     else startGpu();
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
+  // (T153: with Qwen2's biases, Qwen3's norms of the heads and heads of another size than dim / heads as well)
   function gpuUnfit() {
     if (!sharedMemory) return "the page is not cross-origin isolated";
     if (wide) return "a 64-bit memory: not on the GPU yet";
     if (arch !== "llama") return `${arch === "gpt2" ? "GPT-2" : "GPT-NeoX"} is not on the GPU yet`;
-    if (bq) return "the biases of q, k and v are not on the GPU yet";
-    if (qNorm) return "the norms of q and k are not on the GPU yet";
-    if (qDim !== dim) return "heads of another size than dim / heads are not on the GPU yet";
     if (headSize % 4) return "heads of a size that is no multiple of 4 are not on the GPU";
     if (![wq, wk, wv, wo, w1, w2, w3].every((m) => m?.int8 && !m.six && m.group === 32)) {
       return `${T.wq?.kind === "int6" ? "int6" : "float32"} weights are not on the GPU yet`;
     }
     // T148: the layers twice, in this memory and on the GPU (T156 will keep one): a device with too little memory
     // for both keeps the CPU's alone (a phone or an Apple shares its memory between the two)
-    const onGpu = [wq, wk, wv, wo, w1, w2, w3].reduce((bytes, m) => bytes + layers * m.rows * m.n * (1 + 4 / 32), 0) + 2 * layers * D;
+    const onGpu = [wq, wk, wv, wo, w1, w2, w3].reduce((bytes, m) => bytes + layers * m.rows * m.n * (1 + 4 / 32), 0) +
+      Object.values(gpuVectors()).reduce((bytes, { size }) => bytes + layers * size * 4, 0);
     if (gpuRoom !== undefined && onGpu > gpuRoom) {
       return `the layers on the GPU as well (${Math.round(onGpu / 1e6)} MB) would not leave this device enough memory`;
     }
     return null;
+  }
+  // the vectors of every layer the GPU reads (gpu.js's plan.vectors): the norms' weights; T153: Qwen2's biases of q,
+  // k and v, Qwen3's norms of a head of q and of k. Each one's address here and its floats a layer
+  function gpuVectors() {
+    return { attention: { at: attW, size: dim }, ffn: { at: ffnW, size: dim },
+      ...(bq ? { bq: { at: bq, size: qDim }, bk: { at: bk, size: kvDim }, bv: { at: bv, size: kvDim } } : {}),
+      ...(qNorm ? { qNorm: { at: qNorm, size: headSize }, kNorm: { at: kNorm, size: headSize } } : {}) };
   }
   function startGpu() {
     const turned = plan.rotary > 0 && plan.rotary < headSize ? plan.rotary : headSize;
@@ -837,7 +843,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     gpuWorker.onerror = (event) => stopGpu(`the GPU's worker did not start (${event.message ?? "an error"})`);
     listen();
     gpuWorker.postMessage({ type: "start", memory, plan: { dim, hidden, layers, heads, kvHeads, headSize, turned, seqLen,
-      kvStart: plan.kv_start, eps, batch: GPU_BLOCK, matrices, norms: { attention: attW, ffn: ffnW }, rows: gpuRows,
+      kvStart: plan.kv_start, eps, batch: GPU_BLOCK, matrices, vectors: gpuVectors(), rows: gpuRows,
       cos: cosTable, sin: sinTable, staging, force: gpuForce, remembered: gpuRemembered,
       words: { done: GPU_DONE, failed: GPU_FAILED, beat: GPU_BEAT, wanted: GPU_WANTED } } });
   }

@@ -26,7 +26,8 @@
 //   { type: "stop" }                 every buffer and the device let go, and the worker ends
 //
 // A block goes as one submission: per layer the RMSNorm, the matrices of q, k and v (each weight read once for the
-// block's tokens, by the tiled shader chosen on this device: see chooseMatrices), RoPE with the keys and values into the
+// block's tokens, by the tiled shader chosen on this device: see chooseMatrices), T153: their biases (Qwen2) and the
+// norms of every head of q and k (Qwen3) where the model has them, RoPE with the keys and values into the
 // GPU's own cache (float16), the attention (llama.cpp's flash attention with tiles: every token sees the positions up to
 // its own), the output matrix added to the residual, the RMSNorm, the gate and the up matrices, SwiGLU, the down matrix
 // added. The last layer stops at its keys and values: nothing of a prompt's token after them is used. Then the block's
@@ -158,7 +159,8 @@ const adapterKey = (adapter) => {
 // the shaders' own text (the tiled ones this device can make, and the small steps'), as a short hash (FNV-1a)
 function shadersKey(wgsl, forms) {
   let hash = 0x811c9dc5;
-  for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.ROPE, wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile)]) {
+  for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
+    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile)]) {
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
   }
   return (hash >>> 0).toString(16);
@@ -244,7 +246,9 @@ function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
   pass.dispatchWorkgroups(x, y, z);
 }
 
-// every layer's matrices (values and scales, as the checkpoint holds them) and the weights of its two norms
+// every layer's matrices (values and scales, as the checkpoint holds them) and its vectors: the weights of its two
+// norms, and (T153) Qwen2's biases of q, k and v, Qwen3's norms of a head of q and of k (plan.vectors: each one's
+// address in the shared memory and its floats a layer)
 async function upload(m) {
   const { plan } = m, group = m.wgsl.GROUP;
   let bytes = 0;
@@ -262,12 +266,12 @@ async function upload(m) {
     await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
     if (stopping) return bytes;
   }
-  const normBytes = plan.layers * plan.dim * 4;
-  m.norms = {};
-  for (const [name, address] of Object.entries(plan.norms)) {
-    m.norms[name] = buffer(m, normBytes, STORAGE | COPY_DST);
-    copyIn(m, m.norms[name], address, normBytes);
-    bytes += normBytes;
+  m.vectors = {};
+  for (const [name, { at, size }] of Object.entries(plan.vectors)) {
+    const vectorBytes = plan.layers * size * 4;
+    m.vectors[name] = buffer(m, vectorBytes, STORAGE | COPY_DST);
+    copyIn(m, m.vectors[name], at, vectorBytes);
+    bytes += vectorBytes;
   }
   return bytes;
 }
@@ -276,8 +280,8 @@ async function upload(m) {
 async function prepare(m) {
   const { plan, wgsl } = m, B = plan.batch;
   const qDim = plan.heads * plan.headSize, kvDim = plan.kvHeads * plan.headSize, widest = Math.max(plan.dim, qDim, plan.hidden);
-  [m.norm, m.rope, m.swiglu, m.quantize] = await within(Promise.all([wgsl.RMSNORM, wgsl.ROPE, wgsl.SWIGLU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code))),
-    "the small steps' shaders");
+  [m.norm, m.headNorm, m.add, m.rope, m.swiglu, m.quantize] = await within(Promise.all([wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
+    wgsl.SWIGLU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code))), "the small steps' shaders");
   // a block's tokens, each array dense: token t's row at t times its width
   m.x = buffer(m, B * plan.dim * 4, STORAGE | COPY_DST);
   m.xb = buffer(m, B * Math.max(plan.dim, qDim) * 4, STORAGE | COPY_DST);
@@ -297,10 +301,12 @@ async function prepare(m) {
   m.turns = new Float32Array(B * plan.headSize);
   m.ropeShape = uniform(m, new Uint32Array([plan.heads, plan.kvHeads, plan.headSize, plan.turned]));
   m.swigluGroup = bind(m, m.swiglu, [m.gate, m.up, uniform(m, new Uint32Array([plan.hidden, 0, 0, 0])), m.step]);
-  // QUANTIZE of the inputs the matrices read: xb (the norm's and the attention's, dim wide) and gate (SwiGLU's)
+  // QUANTIZE of the inputs the matrices read: xb (the norm's, dim wide; the attention's, heads × headSize wide, which
+  // is not dim where the heads are of another size, T153) and gate (SwiGLU's)
   const quantizing = (from, n) => ({ group: bind(m, m.quantize, [from, m.xq, m.xs, uniform(m, new Uint32Array([n, n, 0, 0])), m.step]),
     x: Math.ceil(n / wgsl.GROUP / 64) });
   m.quantizeXb = quantizing(m.xb, plan.dim);
+  m.quantizeAttention = quantizing(m.xb, qDim);
   m.quantizeGate = quantizing(m.gate, plan.hidden);
 }
 
@@ -521,7 +527,7 @@ async function timeForms(m, forms) {
   const { device, plan } = m, owned = [], layer = [];
   try {
     device.queue.writeBuffer(m.step, 0, new Uint32Array([plan.batch, 0, 0, 0]));
-    const products = [["wq", m.xb, m.q, false, m.quantizeXb], ["wk", m.xb, m.k], ["wv", m.xb, m.v], ["wo", m.xb, m.x, true, m.quantizeXb],
+    const products = [["wq", m.xb, m.q, false, m.quantizeXb], ["wk", m.xb, m.k], ["wv", m.xb, m.v], ["wo", m.xb, m.x, true, m.quantizeAttention],
       ["w1", m.xb, m.gate, false, m.quantizeXb], ["w3", m.xb, m.up], ["w2", m.gate, m.x, true, m.quantizeGate]];
     for (const form of forms) {
       layer.push(await validated(m, () => products.map(([name, from, to, add, quantize]) => {
@@ -562,9 +568,10 @@ async function timeForms(m, forms) {
   }
 }
 
-// every layer's bind groups but those of the cache, with the form chosen
+// every layer's bind groups but those of the cache, with the form chosen. T153: a bias (Qwen2's) added to q, k and
+// v, or (Qwen3's) the norm of every head of q and of k, where the model has them
 function bindLayers(m) {
-  const { plan } = m, form = m.form;
+  const { plan } = m, form = m.form, V = m.vectors;
   const product = (name, l, from, to, add = false) => {
     const { rows, n, layers } = m.matrices[name];
     return { group: productGroup(m, form, ...layers[l], rows, n, from, to, add), rows };
@@ -575,11 +582,22 @@ function bindLayers(m) {
     new Uint32Array(norm, 0, 2).set([plan.dim, l * plan.dim]);
     new Float32Array(norm, 8, 1)[0] = plan.eps;
     const normShape = uniform(m, norm);
+    const added = (to, name) => V[name] && { group: bind(m, m.add, [to, V[name], uniform(m, new Uint32Array([plan.vectors[name].size, l * plan.vectors[name].size, 0, 0])), m.step]),
+      x: Math.ceil(plan.vectors[name].size / 64) };
+    const headNorm = (of, name, heads) => {
+      if (!V[name]) return null;
+      const shape = new ArrayBuffer(16);
+      new Uint32Array(shape, 0, 2).set([plan.headSize, l * plan.headSize]);
+      new Float32Array(shape, 8, 1)[0] = plan.eps;
+      return { group: bind(m, m.headNorm, [of, V[name], uniform(m, shape), m.step]), heads };
+    };
     m.layers.push({
-      attentionNorm: bind(m, m.norm, [m.x, m.norms.attention, m.xb, normShape, m.step]),
+      attentionNorm: bind(m, m.norm, [m.x, V.attention, m.xb, normShape, m.step]),
       q: product("wq", l, m.xb, m.q), k: product("wk", l, m.xb, m.k), v: product("wv", l, m.xb, m.v),
+      biases: [added(m.q, "bq"), added(m.k, "bk"), added(m.v, "bv")].filter(Boolean),
+      headNorms: [headNorm(m.q, "qNorm", plan.heads), headNorm(m.k, "kNorm", plan.kvHeads)].filter(Boolean),
       o: product("wo", l, m.xb, m.x, true),
-      ffnNorm: bind(m, m.norm, [m.x, m.norms.ffn, m.xb, normShape, m.step]),
+      ffnNorm: bind(m, m.norm, [m.x, V.ffn, m.xb, normShape, m.step]),
       gate: product("w1", l, m.xb, m.gate), up: product("w3", l, m.xb, m.up),
       down: product("w2", l, m.gate, m.x, true),
     });
@@ -700,17 +718,20 @@ async function block(m, count, pos, wanted, timing = false) {
   const flash = m.attention;
   for (let l = 0; l < plan.layers; l++) {
     const layer = m.layers[l];
-    dispatch(pass, m.norm, layer.attentionNorm, count);
+    dispatch(pass, m.norm, layer.attentionNorm, 1, count);
     quantize(m.quantizeXb);
     multiplied(layer.q);
     multiplied(layer.k);
     multiplied(layer.v);
+    // T153: as the CPU has it (forward.js), the biases, then the norms of the heads, then RoPE
+    for (const bias of layer.biases) dispatch(pass, m.add, bias.group, bias.x, count);
+    for (const norm of layer.headNorms) dispatch(pass, m.headNorm, norm.group, norm.heads, count);
     dispatch(pass, m.rope, m.cache.rope[l], count);
     if (l === plan.layers - 1) break;  // the keys and values are all a prompt's token leaves
     dispatch(pass, flash.pipeline, m.cache.attention[l], plan.heads * Math.ceil(count / m.wgsl.FLASH_Q_TILE));
-    quantize(m.quantizeXb);
+    quantize(m.quantizeAttention);
     multiplied(layer.o);
-    dispatch(pass, m.norm, layer.ffnNorm, count);
+    dispatch(pass, m.norm, layer.ffnNorm, 1, count);
     quantize(m.quantizeXb);
     multiplied(layer.gate);
     multiplied(layer.up);

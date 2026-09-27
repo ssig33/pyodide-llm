@@ -761,21 +761,42 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // ---- the steps of a layer besides its matrices, for the tokens of a prompt (the model's GPU worker). Each does for
 // every token what the CPU's kernel of the same name (kernels/kernel.ts) does for one, in float32.
 
-// RMSNorm: one workgroup per token. out = weight * (x / sqrt(mean(x²) + eps)); weight: this layer's, from float at
-export const RMSNORM = /* wgsl */ `
+// RMSNorm: one workgroup per row, out = weight * (x / sqrt(mean(x²) + eps)), weight this layer's from float at. The
+// rows of a token are the dispatch's x (one for the layer's norms, a row of dim; T153: Qwen3's norms of q and k, a row
+// a head of headSize, heads of them), the tokens its y. inPlace (T153): x is written over (a head's q or k), as
+// llama.cpp's rms_norm_mul.wgsl has it (INPLACE: the norm and the weight's product in one dispatch, the weight's row
+// the same for every row, mul_src_ne1 1); else out is another buffer (xb, the layer's norms).
+//
+// The row of a norm, its weight broadcast over the rows and the in-place form adapted from llama.cpp,
+// ggml/src/ggml-webgpu/wgsl-shaders/rms_norm_mul.wgsl and binary.wgsl (OP_ADD, INPLACE; ADD below)
+// (https://github.com/ggml-org/llama.cpp, commit 2145525a, 2026-09-26), under the MIT License:
+//
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+const rmsNorm = (inPlace) => /* wgsl */ `
 struct Norm { size: u32, at: u32, eps: f32, unused: u32 }
 ${STEP}
-@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(0) var<storage, ${inPlace ? "read_write" : "read"}> x: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> norm: Norm;
-@group(0) @binding(4) var<uniform> step: Step;
+${inPlace ? "" : "@group(0) @binding(2) var<storage, read_write> out: array<f32>;\n"}@group(0) @binding(${inPlace ? 2 : 3}) var<uniform> norm: Norm;
+@group(0) @binding(${inPlace ? 3 : 4}) var<uniform> step: Step;
 var<workgroup> partial: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u32) {
-  let token = id.x;
-  if (token >= step.tokens) { return; }
-  let row = token * norm.size;
+fn main(@builtin(workgroup_id) id: vec3u, @builtin(num_workgroups) rows: vec3u, @builtin(local_invocation_index) t: u32) {
+  if (id.y >= step.tokens) { return; }
+  let row = (id.y * rows.x + id.x) * norm.size;
   var squares = 0.0;
   for (var i = t; i < norm.size; i += 64u) { squares += x[row + i] * x[row + i]; }
   partial[t] = squares;
@@ -785,7 +806,26 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
     workgroupBarrier();
   }
   let s = 1.0 / sqrt(partial[0] / f32(norm.size) + norm.eps);
-  for (var i = t; i < norm.size; i += 64u) { out[row + i] = weight[norm.at + i] * (s * x[row + i]); }
+  for (var i = t; i < norm.size; i += 64u) { ${inPlace ? "x" : "out"}[row + i] = weight[norm.at + i] * (s * x[row + i]); }
+}`;
+export const RMSNORM = rmsNorm(false);
+export const HEAD_NORM = rmsNorm(true);
+
+// T153: a bias added to every token of a matrix's output (Qwen2's q, k and v), llama.cpp's binary.wgsl with OP_ADD and
+// INPLACE (the notice above): y += bias, the bias (this layer's, from float at) the same for every token (b_ne1 1).
+// Changed: the token is the dispatch's y and the element its x (as SWIGLU here), where llama.cpp numbers every element
+// of the tensor along x and y and finds its place in either by strides
+export const ADD = /* wgsl */ `
+struct Bias { n: u32, at: u32, unused0: u32, unused1: u32 }
+${STEP}
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<uniform> shape: Bias;
+@group(0) @binding(3) var<uniform> step: Step;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.y >= step.tokens || id.x >= shape.n) { return; }
+  y[id.y * shape.n + id.x] += bias[shape.at + id.x];
 }`;
 
 // RoPE on q and k, and the keys and values of every token into this layer's cache at its position (step.pos + the
