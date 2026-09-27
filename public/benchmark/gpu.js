@@ -1650,6 +1650,10 @@ async function checkSampling(kind = "one") {
       cases.push({ vocab, spread, topp: 0.9, temperature: 1.3, penalty: 1, random: Math.random() });
     }
   }
+  // T191: without a nucleus on flat logits of Llama 3's vocabulary (no peaks), so that the mass is spread over the
+  // chunks of the sampling in chunks and the draw passes in a chunk far from the first (a model's logits put nearly
+  // all of it on one peak: the mass before that chunk is next to nothing, and forgetting it passed)
+  for (const random of [0.3, 0.6, 0.9]) cases.push({ vocab: 128256, spread: 1, peaks: 0, topp: 1, temperature: 0.7, penalty: 1.3, random });
   // a history shorter than the window (its empty slots must not count: token 0, among the most likely, is in none)
   for (const spread of [0.5, 2, 6]) for (let i = 0; i < 3; i++) cases.push({ vocab: 1003, spread, topp: 0.9, temperature: 0.7, penalty: 1.3, random: Math.random(), short: true });
   // equal logits (tiedLogits): the draw on the first of the two at the top, on the fifth of the run of 20, and the most
@@ -1729,7 +1733,7 @@ async function checkSampling(kind = "one") {
         }
       };
       for (const c of cases) {
-        const logits = c.ties ? tiedLogits(c.vocab) : madeUpLogits(c.vocab, c.spread);
+        const logits = c.ties ? tiedLogits(c.vocab) : madeUpLogits(c.vocab, c.spread, c.peaks);
         const ranked = [...logits.keys()].sort((a, b) => logits[b] - logits[a]);
         // 70 tokens: the 6 before the window two of the most likely (3rd and 4th, which must not be penalized), then the
         // window: the three most likely twice each (a repeat is penalized once), early and late in it (both halves of
