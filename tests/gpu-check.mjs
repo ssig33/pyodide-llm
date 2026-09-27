@@ -457,7 +457,11 @@ try {
         const logits = b64(engine.logits().slice()), id = ask(tokens[n], n, [], 1), rows = engine.keysAndValues(n, 1);
         return { logits, id, kv: b64(rows.keys) + b64(rows.values) };
       };
-      const [one, two] = [tokens.slice(0, -1).reverse(), [...tokens.slice(1, -1), tokens[0]]].map(upload);
+      // (the two others differ at every position, the last as well: the first try's two ended on the same token, whose
+      // first layer's keys and values are the token's alone, and an upload that left the last position out passed on a
+      // model of two layers)
+      const reversed = tokens.slice(0, -1).reverse();
+      const [one, two] = [reversed, [...reversed.slice(1), reversed[0]]].map(upload);
       Object.assign(out, { uploadedLogits: one.logits, uploaded: one.id, uploadedTwice: two.id, uploadedSame: one.kv === two.kv });
       return out;
     };
