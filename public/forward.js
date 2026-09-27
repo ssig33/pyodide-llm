@@ -796,8 +796,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     }
     // T148: the layers twice, in this memory and on the GPU (T156 will keep one): a device with too little memory
     // for both keeps the CPU's alone (a phone or an Apple shares its memory between the two)
+    // (T153, the review: with the GPU's own keys and values, float16, as the prompt may fill the whole context: Qwen3
+    // 0.6B's are 0.47 GB at 4096 positions, 95% of its layers')
     const onGpu = [wq, wk, wv, wo, w1, w2, w3].reduce((bytes, m) => bytes + layers * m.rows * m.n * (1 + 4 / 32), 0) +
-      Object.values(gpuVectors()).reduce((bytes, { size }) => bytes + layers * size * 4, 0);
+      Object.values(gpuVectors()).reduce((bytes, { size }) => bytes + layers * size * 4, 0) + 2 * layers * seqLen * kvDim * 2;
     if (gpuRoom !== undefined && onGpu > gpuRoom) {
       return `the layers on the GPU as well (${Math.round(onGpu / 1e6)} MB) would not leave this device enough memory`;
     }

@@ -42,8 +42,8 @@ CPU (faster here than WebGPU)", or "prompts on the CPU (reason)".
 - The adapter is a fallback that runs on the CPU (SwiftShader, lavapipe): it would never be faster, and compiling
   the shaders took 2 to 4 minutes.
 - The page is not cross-origin isolated (no shared memory between the workers).
-- The model needs 64-bit memory, or is not a Llama-shaped model in int8 (Qwen2's biases and Qwen3's norms of the
-  heads run on the GPU; GPT-2, GPT-NeoX and 6-bit weights are later tasks).
+- The model needs 64-bit memory, or is not a Llama-shaped model in int8. Qwen2's biases and Qwen3's per-head norms
+  of q and k run on the GPU as well; GPT-2, GPT-NeoX and 6-bit weights are later tasks.
 - The weights would not fit twice: today they are kept in WebAssembly memory for the CPU and again on the GPU. On
   phones and Apple devices both are the same memory. If the total is more than half of `navigator.deviceMemory`,
   the model stays on the CPU. Chromium reports at most 8, which is read as "8 GB or more"; a browser that does not
@@ -59,6 +59,8 @@ The shapes are taken from public implementations, and each file keeps their noti
 | Prompt matrix products, vec4 tiles | TensorFlow.js's `matmul_packed_webgpu.ts` (Apache-2.0) |
 | Prompt matrix products with packed int8 dot products (DP4A) | ONNX Runtime Web's MatMulNBits (MIT) |
 | Attention | llama.cpp's `flash_attn_tile` (MIT). The path for devices without subgroups is ours. |
+| RMSNorm, and Qwen3's per-head norms of q and k | llama.cpp's `rms_norm_mul` (MIT) |
+| Qwen2's biases of q, k and v | llama.cpp's `binary` ADD (MIT) |
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
 | One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |
 | One token's layer on packed int8 dot products, the vector quantized before each matrix (benchmark only) | ONNX Runtime's DP4A MatMulNBits for small M (MIT), with the fused writes of the line above. The norm and its quantizing in one dispatch take their form from vLLM's `rms_norm_per_block_quant` (Apache-2.0; no lines copied). |
