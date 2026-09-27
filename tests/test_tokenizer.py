@@ -104,7 +104,7 @@ def test_special_tokens_inside_a_prompt_become_their_token():
 
 
 # ---------------------------------------------------------- the definitions, on made-up vocabularies (T200)
-# encode_bpe() keeps the pairs' scores from one merge to the next, and encode_unigram() tries a piece at i only as far
+# encode_bpe() keeps the pairs in a heap from one merge to the next (T207), and encode_unigram() tries a piece at i only as far
 # as the reach of text[i:i + 2]. Both must give what the plain definitions below give (the engine's own loops before
 # T200), with ties, a piece written twice, unmatchable scores, NaN and characters the vocabulary lacks. A roundtrip
 # does not see a wrong segmentation (any segmentation decodes to the text), and "Once upon a time" has four tokens.

@@ -25,6 +25,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import codecs
+import heapq
 import math
 import re
 import struct
@@ -233,31 +234,42 @@ class Tokenizer:
                 tokens.extend(self.byte_tokens[byte] for byte in piece)
 
         # Merge the best consecutive pair each iteration, according to the scores in vocab_scores (the first of equal
-        # scores). Only the pairs next to a merge change, so the others keep their scores from one merge to the next
-        # (T200: each merge had looked every pair up again, which made a prompt of 1000 tokens take 1.6 s).
-        pieces = [self.vocab[token] for token in tokens]
+        # scores). The pairs wait in a heap by (minus the score, where the pair's left piece began), so the best and
+        # the first of equal ones comes out first; a merge pushes the two pairs next to it, and the pairs it ended
+        # are left in the heap and passed over when they come out (stamp: a piece's stamp changes when it merges).
+        # T200 had the scores in a list and took the best with max() and index(): 0.17 s for 1000 tokens (T207).
+        # The pieces are a list linked by after and before, the first one never goes (a merge keeps the left piece).
+        pieces, count = [self.vocab[token] for token in tokens], len(tokens)
+        after, before, stamp, waiting = list(range(1, count + 1)), list(range(-1, count - 1)), [0] * count, []
 
-        def pair(k):
-            """the score and the token of the pieces k and k + 1 joined; minus infinity where they do not merge"""
-            id = self.index.get(pieces[k] + pieces[k + 1])
-            return (self.scores[id], id) if id is not None and self.scores[id] > -1e10 else (-math.inf, -1)
+        def pair(k, m):
+            """the pieces k and m joined, if they merge: (minus the score, k, m, their stamps, the token)"""
+            id = self.index.get(pieces[k] + pieces[m])
+            if id is not None and self.scores[id] > -1e10:
+                return -self.scores[id], k, m, stamp[k], stamp[m], id
 
-        ranks, joined = [], []
-        for k in range(len(pieces) - 1):
-            score, id = pair(k)
-            ranks.append(score)
-            joined.append(id)
-        while ranks:
-            best = max(ranks)
-            if best == -math.inf:
-                return tokens
-            i = ranks.index(best)
-            tokens[i:i + 2], pieces[i:i + 2] = [joined[i]], [pieces[i] + pieces[i + 1]]
-            del ranks[i], joined[i]  # the pair merged; the pairs after it move down by one
-            for k in (i - 1, i):  # the pairs with the merged piece
-                if 0 <= k < len(ranks):
-                    ranks[k], joined[k] = pair(k)
-        return tokens
+        for k in range(count - 1):
+            if joined := pair(k, k + 1):
+                waiting.append(joined)
+        heapq.heapify(waiting)
+        while waiting:
+            _, k, m, stamp_k, stamp_m, id = heapq.heappop(waiting)
+            if stamp[k] != stamp_k or stamp[m] != stamp_m:
+                continue  # a merge has changed one of the two since
+            tokens[k], pieces[k] = id, pieces[k] + pieces[m]
+            stamp[k] += 1
+            stamp[m] += 1
+            after[k] = after[m]
+            if after[k] < count:
+                before[after[k]] = k
+            for left, right in ((before[k], k), (k, after[k])):  # the pairs with the merged piece
+                if left >= 0 and right < count and (joined := pair(left, right)):
+                    heapq.heappush(waiting, joined)
+        merged, k = [], 0
+        while k < count:
+            merged.append(tokens[k])
+            k = after[k]
+        return merged
 
     def encode_bytebpe(self, text):
         # The pre-tokenizer keeps merges inside a word: the pieces never cross from a word into the next.
