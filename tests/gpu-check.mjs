@@ -828,9 +828,10 @@ function stepsRight(c, steps, { e16, q8, kvDim, prompt }) {
   // the step after the prompt went through the CPU (the GPU's cache held another's): the CPU's most likely token on
   // the same keys and values, or a near tie of the CPU's logits
   const cpuLogits = floats(steps.uploadedLogits ?? ""), cpuTop = argmax(cpuLogits), uploaded = steps.uploaded?.[0];
-  if (!cpuLogits.length || !near(cpuLogits, cpuTop, uploaded)) failures.push(`after a prompt on the CPU the step is ${uploaded}, the CPU's ${cpuTop}, and not a near tie`);
+  const cpuP = cpuLogits.length ? logSoftmax(cpuLogits) : [], gap = cpuP[cpuTop] - cpuP[uploaded];
+  if (!cpuLogits.length || !near(cpuLogits, cpuTop, uploaded)) failures.push(`after a prompt on the CPU the step is ${uploaded}, the CPU's ${cpuTop}, and not a near tie (${gap?.toFixed(2)} below it in log-probability)`);
   said.push(`${first}${first === 4 ? ` and ${second}` : ""} greedy ids as NumPy's${first === 4 && second === 3 ? "" : " (then a near tie)"}` +
-    `, after a prompt on the CPU ${uploaded}${uploaded === cpuTop ? " as the CPU's" : ` (the CPU's ${cpuTop})`}` +
+    `, after a prompt on the CPU ${uploaded}${uploaded === cpuTop ? " as the CPU's" : ` (the CPU's ${cpuTop}, ${gap.toFixed(2)} below it)`}` +
     (first === 4 ? `, the CPU's step between them ${steps.cpuStep === greedy[4] ? "NumPy's" : `${steps.cpuStep} (NumPy's ${greedy[4]})`}` : ""));
   // the keys and values the GPU wrote back of the positions whose inputs were NumPy's (not the CPU's step's: the CPU's)
   const layers = ref.header[2];
