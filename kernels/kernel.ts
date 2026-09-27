@@ -326,17 +326,19 @@ export function attention_f16(out: usize, q: usize, kc: usize, vc: usize, att: u
 // keeps them, are the number times 2^-112, which one multiplication by 2^112 puts right (exactly, subnormals and
 // zero included). An infinity (what to_f16 writes past 65520) reads back as 65536, and NaN is not kept: neither is
 // expected of a key or value.
+// T160: in four instructions, not seven. The half is loaded sign-extended, so that the shift by 13 puts its sign in
+// bit 31 as well as in bits 30..28 (the copies the extension made); one AND clears those three, and the sign rides
+// through the multiplication (-a times 2^112 is -(a times 2^112) to the bit, -0 included). The same bits as the
+// seven-instruction form (magnitude, multiply, then OR the sign back in) for every one of the 65536 halves.
+const HALF_BITS: i32 = <i32>0x8fffffff;  // the sign, and the exponent and mantissa of a half shifted by 13
+const HALF_SCALE: f32 = 5.192296858534828e33;  // 2^112 (0x77800000)
 // @ts-ignore: decorator
 @inline function halves4(p: usize): v128 {
-  const h = v128.load16x4_u(p);
-  const magnitude = i32x4.shl(v128.and(h, i32x4.splat(0x7fff)), 13);
-  const value = f32x4.mul(magnitude, f32x4.splat(reinterpret<f32>(0x77800000)));
-  return v128.or(value, i32x4.shl(v128.and(h, i32x4.splat(0x8000)), 16));
+  return f32x4.mul(v128.and(i32x4.shl(v128.load16x4_s(p), 13), i32x4.splat(HALF_BITS)), f32x4.splat(HALF_SCALE));
 }
 // @ts-ignore: decorator
 @inline function half(p: usize): f32 {
-  const h = <u32>load<u16>(p);
-  return reinterpret<f32>(reinterpret<u32>(reinterpret<f32>((h & 0x7fff) << 13) * reinterpret<f32>(0x77800000)) | ((h & 0x8000) << 16));
+  return reinterpret<f32>((<i32>load<i16>(p) << 13) & HALF_BITS) * HALF_SCALE;
 }
 // four keys or values from the cache as float32, and one
 // @ts-ignore: decorator

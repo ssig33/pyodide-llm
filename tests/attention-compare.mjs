@@ -4,6 +4,7 @@
 //   git fetch --depth=1 origin main && node tests/attention-compare.mjs FETCH_HEAD [rounds]
 // The old kernels are compiled here from that commit's kernels/*.ts (as kernels/build.py's plain module), the new
 // ones are public/simdkernel_plain.wasm (make kernels). Exit 1 if the outputs differ.
+// T160: at the end, the float16 cache against the float32 one, old and new (above 1: the float16 cache is slower).
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
@@ -23,6 +24,7 @@ const kernels = { old: load(`${dir}old.wasm`), new: load(`${root}public/simdkern
 const F = new Float32Array(memory.buffer);
 
 let failed = false;
+const times = {};  // T160: "shape, position" -> {attention: {old, new}, attention_f16: {old, new}}
 console.log(`| kernel | heads / kv heads / head size, position | old µs | new µs | old ÷ new | G MAC/s old → new |\n|---|---|---:|---:|---:|---|`);
 for (const [nh, nkv, hs, positions] of [[8, 8, 64, [16, 256, 1000, 2000, 4000]], [32, 8, 64, [256, 4000]], [4, 2, 6, [0, 1, 2, 3, 4, 5, 6, 7]], [3, 3, 10, [9]]]) {
   const seq = 4096, kvDim = nkv * hs;
@@ -59,10 +61,15 @@ for (const [nh, nkv, hs, positions] of [[8, 8, 64, [16, 256, 1000, 2000, 4000]],
           }
         }
       }
+      (times[`${nh}/${nkv}/${hs}, ${pos}`] ??= {})[name] = best;
       const macs = 2 * nh * (pos + 1) * hs;
       console.log(`| ${name} | ${nh}/${nkv}/${hs}, ${pos} | ${best.old.toFixed(1)} | ${best.new.toFixed(1)} | ${(best.old / best.new).toFixed(2)} | ${(macs / best.old / 1e3).toFixed(2)} → ${(macs / best.new / 1e3).toFixed(2)} |`);
     }
   }
+}
+console.log(`\n| heads / kv heads / head size, position | float16 ÷ float32 old | new |\n|---|---:|---:|`);
+for (const [shape, { attention: f32, attention_f16: f16 }] of Object.entries(times)) {
+  console.log(`| ${shape} | ${(f16.old / f32.old).toFixed(2)} | ${(f16.new / f32.new).toFixed(2)} |`);
 }
 console.log(failed ? "attention-compare: FAILED" : "attention-compare: the outputs agree");
 process.exit(failed ? 1 : 0);

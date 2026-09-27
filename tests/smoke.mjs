@@ -329,6 +329,21 @@ kernel["attention_f16"](out16.ctypes.data, q.ctypes.data, keys.ctypes.data, valu
 kernel["attention_f16"](out16.ctypes.data, q.ctypes.data, keys.ctypes.data, values.ctypes.data, scores.ctypes.data,
                         count - 1, heads, kv_heads, head_size, 3, heads)
 assert np.array_equal(out32, out16), "attention_f16 is not attention over the widened cache"
+# T160: every one of the 65536 halves widened, four at a time (one head of 65536) and one at a time (65536 heads of
+# one), keys and values: an infinity reads 65536 and a NaN 65536 times (1 + mantissa / 1024), as the kernel says
+every = np.arange(65536, dtype=np.uint32).astype(np.uint16)
+top = (every & 0x7c00) == 0x7c00
+stand = np.where(top, np.where(every & 0x8000, -1.0, 1.0) * 65536.0 * (1 + (every & 0x3ff) / 1024.0),
+                 np.where(top, 0, every).astype(np.uint16).view(np.float16).astype(np.float64)).astype(np.float32)
+query = (rng.standard_normal(65536) * 1e-6).astype(np.float32)
+scores = np.empty(65536, dtype=np.float32)
+out32, out16 = (np.empty(65536, dtype=np.float32) for _ in range(2))
+for heads, head_size in ((1, 65536), (65536, 1)):
+    kernel["attention"](out32.ctypes.data, query.ctypes.data, stand.ctypes.data, stand.ctypes.data, scores.ctypes.data,
+                        0, heads, heads, head_size, 0, heads)
+    kernel["attention_f16"](out16.ctypes.data, query.ctypes.data, every.ctypes.data, every.ctypes.data, scores.ctypes.data,
+                            0, heads, heads, head_size, 0, heads)
+    assert np.array_equal(out32.view(np.uint32), out16.view(np.uint32)), f"attention_f16 widens a half wrong ({heads} heads of {head_size})"
 # NumPy takes over when the kernels cannot be loaded
 assert llama2_numpy.Llama(read("stories15M.f32"), read("tokenizer.bin"), kernels="missing.so").backend == "NumPy"
 
