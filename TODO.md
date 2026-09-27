@@ -588,10 +588,11 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 作るもの: 案を持ち主に見せて選んでもらい、`/benchmark/` の報告を短くする。`parseReport()` と `tests/reports.mjs` が読めるまま。
 - 完了条件: 持ち主の Android の報告（GPU の節つき）が URL に入る。
 
-### T186 [描画] ベンチの小さな直し — 状態: 未着手（2026-09-27、同じ回。規模 小）
+### T186 [描画] ベンチの小さな直し — 状態: **画面待ち**（ブランチ `t186-bench-small`、Opus medium）（2026-09-27、同じ回。規模 小）
 - スマホ幅で機能の表の「storage the browser grants」の値が右で切れる（T177 の画面で見つけた）。
 - T175 の `sameAsNormsApart` と量子化の比べが報告に ok / WRONG しか出ない: 細かい数字を 1 行で。
 - 見た目なので `preview.yml` の画面を持ち主に見せる。
+- 作ったもの（2026-09-27）: (1) 列が 2 つの表（名前と値。いまは「This browser」だけ）はセルを折り返す（`table.pairs`、`overflow-wrap: break-word`）。ほかの表は今までどおり折り返さず、表の中で横にスクロールする。(2) 層の判定の後ろに 1 行（`src/bench.js` の `layerCheckNumbers()`）: 4 つの量子化したベクトルのスケールの差の最大と ±1 の数の合計（「quantized: scales 2.5e-7, 6 of 8416 off by 1」、外れたものがあればその 1 つの名前と理由）、DP4A の融合の形は norm を分けた形との差（「norms apart: 2 ulp, 1 off by 1, stream 3.0e-7」、ビット単位で同じなら「bit for bit」だけ）。判定の `quantized` は文ではなく 4 つの `{point, wrong, scale, apart, of}` にし、CI のログ（`bench-check.mjs`）は今までどおり 4 つを別々に出す。報告の長さ（T185）: 層の形 1 つにつき約 40〜90 字増える（未計測）。
 
 ### ベンチの改善の順（2026-09-27）
 T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか（持ち主の iPhone と PC の数字を見て決める。例: llama.cpp の f16 のタイルは持ち主の Android で 1 トークン約 1 秒）→ 知人の独立した GPU の PC で測ってもらう。

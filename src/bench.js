@@ -241,6 +241,24 @@ export function noRatios({ fallback, lost } = {}) {
  * \| as a | in a cell). */
 export const tableCell = (text) => String(text).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
 
+/** T186: the numbers under a layer's verdict in the check (T175), in one short line for the page and the report: its
+ * quantized vectors held to quantize_x (quantized: [{point, wrong, scale, apart, of}]; the worst scale's relative
+ * difference and the values off by 1 of all four, or the first that was wrong) and, for the DP4A fused form, the one
+ * with the norms apart (sameAsNormsApart: {ulps, apart, stream, bitForBit}). "" where the verdict has neither. */
+export function layerCheckNumbers({ quantized, sameAsNormsApart: apart } = {}) {
+  const parts = [];
+  if (quantized?.length) {
+    const wrong = quantized.find((q) => q.wrong);
+    const sum = (key) => quantized.reduce((total, q) => total + q[key], 0);
+    parts.push(wrong ? `quantized: ${wrong.point} ${wrong.wrong}`
+      : `quantized: scales ${Math.max(...quantized.map((q) => q.scale)).toExponential(1)}, ${sum("apart")} of ${sum("of")} off by 1`);
+  }
+  if (apart) {
+    parts.push(`norms apart: ${apart.bitForBit ? "bit for bit" : `${apart.ulps} ulp, ${apart.apart} off by 1, stream ${apart.stream.toExponential(1)}`}`);
+  }
+  return parts.join("; ");
+}
+
 /** Whether the check of the shaders found the one a token's row ran with wrong (or could not run it): widened or
  * packed, and the choosing on the GPU where it chose. */
 function tokenWrong(t, check) {

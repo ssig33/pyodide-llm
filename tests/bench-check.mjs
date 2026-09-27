@@ -148,7 +148,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
       const apart = v.sameAsNormsApart;
       console.log(`check ${name}: ${v.ok ? "ok" : "WRONG"}` + (v.error ? `, ${v.error}` : "") +
         (Number.isFinite(v.stream) ? `, stream ${v.stream.toExponential(1)}, cache ${v.cache.toExponential(1)}` : "") +
-        (v.quantized ? `; ${v.quantized}` : "") +
+        (v.quantized ? `; ${v.quantized.map((q) => `${q.point}: ${q.wrong ?? `scales ${q.scale.toExponential(1)}, ${q.apart} of ${q.of} values off by 1`}`).join("; ")}` : "") +
         (apart ? `; against the norms apart: scales ${apart.ulps} ulp, ${apart.apart} values off by 1, stream ${apart.stream.toExponential(1)}, ${apart.bitForBit ? "bit for bit" : "not bit for bit"}` : "") +
         (name === "tokens on the GPU" ? `; ${v.tokens} tokens, layer ${v.layer}${v.problems ? `, ${v.problems.join(" / ")}` : ""}` : ""));
     }

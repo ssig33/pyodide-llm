@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuTable, environmentOf, loginUrl, parseReport, reportBody,
-         generateTable, gpuSkipped, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerCheckNumbers, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -335,4 +335,13 @@ assert.equal(PATH_WRITES, 64);
 // in the report, under the rounds' table: parseReport() still reads the rounds alone
 const withPath = [markdown, pathTable(real, "tiny-lm 29M")].join("\n\n");
 assert.deepEqual(parseReport(withPath).rows.map((row) => row.name), ["everything", "without the kernels"]);
+// T186: a layer's verdict in one short line: the four quantized vectors summed, the fused form against the norms apart
+const quantized = [{ point: "q, k, v", wrong: null, scale: 1.2e-7, apart: 3, of: 2112 }, { point: "o", wrong: null, scale: 2.5e-7, apart: 1, of: 2112 },
+  { point: "gate, up", wrong: null, scale: 0, apart: 0, of: 2112 }, { point: "down", wrong: null, scale: 1e-8, apart: 2, of: 2080 }];
+assert.equal(layerCheckNumbers({ quantized }), "quantized: scales 2.5e-7, 6 of 8416 off by 1");
+assert.equal(layerCheckNumbers({ quantized, sameAsNormsApart: { ulps: 2, apart: 1, stream: 3e-7, bitForBit: false } }),
+  "quantized: scales 2.5e-7, 6 of 8416 off by 1; norms apart: 2 ulp, 1 off by 1, stream 3.0e-7");
+assert.equal(layerCheckNumbers({ sameAsNormsApart: { ulps: 0, apart: 0, stream: 0, bitForBit: true } }), "norms apart: bit for bit");
+assert.equal(layerCheckNumbers({ quantized: [quantized[0], { ...quantized[1], wrong: "far from quantize_x's" }] }), "quantized: o far from quantize_x's");
+assert.equal(layerCheckNumbers({ worstRelative: 1e-6, ok: true }), "");
 console.log("ok");

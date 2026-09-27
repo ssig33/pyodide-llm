@@ -145,6 +145,17 @@ for (const [width, viewport] of Object.entries(widths)) {
   console.log(`${width}: /benchmark/ ${await page.evaluate(() => Object.entries(window.__benchmark.results).map(([n, r]) => `${n} ${r.status}`).join(", "))}`);
   // the page itself never scrolls sideways at a phone's width: a wide table scrolls inside its section
   console.log(`${width}: /benchmark/ is ${await page.evaluate(() => document.documentElement.scrollWidth)} px wide in a window of ${viewport.width}`);
+  // T186: "This browser" at 360 px (a narrow Android): its table's values wrap instead of running out on the right
+  if (width === "phone") {
+    await page.setViewportSize({ width: 360, height: viewport.height });
+    await page.locator('section[data-section="device"]').scrollIntoViewIfNeeded();
+    await shot(page, "benchmark-device", 360);
+    console.log(`360: "This browser"'s table is ${await page.evaluate(() => {
+      const out = document.querySelector('section[data-section="device"] table');
+      return out ? `${out.scrollWidth} px wide in a box of ${out.parentElement.clientWidth}` : "not there";
+    })}, the page ${await page.evaluate(() => document.documentElement.scrollWidth)} px`);
+    await page.setViewportSize(viewport);
+  }
 
   // T119 (6): a conversion under way says what has arrived, how fast, and what is converted
   await context.close();

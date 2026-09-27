@@ -1183,7 +1183,7 @@ async function checkLayer() {
       // on DP4A, how each quantized vector held (for CI's logs): the worst scale apart and the values off by 1
       verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length && agreed?.ok !== false,
         stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}), ...(agreed === undefined ? {} : { sameAsNormsApart: agreed }),
-        ...(quantizing.length ? { quantized: quantizing.map(([point, q]) => `${point}: ${q.wrong ?? `scales ${q.scale.toExponential(1)}, ${q.apart} of ${q.of} values off by 1`}`).join("; ") } : {}) };
+        ...(quantizing.length ? { quantized: quantizing.map(([point, q]) => ({ point, ...q })) } : {}) };
     } catch (error) {
       verdicts[layerCheck(form)] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
     } finally {

@@ -129,13 +129,16 @@ const BENCH_MODEL = "llm-jp-3-150m";
   .out { overflow-x: auto; }
   .out table { border-collapse: collapse; font-size: 0.8rem; font-variant-numeric: tabular-nums; margin: 6px 0; }
   .out th, .out td { text-align: left; padding: 3px 12px 3px 0; vertical-align: top; white-space: nowrap; }
+  /* a table of two columns (a name and its value: "This browser") wraps its words instead (T186: at 360 px the
+     storage's value was cut off on the right) */
+  .out table.pairs th, .out table.pairs td { white-space: normal; overflow-wrap: break-word; }
   .out th { font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--line); }
   .out p { font-size: 0.8rem; margin: 4px 0; overflow-wrap: anywhere; }
   pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.75rem; background: var(--panel); border-radius: 10px; padding: 10px; }
 </style>
 
 <script>
-  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, pathTable, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -230,7 +233,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
         const rows: string[][] = [];
         for (i += 2; i < lines.length && lines[i].startsWith("|"); i++) rows.push(cells(lines[i]));
         i--;
-        html.push(`<table><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr>${rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</table>`);
+        html.push(`<table${head.length === 2 ? ' class="pairs"' : ""}><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr>${rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</table>`);
       } else if (line.startsWith("#")) {
         continue;  // the section's own title is on the page already
       } else if (line.trim()) {
@@ -506,10 +509,11 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const check = steps.find((s) => s.name === "the shaders against JavaScript");
     if (check?.error) lines.push(`**Shaders against JavaScript**: not checked (${check.error})`, "");
     // a tiled shader the device refused says so (T146); a packed one also says how many of the values the GPU
-    // quantized came out apart from the CPU's
+    // quantized came out apart from the CPU's; a layer, its quantized vectors and the fused form against the norms apart (T186)
     const verdict = ([k, v]: any) => (v.error ? `${k} FAILED (${v.error})`
       : v.tokens !== undefined ? `${k} ${v.ok ? "ok" : "WRONG"} (${v.tokens} tokens, ${v.edge} next to a border${v.problems ? `: ${tableCell(v.problems[0])}` : ""})`
-      : `${k} ${v.ok ? "ok" : "WRONG"} (worst ${v.worstRelative.toExponential(1)}${v.apart === undefined ? "" : `, quantized ${v.far ? "far apart" : `${fixed(100 * v.apart, 2)}% apart by 1`}`})`);
+      : `${k} ${v.ok ? "ok" : "WRONG"} (worst ${v.worstRelative.toExponential(1)}${v.apart === undefined ? "" : `, quantized ${v.far ? "far apart" : `${fixed(100 * v.apart, 2)}% apart by 1`}`}` +
+        `${[layerCheckNumbers(v)].filter(Boolean).map((numbers) => `; ${numbers}`).join("")})`);
     if (check?.result) lines.push(`**Shaders against JavaScript**: ${Object.entries(check.result).map(verdict).join(", ")}`, "");
     const bandwidths = steps.filter((s) => s.name.startsWith("bandwidth"));
     const ceilings = steps.find((s) => s.name === "the device's ceilings")?.result;
