@@ -8,10 +8,12 @@
 // part of "Run all" (it may end the tab): only its own button or ?run=memory runs it, and a page that finds a mark
 // does not run it again (a ?run=memory in the address would otherwise end the tab over and over).
 //
-// A page hidden (another app, the screen locked) or left (a reload, another page) stops the run at once and removes
-// the mark in the event itself (T173's review): a phone ends a hidden page far sooner than one in front, so a tab
-// ended after that says nothing of the limit, and a page left is no tab ended. A mark found is then a tab that ended
-// with no such event: the browser ended it (for its memory, most likely: a crash of another cause looks the same).
+// A page hidden (another app, the screen locked) or left (a reload, another page) stops the run at once (T173's
+// review: the page's visibilitychange and pagehide settle `hidden`), and the run's finally removes the mark in the
+// microtasks right after the event, before the page can be put away: a phone ends a hidden page far sooner than one in
+// front, so a tab ended after that says nothing of the limit, and a page left is no tab ended. A mark found is then a
+// tab that ended with no such event: the browser ended it (for its memory, most likely: a crash of another cause
+// looks the same).
 import { tableCell } from "./bench.js";
 
 export const MEMORY_MARK = "benchmark-memory";
@@ -29,7 +31,7 @@ export function memoryLimit(asked) {
   return Math.min(MEMORY_MOST, Math.max(MEMORY_STEP, Math.floor(bytes / MEMORY_STEP) * MEMORY_STEP));
 }
 
-/** Remove the mark: a run that ended, or one the page stopped (hidden, left, or a section stopped for its silence). */
+/** Remove the mark: a run that ended, or one the page stopped for its silence (it never reaches its own finally). */
 export function forgetMark(storage) {
   try {
     storage?.removeItem(MEMORY_MARK);
@@ -41,7 +43,7 @@ export function forgetMark(storage) {
 /** Grow the worker's memory step by step up to limit, writing the mark before each step. ask(message) answers as the
  * worker does; storage is the tab's sessionStorage (null: none here, and nothing is grown: a tab ended without a
  * mark would report nothing). stage({stage, at, of}) is the page's progress (T177). hidden settles when the page is
- * hidden or left (the page has then removed the mark and ended the worker): the run stops. What it returns is the
+ * hidden or left (the page has then ended the worker): the run stops and removes its mark. What it returns is the
  * section's data: { stop: "limit" | "refused" | "hidden" | "error" | "none", held, trying?, limit, maximum?, why?,
  * seconds }; maximum is the bytes the memory was made with room for, null where the browser refused that. */
 export async function holdMemory({ ask, storage, limit = MEMORY_MOST, stage = () => {}, pause = MEMORY_PAUSE_MS,

@@ -2,7 +2,7 @@
 //
 //   node tests/page-memory.mjs
 import assert from "node:assert/strict";
-import { MEMORY_MARK, MEMORY_MOST, MEMORY_STEP, forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../src/page-memory.js";
+import { MEMORY_MARK, MEMORY_MOST, MEMORY_STEP, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../src/page-memory.js";
 
 const MiB = 2 ** 20;
 // sessionStorage as the page has it; `log` keeps every mark written, in order
@@ -117,8 +117,8 @@ assert.equal(memoryLimit("99999"), MEMORY_MOST, "no more than one 32-bit memory"
   assert.deepEqual(memorySummary(d), ["Page memory: held 128 MiB; the tab ended while it grew to 192 MiB and the page was loaded again: the browser ended it, most likely for its memory"]);
 }
 
-// T173's review: the page hidden or left while a step grows: the run stops at once, holds no more, and leaves no mark
-// (the page removes it in the event: a phone ends a hidden page far sooner, so a tab ended then is no limit)
+// T173's review: the page hidden or left while a step grows: the run stops at once, holds no more, and removes its
+// mark (a phone ends a hidden page far sooner, so a tab ended then is no limit)
 {
   const s = storage(), w = worker();
   let hide, asked = 0;
@@ -126,7 +126,6 @@ assert.equal(memoryLimit("99999"), MEMORY_MOST, "no more than one 32-bit memory"
   // the third step's worker is ended by the page (it never answers), as the page's visibilitychange does
   const ask = (m) => {
     if (++asked < 3) return w.ask(m);
-    forgetMark(s);
     hide();
     return new Promise(() => {});
   };
