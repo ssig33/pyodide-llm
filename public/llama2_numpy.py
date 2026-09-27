@@ -63,9 +63,44 @@ def number(char):
     return unicodedata.category(char)[0] == "N"
 
 
+class CharClasses(dict):
+    r"""What the pre-tokenizer's patterns tell apart, one character for each character (T200): the ASCII letters,
+    the apostrophe, the space, \r and \n as they are (the contractions and the line breaks name them), any other
+    whitespace (str.isspace) "\t", any other letter (\p{L}) "a", a number (\p{N}) "0", anything else "!". A text goes
+    through str.translate() with it, and the standard re module runs the patterns on what comes out: \p{L} and
+    \p{N}, which re has not, become [A-Za-z] and 0. A character is classed the first time it is seen."""
+
+    def __missing__(self, code):
+        char = chr(code)
+        if char.isascii() and char.isalpha() or char in "' \r\n":
+            kind = char
+        elif char.isspace():
+            kind = "\t"
+        elif letter(char):
+            kind = "a"
+        elif number(char):
+            kind = "0"
+        else:
+            kind = "!"
+        self[code] = kind
+        return kind
+
+
+CHAR_CLASSES = CharClasses()
+# pretokenize()'s patterns on the classes: \p{L} is [A-Za-z], \p{N} is 0, \s is [ \t\r\n], anything else ['!]
+CONTRACTED = "'s|'t|'re|'ve|'m|'ll|'d"
+SPACES = r"[ \t\r\n]+(?![^ \t\r\n])|[ \t\r\n]+"
+PATTERNS = {
+    "gpt2": re.compile(CONTRACTED + r"| ?[A-Za-z]+| ?0+| ?['!]+|" + SPACES),
+    "qwen": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-z0]?[A-Za-z]+|0| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    "llama3": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-z0]?[A-Za-z]+|0{1,3}| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+}
+
+
 def pretokenize(text, pattern):
-    r"""Split text the way the tokenizer.json's pre_tokenizer does, without a regex engine: those patterns need
-    \p{L} and \p{N}, which the standard re module has not.
+    r"""Split text the way the tokenizer.json's pre_tokenizer does. Those patterns need \p{L} and \p{N}, which the
+    standard re module has not, so they run on the text's character classes (CharClasses) and the pieces are cut
+    from the text at the same places (T200: a loop of Python over the characters did it before, a tenth as fast).
 
     "gpt2" is what ByteLevel(use_regex) applies:
         's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
@@ -74,82 +109,15 @@ def pretokenize(text, pattern):
     and a piece of anything-but-a-line-break may lead a word):
         (?i:'s|…)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
     "llama3" is Llama 3's, which is Qwen's with the digits taken up to three at a time (\p{N}{1,3}).
-    All four are checked against the real patterns in tests/test_bytebpe.py.
+    All four are checked against the real patterns in tests/test_bytebpe.py and tests/test_llama3.py.
     """
     if pattern == "gpt2-digits":
         parts = []
         for chunk in re.findall(r"\d|\D+", text):
             parts += pretokenize(chunk, "gpt2")
         return parts
-    qwen = pattern in ("qwen", "llama3")
-    digits = 3 if pattern == "llama3" else 1  # how many digits Qwen's branch takes at a time
-    parts, i, n = [], 0, len(text)
-    while i < n:
-        char = text[i]
-        # 's, 't, ... (Qwen matches them whatever the case)
-        if char == "'":
-            rest = text[i:i + 3].lower() if qwen else text[i:i + 3]
-            found = next((c for c in CONTRACTIONS if rest.startswith(c)), None)
-            if found:
-                parts.append(text[i:i + len(found)])
-                i += len(found)
-                continue
-        # letters, with one character in front of them: a space, or (Qwen) anything but a line break
-        start = i
-        lead = i + 1 if i + 1 < n and (char == " " or (qwen and not letter(char) and not number(char)
-                                                      and char not in "\r\n")) else i
-        if lead < n and letter(text[lead]):
-            i = lead
-            while i < n and letter(text[i]):
-                i += 1
-            parts.append(text[start:i])
-            continue
-        # digits: Qwen takes them one by one (Llama 3 up to three), GPT-2 takes a run and may put a space in front
-        if qwen and number(char):
-            while i < n and i - start < digits and number(text[i]):
-                i += 1
-            parts.append(text[start:i])
-            continue
-        if not qwen:
-            lead = i + 1 if char == " " and i + 1 < n and number(text[i + 1]) else i
-            if lead < n and number(text[lead]):
-                i = lead
-                while i < n and number(text[i]):
-                    i += 1
-                parts.append(text[start:i])
-                continue
-        # everything else that is not a space, with a space allowed in front of it
-        lead = i + 1 if char == " " and i + 1 < n and not text[i + 1].isspace() else i
-        if lead < n and not text[lead].isspace() and not letter(text[lead]) and not number(text[lead]):
-            i = lead
-            while i < n and not text[i].isspace() and not letter(text[i]) and not number(text[i]):
-                i += 1
-            if qwen:  # the line breaks that follow belong to the same piece
-                while i < n and text[i] in "\r\n":
-                    i += 1
-            parts.append(text[start:i])
-            continue
-        # whitespace. Qwen takes a run up to its last line break (\s*[\r\n]+: spaces between line breaks go with
-        # them); otherwise a run that is followed by a word leaves its last character to that word, and a run at
-        # the end of the text stays whole.
-        i = start
-        if qwen:
-            j = i
-            while j < n and text[j].isspace():
-                j += 1
-            while j > i and text[j - 1] not in "\r\n":
-                j -= 1
-            if j > i:
-                parts.append(text[i:j])
-                i = j
-                continue
-        j = i
-        while j < n and text[j].isspace():
-            j += 1
-        end = j if j == n or j - 1 == i else j - 1
-        parts.append(text[i:end])
-        i = end
-    return parts
+    classes = text.translate(CHAR_CLASSES)
+    return [text[match.start():match.end()] for match in PATTERNS.get(pattern, PATTERNS["gpt2"]).finditer(classes)]
 
 
 # sentencepiece's nmt_ normalizers (nmt_nfkc, nmt_nfkc_cf): these characters become a space, and these go
@@ -192,12 +160,25 @@ class Tokenizer:
             self.index.setdefault(piece, i)
         # raw byte tokens look like b"<0x0A>"; they spell out whatever the vocabulary lacks
         self.byte_tokens = [self.index.get(b"<0x%02X>" % byte, byte + 3) for byte in range(256)]
-        self.max_piece_chars = max(len(piece.decode("utf-8", "ignore")) for piece in self.vocab)
         # byte-level pieces are text, and the merging works on that text rather than on bytes
         self.text_index = {}
         if self.kind == "bytebpe":
             for i, piece in enumerate(self.vocab):
                 self.text_index.setdefault(piece.decode("utf-8", "replace"), i)
+        # the Viterbi search's pieces as text: (token, score) of each piece it can match (the first of equal pieces,
+        # as index finds it), and how long a piece that begins with two given characters can be (T200)
+        self.pieces, self.reach = {}, {}
+        if self.kind == "unigram":
+            for i, piece in enumerate(self.vocab):
+                if self.index[piece] != i or not self.scores[i] > self.UNMATCHABLE:
+                    continue
+                try:
+                    text = piece.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue  # no text encodes to it
+                self.pieces[text] = (i, self.scores[i])
+                if len(text) > 1:
+                    self.reach[text[:2]] = max(self.reach.get(text[:2], 0), len(text))
         self.unknown_score = min(score for score in self.scores if score > self.UNMATCHABLE) - 10.0
 
     def encode(self, text, specials=()):
@@ -248,15 +229,36 @@ class Tokenizer:
                 tokens.extend(self.byte_tokens[byte] for byte in piece)
 
         # Merge the best consecutive pair each iteration, according to the scores in vocab_scores
-        while True:
-            best_score, best_id, best_idx = -1e10, -1, -1
-            for i in range(len(tokens) - 1):
-                id = self.index.get(self.vocab[tokens[i]] + self.vocab[tokens[i + 1]])
-                if id is not None and self.scores[id] > best_score:
-                    best_score, best_id, best_idx = self.scores[id], id, i
-            if best_idx == -1:
-                return tokens
-            tokens[best_idx:best_idx + 2] = [best_id]
+        return self.merged([self.vocab[token] for token in tokens], tokens, self.index, -1e10)
+
+    def merged(self, pieces, tokens, index, floor):
+        """Merge the adjacent pair whose joined piece index has and scores best (the first of equal scores; above
+        floor), until no pair is left to merge. pieces: the text of each symbol (bytes or str), tokens: its token or
+        None, both changed in place. Only the pairs next to a merge change, so the scores of the others are kept
+        from one merge to the next (T200: each merge had looked every pair up again)."""
+        def pair(k):
+            """the score and the token of the pieces k and k + 1 joined; minus infinity where they do not merge"""
+            id = index.get(pieces[k] + pieces[k + 1])
+            return (self.scores[id], id) if id is not None and self.scores[id] > floor else (-math.inf, -1)
+
+        ranks, joined = [], []
+        for k in range(len(pieces) - 1):
+            score, id = pair(k)
+            ranks.append(score)
+            joined.append(id)
+        while ranks:
+            best = max(ranks)
+            if best == -math.inf:
+                break
+            i = ranks.index(best)
+            pieces[i:i + 2] = [pieces[i] + pieces[i + 1]]
+            if tokens is not None:
+                tokens[i:i + 2] = [joined[i]]
+            del ranks[i], joined[i]  # the pair merged; the pairs after it move down by one
+            for k in (i - 1, i):  # the pairs with the merged piece
+                if 0 <= k < len(ranks):
+                    ranks[k], joined[k] = pair(k)
+        return tokens
 
     def encode_bytebpe(self, text):
         # The pre-tokenizer keeps merges inside a word: the pieces never cross from a word into the next.
@@ -266,29 +268,25 @@ class Tokenizer:
             if self.ignore_merges and "".join(symbols) in self.text_index:
                 # Llama 3: a piece the vocabulary has is that one token, whatever the merges would make of it
                 symbols = ["".join(symbols)]
-            while len(symbols) > 1:
-                best_score, best_id, best_idx = self.UNMATCHABLE, -1, -1
-                for i in range(len(symbols) - 1):
-                    id = self.text_index.get(symbols[i] + symbols[i + 1])
-                    if id is not None and self.scores[id] > best_score:
-                        best_score, best_id, best_idx = self.scores[id], id, i
-                if best_idx == -1:
-                    break
-                symbols[best_idx:best_idx + 2] = [self.vocab[best_id].decode("utf-8", "replace")]
+            # a merged symbol is the text of the joined piece (text_index maps each text to a piece of that text)
+            self.merged(symbols, None, self.text_index, self.UNMATCHABLE)
             tokens += [self.text_index[symbol] for symbol in symbols]
         return tokens
 
     def encode_unigram(self, text):
-        # Viterbi: best[j] is the best total score of any segmentation of text[:j]
-        best = [0.0] + [-math.inf] * len(text)
-        back = [None] * (len(text) + 1)
-        for i in range(len(text)):
-            if best[i] == -math.inf:
+        # Viterbi: best[j] is the best total score of any segmentation of text[:j]. The pieces that begin at i are
+        # no longer than the reach of text[i:i + 2] (one character where no longer piece begins with those two).
+        n, pieces, reach = len(text), self.pieces, self.reach
+        best = [0.0] + [-math.inf] * n
+        back = [None] * (n + 1)
+        for i in range(n):
+            here = best[i]
+            if here == -math.inf:
                 continue
-            for j in range(i + 1, min(len(text), i + self.max_piece_chars) + 1):
-                id = self.index.get(text[i:j].encode("utf-8"))
-                if id is not None and self.scores[id] > self.UNMATCHABLE and best[i] + self.scores[id] > best[j]:
-                    best[j], back[j] = best[i] + self.scores[id], (i, [id])
+            for j in range(i + 1, min(n, i + reach.get(text[i:i + 2], 1)) + 1):
+                found = pieces.get(text[i:j])
+                if found is not None and here + found[1] > best[j]:
+                    best[j], back[j] = here + found[1], (i, [found[0]])
             # a character the vocabulary lacks becomes its UTF-8 bytes, at a penalty
             if back[i + 1] is None or back[i + 1][0] != i:
                 score = best[i] + self.unknown_score
