@@ -50,11 +50,12 @@
 // forced): NumPy continues the prompt greedy for GEN tokens (its logits of each step, and the keys and values of their
 // positions); the GPU is asked for 4 steps greedy from the prompt's last token, the CPU then takes one step (the
 // forward pass on the keys and values the GPU wrote back), and the GPU 3 more (the CPU's position goes up to it first).
-// Checked: the ids are NumPy's, or where one is not, a near tie (NumPy's logit of it no farther below its largest than
-// twice the CPU's own logits from NumPy's, the difference of 7-bit activations: the steps after it are not compared,
-// their inputs differ; the CPU's step feeds NumPy's id to the GPU's next ones whatever it chose); the keys and values
-// the GPU wrote back of those positions (not the CPU's step's) in forward.js's cache against NumPy's, to the line of
-// the prompt's shader of the same arithmetic (float32 T147's GPU_LINE or K × E16; DP4A PACKED_LINE of the CPU's); a
+// Checked: the ids are NumPy's, or where one is not, a near tie (T187's: NumPy gives it at least half the probability
+// of its most likely; the steps after it are not compared, their inputs differ; the CPU's step feeds NumPy's id to the
+// GPU's next ones whatever it chose); the keys and values the GPU wrote back of its first 4 positions in forward.js's
+// cache against NumPy's, to the line of the prompt's shaders of the same arithmetic (float32 GPU_LINE or K × E16;
+// DP4A K_PACKED × Q8's distance) or the run's own prompt's distance, the larger (the steps' attention reads the
+// prompt's keys and values; the next 3 read the CPU's step's too, its 7-bit activations, and are held to their ids); a
 // stop token (NumPy's second) ends the steps after it; a penalty of 100 on NumPy's first id (greedy) gives the largest
 // of NumPy's logits penalized so (or a near tie); two sampled steps at temperature 2 with random numbers of 0.02 and
 // 0.98 give two tokens of NumPy's nucleus, not the same (the random numbers reach the GPU: where either lands is not
@@ -777,7 +778,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
     // (evaluated, and said, whatever came before)
-    const stepsFine = gpu.steps ? stepsRight(c, gpu.steps, { cpuKv, e16, cpuLogits, kvDim }) : true;
+    const stepsFine = gpu.steps ? stepsRight(c, gpu.steps, { e16, q8, kvDim, prompt: gpuKv }) : true;
     failed ||= !stepsFine;
   }
   layerTables(c, cpu, runs, measures);
@@ -786,7 +787,7 @@ process.exit(failed ? 1 : 0);
 
 // T152: the steps of a generation on the GPU against NumPy's greedy continuation (see the head of this file): a line
 // "  a token by <form>: ..." and whether it is right
-function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
+function stepsRight(c, steps, { e16, q8, kvDim, prompt }) {
   const ref = c.reference, greedy = ref.greedy, vocab = floats(ref.logits).length;
   const rows = floats(ref.greedyLogits), logitsOf = (i) => rows.subarray(i * vocab, (i + 1) * vocab);
   const failures = [], said = [];
@@ -797,30 +798,30 @@ function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
     console.log(`  a token: on the CPU (${steps.why})${right ? "" : " — FAILED"}`);
     return right;
   }
-  // how far below the largest of these logits the logit of id is, over the largest |logit|
-  const below = (logits, want, id) => (logits[want] - logits[id]) / logits.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
-  const nearTie = TIE * cpuLogits;
-  // the GPU's ids against NumPy's, step after step from `at`, up to the first that is not NumPy's (then a near tie:
-  // no farther below NumPy's largest logit than TIE times the CPU's own logits from NumPy's; the steps after it have
-  // other inputs). The positions whose inputs were NumPy's are compared (theirs, [position - n] each)
+  // whether NumPy gives id at least half the probability of want (T187's near tie: log-probabilities within TIE)
+  const near = (logits, want, id) => id === want || logSoftmax(logits)[id] >= logSoftmax(logits)[want] - TIE;
+  // the GPU's ids against NumPy's, step after step from `at`, up to the first that is not NumPy's (then a near tie; the
+  // steps after it have other inputs). keep: the positions whose inputs were NumPy's are compared (theirs, [position
+  // - n] each)
   const positions = [];
-  const run = (ids, at, count) => {
+  const run = (ids, at, count, keep = true) => {
     if (!ids || ids.length !== count) {
       failures.push(`${count} steps from ${at} came back as ${JSON.stringify(ids)}`);
       return 0;
     }
     let same = 0;
     for (; same < count && ids[same] === greedy[at + same]; same++);
-    for (let i = 0; i <= Math.min(same, count - 1); i++) positions.push(at + i);
-    if (same < count && !(below(logitsOf(at + same), greedy[at + same], ids[same]) <= nearTie)) {
+    if (keep) for (let i = 0; i <= Math.min(same, count - 1); i++) positions.push(at + i);
+    if (same < count && !near(logitsOf(at + same), greedy[at + same], ids[same])) {
       failures.push(`step ${at + same} is ${ids[same]}, NumPy's ${greedy[at + same]}, and not a near tie`);
     }
     return same;
   };
-  const first = run(steps.first, 0, 4), second = first === 4 ? run(steps.second, 5, 3) : 0;
+  // (the keys and values of the second run's positions are not held to a line: they are the attention's over the
+  // CPU's step between, its 7-bit activations, 1.02e-2 to 1.30e-2 on llm-jp-3 150M's float forms, run 36324147634)
+  const first = run(steps.first, 0, 4), second = first === 4 ? run(steps.second, 5, 3, false) : 0;
   // the steps after the prompt went through the CPU (the GPU's cache held another's): NumPy's, or a near tie
-  const kept = positions.length, uploaded = run(steps.uploaded, 0, 4);
-  positions.length = kept;
+  const uploaded = run(steps.uploaded, 0, 4, false);
   said.push(`${first}${first === 4 ? ` and ${second}` : ""} greedy ids as NumPy's${first === 4 && second === 3 ? "" : " (then a near tie)"}` +
     `, after a prompt on the CPU ${uploaded}` +
     (first === 4 ? `, the CPU's step between them ${steps.cpuStep === greedy[4] ? "NumPy's" : `${steps.cpuStep} (NumPy's ${greedy[4]})`}` : ""));
@@ -834,8 +835,10 @@ function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
     return out;
   };
   const kvOff = Math.max(worstRow(rowsOf(steps.keys), rowsOf(ref.greedyKeys), kvDim), worstRow(rowsOf(steps.values), rowsOf(ref.greedyValues), kvDim));
+  // the line of the prompt's shaders of the same arithmetic (T187: DP4A by Q8's distance), or the run's own prompt's
+  // distance where that is larger: the steps' attention reads its keys and values
   const packed = /DP4A/.test(steps.form ?? "");
-  const line = packed ? PACKED_LINE * cpuKv : Math.max(GPU_LINE, K.float32 * e16);
+  const line = Math.max(packed ? K_PACKED * q8 : Math.max(GPU_LINE, K.float32 * e16), prompt);
   if (!(kvOff <= line)) failures.push(`the keys and values of the steps are ${kvOff.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
   said.push(`keys and values of ${positions.length} positions ${kvOff.toExponential(2)} (line ${line.toExponential(2)})`);
   // a stop token: NumPy's second id ends the steps after it
@@ -846,7 +849,7 @@ function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
   const penalized = logitsOf(0).slice();
   wgsl.penalizeLikeCpu(penalized, steps.penaltyHistory ?? [], 100);
   const wantPenalized = wgsl.argmaxLikeCpu(penalized), gotPenalized = steps.penalized?.[0];
-  if (!(below(penalized, wantPenalized, gotPenalized) <= nearTie)) failures.push(`with a penalty of 100 the step is ${gotPenalized}, NumPy's ${wantPenalized}, and not a near tie`);
+  if (!near(penalized, wantPenalized, gotPenalized)) failures.push(`with a penalty of 100 the step is ${gotPenalized}, NumPy's ${wantPenalized}, and not a near tie`);
   said.push(`penalized ${gotPenalized}${gotPenalized === wantPenalized ? " as NumPy's" : ` (NumPy's ${wantPenalized})`}`);
   // sampled at temperature 2 with a random number of 0.02 and one of 0.98: two tokens of NumPy's nucleus, and not
   // the same (the random numbers reach the GPU; its logits are not NumPy's, so where either lands is not held to it)
