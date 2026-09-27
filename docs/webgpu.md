@@ -6,7 +6,9 @@ GPU today, how the page chooses, and what has been measured.
 
 ## What runs on the GPU today
 
-**The blocks of a prompt**, up to 64 tokens at a time. The tokens the model writes still run on the CPU.
+**The blocks of a prompt**, up to 64 tokens at a time, and **the tokens the model writes**, 4 at a time (the
+forward pass and the sampling of each on the GPU, the ids read back once), for models of Llama's shape. Each goes to
+the GPU only where the device measures it faster than the CPU.
 
 The reason is the first measurement (2026-09-26, on the owner's three devices): moving the generation of one token
 to the GPU as it was on the CPU was slower everywhere. For Llama 3.2 1B, the GPU's speed divided by the CPU's was
@@ -26,16 +28,22 @@ tokens, and the fixed cost is shared among them.
    runs on the GPU only if the GPU is expected to take less than 0.95 of the CPU's time. Short prompts stay on the
    CPU, because the GPU's fixed cost is not shared among enough tokens.
 4. The GPU writes the keys and values of each layer back into the CPU's cache (in float16; widened to float32 where
-   the CPU keeps them so, for most models with grouped-query attention), and the rest (the last token of the prompt
-   and everything the model writes) runs on the CPU.
-5. Every 8 answers, the page measures the side it did not choose again, on part of a prompt, in case the device
-   has warmed up or cooled down.
+   the CPU keeps them so, for most models with grouped-query attention), so either side can go on from any position.
+5. For the tokens the model writes, the GPU runs one token's layer in a fused form (the matrices of the one-token
+   benchmark below: llama.cpp's `mul_mat_vec` or ONNX Runtime's DP4A), checks each form against JavaScript on the
+   model's own first layer and classifier, and takes the fastest. Four tokens go in one submission, each sampled on
+   the GPU with the random number the CPU drew for it. The page times a token on each side and gives the tokens to
+   the GPU where it is faster by more than 5%. Models with biases (Qwen2), per-head norms (Qwen3), LayerNorm (GPT-2,
+   GPT-NeoX) or matrices whose parts do not start on the device's binding alignment keep their tokens on the CPU.
+6. Every 8 answers, the page measures the side it did not choose again, on part of a prompt and on the first
+   tokens of an answer, in case the device has warmed up or cooled down.
 
 The page is ready without waiting for the GPU: until the GPU is ready, prompts run on the CPU. The shape it chose
 is remembered per model and device, so the next visit compiles two shaders instead of all of them.
 
 The status line says what happens: "prompts on WebGPU", "prompts of 29 tokens and more on WebGPU", "prompts on the
-CPU (faster here than WebGPU)", or "prompts on the CPU (reason)".
+CPU (faster here than WebGPU)", or "prompts on the CPU (reason)", and then "tokens on WebGPU", "tokens on the CPU
+(faster here than WebGPU)" or "tokens on the CPU (reason)".
 
 ## Where the GPU is not used
 
@@ -70,11 +78,11 @@ The shapes are taken from public implementations, and each file keeps their noti
 | LayerNorm of GPT-2 and GPT-NeoX | llama.cpp's `row_norm` NORM (MIT), with the weight and the bias in the same dispatch as llama.cpp's Metal `kernel_norm_mul_add_f32` has them (MIT) |
 | GELU of GPT-2 and GPT-NeoX | llama.cpp's `unary` GELU (MIT) |
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
-| One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |
-| One token's layer on packed int8 dot products, the vector quantized before each matrix (benchmark only) | ONNX Runtime's DP4A MatMulNBits for small M (MIT), with the fused writes of the line above. The norm and its quantizing in one dispatch take their form from vLLM's `rms_norm_per_block_quant` (Apache-2.0; no lines copied). |
+| One token's layer in 5 dispatches instead of 14 | built on llama.cpp's `mul_mat_vec` |
+| One token's layer on packed int8 dot products, the vector quantized before each matrix | ONNX Runtime's DP4A MatMulNBits for small M (MIT), with the fused writes of the line above. The norm and its quantizing in one dispatch take their form from vLLM's `rms_norm_per_block_quant` (Apache-2.0; no lines copied). |
 | 6-bit weights widened to int8 as they are uploaded | ours (the packing is this project's); four values a 32-bit word by byte masks and shifts, the form of llama.cpp's Q6_K in CUDA and Metal (MIT; no lines copied) |
 | The device's ceilings (benchmark only) | the loops of clpeak (GPL-3.0): the shapes only, no lines copied |
-| Sampling on the GPU and several tokens a submission (benchmark only): the repetition penalty, softmax, top-p and the draw, the next token's row of the embedding | the penalty of MLC LLM (Apache-2.0); llama.cpp's `argmax`, `soft_max`, `cumsum` and `get_rows` (MIT); top-p without sorting from MLC LLM's `top_p_pivot` (Apache-2.0). Carrying the state from one token to the next, and the draw by the same pivots, are ours. |
+| Sampling on the GPU and several tokens a submission: the repetition penalty, softmax, top-p and the draw, the next token's row of the embedding | the penalty of MLC LLM (Apache-2.0); llama.cpp's `argmax`, `soft_max`, `cumsum` and `get_rows` (MIT); top-p without sorting from MLC LLM's `top_p_pivot` (Apache-2.0). Carrying the state from one token to the next, and the draw by the same pivots, are ours. |
 
 ## Measured
 
@@ -92,6 +100,8 @@ say only that the shaders are right, not how fast a GPU is.
 - `tests/gpu-check.mjs` runs a prompt of 150 tokens on the CPU and on the GPU, and compares the keys and values
   written back and the logits of the last token with NumPy. It runs every shader shape, and the attention without
   subgroups, in Chromium's SwiftShader and in Node with Dawn and Mesa's lavapipe.
+- It then writes 8 tokens greedy on the GPU (4, one on the CPU, 3 more) and checks the ids against NumPy's
+  (or a near tie), the keys and values written back, a stop token and a sampled token.
 - Deliberately broken shaders (a wrong causal mask, a RoPE sign, a GQA head mapping, a missing quantization step
   and others) fail these checks.
 - The sampling on the GPU picks the token the CPU's sampling picks for the same logits and random number (or, where
@@ -101,10 +111,9 @@ say only that the shaders are right, not how fast a GPU is.
 
 ## Next
 
-In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
-GPU with the CPU's random numbers, is in the benchmark: a seed gives the same text again on the same device and the
+In order: keeping the weights once instead of twice. A seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
-activations to 7 or 8 bits)); then keeping the weights once instead of twice. The tasks are in
+activations to 7 or 8 bits), and whose random numbers are drawn 4 at a time on the GPU. The tasks are in
 [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself
