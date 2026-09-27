@@ -26,11 +26,21 @@
 //   - the logits of the prompt's last token (the CPU's in both runs, on the GPU's keys and values in one): the same
 //     most likely token as the run on the CPU, and no farther from NumPy's than LOGITS_LINE times that run (see there).
 // "synthetic": a made-up int8 model with grouped-query attention (4 heads, 2 of keys and values; none of the models
-// of this directory has it). The others are the models of this directory (make models kernels).
+// of this directory has it). The others are the models of this directory (make models kernels), or <prefix>.json: a
+// model tests/perplexity_prepare.py converted (<prefix>.bin, <prefix>.tokenizer.bin, and the options in <prefix>.json;
+// gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
+// the native Python (tests/gpu_answer.py; $PYTHON, python3 by default).
+//
+// T183: what a person reads to judge it, in the log of CI (the development machine does not run WebGPU's tests): for
+// each model two tables of the keys and values by layer, one column a run (the CPU's, and the GPU's lettered A, B...):
+// against NumPy's, and E16, against NumPy's with its cache rounded to float16 as it is written (T153's review: what
+// is left is the GPU's arithmetic, not the cache's); a line a run with its form, its line and the ratio to it; and a
+// line of the seconds of every step.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { pyodideWithEngine } from "./engine.mjs";
 import { MODELS } from "../src/models.js";
 
@@ -66,6 +76,7 @@ const LOGITS_LINE = 1.5;
 
 // ---- Node: the plans and NumPy's answers
 const { pyodide: py } = await pyodideWithEngine();
+py.FS.writeFile("gpu_answer.py", fs.readFileSync(path.join(root, "tests", "gpu_answer.py")));
 py.runPython(`
 import base64, struct, numpy as np, llama2_numpy, llama2_convert
 from llama2_numpy import Llama
@@ -88,23 +99,7 @@ def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_
     tokenizer = struct.pack("<i", max(map(len, pieces))) + b"".join(struct.pack("<fi", 0.0, len(p)) + p for p in pieces)
     return b"".join(out), tokenizer
 
-def answer(data, vocabulary, text, count, options):
-    """NumPy's keys and values of the prompt's first count - 1 positions ([layers][positions][kv dim] each) and the
-    logits of its last token, and the tokens"""
-    numpy = Llama(data, vocabulary, **options)
-    if text:
-        tokens = ([numpy.bos] + list(numpy.tokenizer.encode(text)))[:count]
-    else:
-        tokens = [numpy.bos] + [int(t) for t in np.random.default_rng(1).integers(3, numpy.vocab_size, count - 1)]
-    assert len(tokens) == count, f"the text is {len(tokens)} tokens long"
-    for pos, token in enumerate(tokens[:-1]):
-        numpy.forward(token, pos, need_logits=False)
-    logits = numpy.forward(tokens[-1], count - 1)
-    n = count - 1
-    kv = lambda cache: np.ascontiguousarray(cache[:, :, :n, :].transpose(0, 2, 1, 3).reshape(numpy.n_layers, n, -1), dtype=np.float32)
-    b64 = lambda a: base64.b64encode(np.ascontiguousarray(a, dtype=np.float32).tobytes()).decode()
-    return {"tokens": tokens, "logits": b64(logits), "keys": b64(kv(numpy.key_cache)), "values": b64(kv(numpy.value_cache)),
-            "header": list(struct.unpack_from("<7i", data, 0))}
+from gpu_answer import answer  # tests/gpu_answer.py, which Pyodide has next to the engine
 `);
 
 // each text three times over: long enough for COUNT tokens of every model here
@@ -119,6 +114,10 @@ const directory = path.join(root, ".tmp", "gpu-check");
 fs.mkdirSync(directory, { recursive: true });
 for (const id of ids) {
   let options, text;
+  if (id.endsWith(".json")) {
+    cases.push(prepared(id));
+    continue;
+  }
   if (id === "synthetic") {
     py.runPython(`data, vocabulary = synthetic()`);
     options = { dtype: "int8" };
@@ -134,10 +133,37 @@ for (const id of ids) {
   if (options.dtype !== "int8") throw new Error(`${id} is ${options.dtype}: the GPU takes int8 weights`);
   py.globals.set("OPTIONS", py.toPy(options));
   py.globals.set("TEXT", text ?? "");
+  const began = performance.now();
   const reference = py.runPython(`answer(data, vocabulary, TEXT, ${COUNT}, OPTIONS)`).toJs({ dict_converter: Object.fromEntries });
-  // the plan forward.js gets from Python, recorded: Llama(external=) with a start() that keeps it
+  const exact = (performance.now() - began) / 1000, halfBegan = performance.now();
+  const reference16 = py.runPython(`answer(data, vocabulary, TEXT, ${COUNT}, OPTIONS, half=True)`).toJs({ dict_converter: Object.fromEntries });
+  const seconds = { NumPy: exact, "NumPy, a float16 cache": (performance.now() - halfBegan) / 1000 };
+  cases.push({ ...caseOf(id, options, reference, py.runPython("data").toJs()), reference16, seconds });
+}
+// T183: a model tests/perplexity_prepare.py converted, NumPy's answers from the native Python (T153: Qwen3 0.6B
+// widened to float32 is 2.4 GB, which with the file's copies went past Pyodide's 4 GB); the text by the model's note
+// where the file is named for a model of src/models.js (gpu-prompt.yml's real=)
+function prepared(id) {
+  const prefix = id.slice(0, -".json".length), began = performance.now();
+  const options = JSON.parse(fs.readFileSync(id, "utf8"));
+  if (options.dtype !== "int8") throw new Error(`${id} is ${options.dtype}: the GPU takes int8 weights`);
+  const entry = MODELS.find((m) => m.id === path.basename(prefix));
+  const text = (/日本語/.test(entry?.note ?? "") ? TEXTS.japanese : TEXTS.english).repeat(3);
+  const native = spawnSync(process.env.PYTHON ?? "python3", [path.join(root, "tests", "gpu_answer.py"), prefix, String(COUNT), text],
+    { encoding: "utf8", maxBuffer: 1 << 30, stdio: ["ignore", "pipe", "inherit"] });
+  if (native.status !== 0) throw new Error(`NumPy's answer for ${id} failed (${native.status ?? native.signal})`);
+  const { exact, half } = JSON.parse(native.stdout);
+  py.FS.writeFile("tokenizer.bin", fs.readFileSync(`${prefix}.tokenizer.bin`));
+  py.runPython(`vocabulary = open("tokenizer.bin", "rb").read()`);
+  const seconds = { "NumPy and NumPy with a float16 cache (native)": (performance.now() - began) / 1000 };
+  return { ...caseOf(id, options, exact, new Uint8Array(fs.readFileSync(`${prefix}.bin`))), reference16: half, seconds };
+}
+// the plan forward.js gets from Python (the vocabulary in Pyodide's globals), recorded: Llama(external=) with a start()
+// that keeps it, and the case the browser runs
+function caseOf(id, options, reference, bytes) {
+  const began = performance.now();
   let plan;
-  const bytes = py.runPython("data").toJs();
+  py.globals.set("OPTIONS", py.toPy(options));
   py.globals.set("recorder", {
     size: bytes.length,
     read: (offset, length) => bytes.slice(offset, offset + length),
@@ -149,9 +175,10 @@ for (const id of ids) {
   py.runPython(`Llama(None, vocabulary, kernels="simdkernel.so", external=recorder, **OPTIONS).release()`);
   plan.kv_start = KV_START;
   for (const [name, value] of Object.entries(plan.derived)) plan.derived[name] = Buffer.from(value).toString("base64");
-  const file = path.join(directory, `${id}.bin`);
+  const name = path.basename(id), file = path.join(directory, `${name}.bin`);
   fs.writeFileSync(file, bytes);
-  cases.push({ id, plan, checkpoint: `/case/${id}.bin`, file, reference });
+  const planned = (performance.now() - began) / 1000;
+  return { id, plan, headDim: options.head_dim ?? 0, checkpoint: `/case/${name}.bin`, file, reference, planned };
 }
 
 // ---- the browser: a page that is cross-origin isolated (its own headers), a worker that runs forward.js
@@ -182,14 +209,16 @@ try {
     const plan = c.plan;
     for (const name of Object.keys(plan.derived)) plan.derived[name] = Uint8Array.from(atob(plan.derived[name]), (ch) => ch.charCodeAt(0));
     const checkpoint = await fetched(c.checkpoint), size = checkpoint.length, tokens = c.reference.tokens, n = tokens.length - 1;
-    const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start }) });
+    const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start, head_dim: c.headDim }) });
     new Uint8Array(memory.buffer, base, size).set(checkpoint);
     // T148: SwiftShader and lavapipe are fallback adapters, which the page refuses: the tests take them (fallback),
     // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU)
     const TESTS = { fallback: true, always: true };
     const run = async (gpu, gpuForce, gpuRemembered) => {
+      const started = performance.now();
       const engine = createForward({ memory, base, size, kernels, plan, gpu, gpuForce: { ...TESTS, ...gpuForce }, gpuRemembered });
       const note = gpu ? await engine.gpu : undefined;
+      const readySeconds = (performance.now() - started) / 1000;
       const ready = engine.gpuReady;
       const began = performance.now();
       // blocks of 16 at first (T108's, as Python handed them before T147): each block sees the keys and values the
@@ -213,7 +242,8 @@ try {
         out.past = { gpuTokens: engine.gpuTokens };
       }
       engine.release();
-      return out;
+      // T183: the seconds of the run, and of those until the GPU's worker said it was ready (its shaders compiled)
+      return { ...out, seconds: (performance.now() - started) / 1000, readySeconds };
     };
     // T147: a GPU that answers late. forward.js gives its request up (stalledMs 1: the GPU's worker counts every 250
     // ms) and runs the block itself; the stop it posts never reaches the worker (a worker that went on before it read
@@ -283,7 +313,7 @@ const server = http.createServer((req, res) => {
   const found = cases.find((c) => c.checkpoint === pathname);
   if (pathname === "/") return send(types[".html"], PAGE);
   if (pathname === "/harness.js") return send(types[".js"], `const ONLY = ${JSON.stringify(only ? only.split(",") : [])};\n${HARNESS}`);
-  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, ...c }) => c)));
+  if (pathname === "/cases.json") return send(types[".json"], JSON.stringify(cases.map(({ file, reference16, ...c }) => c)));
   if (found) return send("application/octet-stream", fs.readFileSync(found.file));
   const file = path.join(root, "public", pathname.replace(/^\/public\//, ""));
   if (!pathname.startsWith("/public/") || !fs.existsSync(file)) {
@@ -393,7 +423,7 @@ const argmax = (xs) => xs.reduce((best, x, i) => (x > xs[best] ? i : best), 0);
 let failed = false;
 for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results) {
   const c = cases.find((entry) => entry.id === id), ref = c.reference, n = ref.tokens.length - 1;
-  const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (dim / heads) * kvHeads;
+  const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (c.headDim || dim / heads) * kvHeads;
   const kv = (run) => Math.max(worstRow(floats(run.keys), floats(ref.keys), kvDim), worstRow(floats(run.values), floats(ref.values), kvDim));
   const cpuKv = kv(cpu);
   const want = floats(ref.logits), largest = want.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
@@ -430,6 +460,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const line = /DP4A/.test(gpu.form ?? "") ? PACKED_LINE * cpuKv : /f16/.test(gpu.form ?? "") ? HALF_LINE : GPU_LINE;
     const gpuKv = kv(gpu), againKv = gpu.again ? kv(gpu.again) : NaN;
+    gpu.line = line;
     if (!(gpuKv <= line) || !(againKv <= line)) {
       failures.push(`the keys and values of the GPU are ${gpuKv.toExponential(2)} and ${againKv.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
     }
@@ -446,5 +477,45 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
   }
+  layerTables(c, cpu, runs);
 }
 process.exit(failed ? 1 : 0);
+
+// T183: what a person reads in the log of CI to judge the numbers (Markdown: gpu-prompt.yml puts the log in the run's
+// summary too). Two tables of the keys and values by layer, a column a run: against NumPy's, and E16, against NumPy's
+// with its cache rounded to float16 as it is written (tests/gpu_answer.py); a line a run with its form, its line and
+// the ratio to it; the seconds of every step. The runs are the GPU's worker's first run (the forms it chose), then
+// one a form of the matrices (T147), then the attention without subgroups.
+function layerTables(c, cpu, runs) {
+  const ref = c.reference, n = ref.tokens.length - 1;
+  const [dim, , layers, heads, kvHeads] = ref.header, kvDim = (c.headDim || dim / heads) * kvHeads;
+  const byLayer = (run, want) => Array.from({ length: layers }, (_, l) => {
+    const layer = (b64) => floats(b64).subarray(l * n * kvDim, (l + 1) * n * kvDim);
+    return Math.max(worstRow(layer(run.keys), layer(want.keys), kvDim), worstRow(layer(run.values), layer(want.values), kvDim));
+  });
+  const e = (x) => x.toExponential(1);
+  const columns = [["CPU", cpu], ...runs.map((run, i) => [String.fromCharCode(65 + i), run])];
+  const all = {};
+  for (const [key, title, want] of [["numpy", "against NumPy's", ref], ["e16", "E16, against NumPy's with a float16 cache", c.reference16]]) {
+    const table = columns.map(([, run]) => byLayer(run, want));
+    all[key] = table.map((column) => Math.max(...column));
+    console.log(`\nkeys and values of ${c.id} by layer, ${title} (the worst row: its largest difference over its largest value)\n`);
+    console.log(`| layer | ${columns.map(([name]) => name).join(" | ")} |`);
+    console.log(`|---:|${columns.map(() => "---:").join("|")}|`);
+    for (let l = 0; l < layers; l++) console.log(`| ${l} | ${table.map((column) => e(column[l])).join(" | ")} |`);
+    console.log(`| all | ${all[key].map(e).join(" | ")} |`);
+  }
+  console.log(`- CPU: forward.js on the CPU: all layers ${e(all.numpy[0])}, E16 ${e(all.e16[0])}`);
+  runs.forEach((run, i) => {
+    const worst = Math.max(all.numpy[i + 1], run.again ? kv(run.again) : 0);
+    console.log(`- ${columns[i + 1][0]}: ${run.form ?? "no form"}, ${run.attention ?? "no attention"}: line ${e(run.line)}, all layers ` +
+      `${e(all.numpy[i + 1])} (all at once ${run.again ? e(kv(run.again)) : "-"}), ${(worst / run.line).toFixed(2)} of the line, E16 ${e(all.e16[i + 1])}`);
+  });
+  const seconds = { ...c.seconds, "the plan": c.planned, CPU: cpu.seconds };
+  runs.forEach((run, i) => { seconds[`${columns[i + 1][0]} (its GPU ready in ${run.readySeconds.toFixed(1)})`] = run.seconds; });
+  console.log(`\nseconds of ${c.id}: ${Object.entries(seconds).map(([step, s]) => `${step} ${s.toFixed(1)}`).join(", ")}\n`);
+
+  function kv(run) {
+    return Math.max(worstRow(floats(run.keys), floats(ref.keys), kvDim), worstRow(floats(run.values), floats(ref.values), kvDim));
+  }
+}

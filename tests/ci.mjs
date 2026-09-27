@@ -14,9 +14,9 @@
 //
 // Meant to run in the background (the agent's Bash with run_in_background): it always ends, by the deadline at the
 // latest. Once a run has ended, the lines of its jobs' logs that match --grep are printed (models.yml, bench.yml,
-// browsers.yml and preview.yml have lines of their own by default), and for a job that failed, the lines up to its
-// first error. Everything printed also goes to .tmp/ci/<time>-<pid>.log, and a run already waited for by another
-// ci.mjs is not waited for twice: that one's log is named instead.
+// browsers.yml, preview.yml and gpu-prompt.yml have lines of their own by default), and for a job that failed, the
+// lines up to its first error. Everything printed also goes to .tmp/ci/<time>-<pid>.log, and a run already waited for
+// by another ci.mjs is not waited for twice: that one's log is named instead.
 // Exit: 0 every run succeeded, 1 one ended otherwise (failure, cancelled...), 2 the deadline passed with one still
 // going, 3 there was no run to wait for (a dispatch failed, no deploy of that commit appeared, no run of that ID), 4
 // all were waited for by another ci.mjs already.
@@ -106,6 +106,9 @@ const LINES = {
   "bench.yml": "^### (chromium|firefox|webkit|chrome|msedge)$|^sections:|WRONG|^failed:",
   "browsers.yml": "ready in|FAILED|timed out",
   "preview.yml": "^sections:|FAILED|timed out",
+  // T183: gpu-check's lines of each model and run, its tables by layer (against NumPy's and E16), each run's line and
+  // ratio, and the seconds of each step
+  "gpu-prompt.yml": "^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\||^ *- |^seconds of |FAILED",
 };
 
 async function start([workflow, ...pairs]) {
