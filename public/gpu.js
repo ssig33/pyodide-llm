@@ -375,13 +375,13 @@ function tokensLayout(m) {
       const matrix = m.matrices[name];
       if (matrix.pieces.length > 1) return why(`${name} is past a buffer of this GPU`);
       if (values % align || scales % align) {
-        return why(`${names.join(", ")} as one matrix would not start ${name} where this GPU binds a buffer (every ${align} bytes)`);
+        return why(`${name} would not start where this GPU binds a buffer`);
       }
       homes[name] = { joined, at: [values, scales] };
       values += matrix.rows * matrix.n;
       scales += (matrix.rows * matrix.n / group) * 4;
     }
-    if (values > m.limit) return why(`${names.join(", ")} as one matrix are past a buffer of this GPU`);
+    if (values > m.limit) return why(`${names.join(" and ")} together are past a buffer of this GPU`);
     sizes[joined] = [values, scales];
   }
   for (const [name, { rows, n }] of Object.entries(tablesOf(plan))) {
