@@ -219,6 +219,10 @@ class Tokenizer:
             text = unicodedata.normalize("NFC", text)
         if self.collapse:
             text = re.sub(" {2,}", " ", text).strip(" ")
+        if self.kind != "bytebpe":
+            # sentencepiece writes a space as U+2581, so one written in the text is a space too (after the collapse,
+            # which sees spaces only; nmt made it one before). The pieces here spell it " " (T216)
+            text = text.replace("\u2581", " ")
         return text
 
     def encode_bpe(self, text):

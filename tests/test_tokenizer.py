@@ -1,5 +1,6 @@
 # Encode -> decode round trips, on a synthetic vocabulary and on the real ones `make models` fetches.
 import math
+import re
 import random
 import unicodedata
 
@@ -231,6 +232,33 @@ def test_an_identity_normalizer_without_collapsing_changes_nothing():
     for name, nfkc in ((b"identity", False), (b"nfkc", True)):
         model, _ = sentencepiece(field(1, name) + field(4, 0), spelled=True)
         assert sentencepiece_options(model) == {"tokenizer_kind": "unigram", "nfkc": nfkc}
+
+
+def test_u2581_in_the_text_is_a_space():
+    """T216: sentencepiece writes a space as U+2581 before it looks the pieces up, so a U+2581 the text has is a space
+    to it (Llama 2, tiny-lm, llm-jp); the engine spelled it as a character the vocabulary lacks. remove_extra_whitespaces
+    sees spaces only, so it does not collapse U+2581 unless the normalizer made it a space first (nmt: rinna's)."""
+    from make_hf_fixture import field
+    from llama2_convert import sentencepiece_pieces, tokenizer_bin
+    for normalizer, settings in ((field(1, b"identity") + field(4, 0), {}), (field(1, b"nfkc") + field(4, 0), {"nfkc": True}),
+                                 (field(1, b"nmt_nfkc"), {"nfkc": True, "nmt": True, "collapse": True, "unknown": 0}),
+                                 (field(1, b"identity"), {"collapse": True})):
+        model, size = sentencepiece(normalizer, spelled=True)
+        data = tokenizer_bin(sentencepiece_pieces(model), size)
+        collapsed = (lambda text: re.sub(" {2,}", " ", text).strip(" ")) if settings.get("collapse") else (lambda text: text)
+        for kind in ("bpe", "unigram"):
+            tokenizer = Tokenizer(data, size, kind=kind, **settings)
+            plain = Tokenizer(data, size, kind=kind, **{**settings, "collapse": False})
+            for text in ["a\u2581b", "\u2581a", "\u2581", "a\u2581\u2581b", "a \u2581b", "a  \u2581  b", "x\u2581",
+                         "\u2581\u2581x\u2581 \u2581y", " \u2581 "]:
+                # nmt makes U+2581 a space before the collapse; otherwise the collapse leaves it alone
+                spaced = (collapsed(text.replace("\u2581", " ")) if settings.get("nmt")
+                          else collapsed(text).replace("\u2581", " "))
+                assert tokenizer.encode(text) == plain.encode(spaced), (settings, kind, text)
+    llama = real_tokenizer("tokenizer.bin", checkpoint_vocab_size("stories15M.bin"))
+    assert llama.encode("Once\u2581upon a\u2581time") == [9038, 2501, 263, 931]
+    tiny = real_tokenizer("tiny-lm.tokenizer.bin", checkpoint_vocab_size("tiny-lm.bin"), kind="unigram", nfkc=True)
+    assert tiny.encode("\u2581日本\u2581語") == tiny.encode(" 日本 語")
 
 
 def test_the_conversion_hands_the_normalizer_to_the_engine():
