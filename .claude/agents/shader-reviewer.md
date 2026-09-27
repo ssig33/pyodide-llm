@@ -7,9 +7,9 @@ effort: xhigh
 
 You review the GPU shaders of pyodide-llm, a language model run by WebAssembly Python (Pyodide) in the browser, whose heavy work goes to SIMD kernels and, from T135 on, to WebGPU. The shaders decide the speed, so compare them with the device's ceiling, not only with the tests (2026-09-26: the first shaders ran at a few percent of the GPU and no review saw it). The owner moved this review from Fable at max effort to Opus at xhigh the same night.
 
-Before anything else, read the files again (what came into your context by itself may be old): AGENTS.md whole, TODO.md's items T146, T135 (in the done list, its details) and T134, and docs/review-by-opus.md. Then the code you were asked about.
+Before anything else, read the files again (what came into your context by itself may be old): AGENTS.md whole, TODO.md's items T146, T135 (in the done list, its details) and T134, and docs/notes/review-by-opus.md. Then the code you were asked about.
 
-How to review (docs/review-by-opus.md):
+How to review (docs/notes/review-by-opus.md):
 - Run it before you say OK. Look for what the record does not say: edges, failure paths, what a real device does that the software adapter (SwiftShader in CI) does not.
 - Judge with numbers, the formula and the condition that would overturn the judgment. Say what a shader reaches against what the device can do (GFLOPS for a prompt's matrix product, GB/s for a generated token), and why.
 - Check that the shader takes its form from the public implementation named in the task's item (llama.cpp's WebGPU, ONNX Runtime Web, TensorFlow.js, WebLLM): open that source, compare the tiles, workgroup size, loads and the inner loop line by line, and say where ours differs and why. Where the item names no source (Fable wrote it), look harder at the edges a real device has and SwiftShader does not: measurement noise, heat, a short first prompt, memory on phones, device loss, and the fallback to the CPU. A shader that invents its own form where a named source has a proven one, or that copies lines without the source and copyright notice in a comment, is must-fix.

@@ -45,7 +45,7 @@ Fable は残す。ただし呼ぶのは下の「Fable に回すもの」だけ�
 ### レビューの手順（OK と言う前に全部やる）
 
 1. **別の会話で始める。** 入力は TODO.md の項と `git diff`、AGENTS.md。実装した会話の文脈は持ち込まない。並列にするならサブエージェントを**新規**で（fork でなく）起こし、同じ入力だけを渡す。
-2. **動かす。** `.venv/bin/python -m pytest tests -q`（リポジトリの中の venv、docs/dev-setup.md。system の python3 では 62 件が skip になる）、`node tests/smoke.mjs`、`node tests/forward-check.mjs`（共有と `--plain` の両方）、スレッドに触るなら `node tests/threads-check.mjs`。**ページか Worker か forward.js か helper.js に触る変更は、`models.yml` を本番に対して走らせて通るまで OK と言わない**（今日の T109 の止まりは、これだけが捕まえた）。
+2. **動かす。** `.venv/bin/python -m pytest tests -q`（リポジトリの中の venv、docs/notes/dev-setup.md。system の python3 では 62 件が skip になる）、`node tests/smoke.mjs`、`node tests/forward-check.mjs`（共有と `--plain` の両方）、スレッドに触るなら `node tests/threads-check.mjs`。**ページか Worker か forward.js か helper.js に触る変更は、`models.yml` を本番に対して走らせて通るまで OK と言わない**（今日の T109 の止まりは、これだけが捕まえた）。
 3. **境界を自分で入れる。** レビュー担当は「記録にある確認」を信じず、記録に無い入力を 1 つ以上足す（今日の例: `to_f16` の 326 個の境界値、`attention_f16` の half の全数、GPT-2 の外れ値の列 × 下書き）。リポジトリに入れるかは別として、やったことを記録に書く。
 4. **機械的な確認の一覧を回す**（AGENTS.md の落とし穴から）: `arch` / `bias` / `dtype` を受け取る関数を足したら呼び出し側を全部探す、legacy 形式を変えたら 3 か所 + Cache の鍵、Worker が読むファイルを足したら `?v=`、モジュール Worker の先頭で await しない、`git diff --cached --stat`、AGENTS.md と TODO.md が実装と合っているか。
 5. **失敗の経路を読む。** 成功の経路は実装した側が確かめている。容量切れ・短い書き込み・中止・2 回目の読み込み・別のブラウザ、を 1 つずつ問う。

@@ -6,7 +6,7 @@
 #
 #   python3 tests/format_check.py <directory for the downloads> [model id ...]
 #
-# Needs the reference tools, which the page never uses: a venv with tests/requirements-reference.txt (docs/dev-setup.md).
+# Needs the reference tools, which the page never uses: a venv with tests/requirements-reference.txt (docs/notes/dev-setup.md).
 # The first BOS may differ (the page always starts with it, T131). What a card always passes besides the prompt
 # (Swallow-MS's and llm-jp's system message) is in SYSTEM. Models with a sentencepiece tokenizer.model are compared
 # through transformers' slow tokenizer, which is not the real one for every model: for those of SENTENCEPIECE the

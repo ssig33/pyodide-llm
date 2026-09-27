@@ -1,6 +1,6 @@
 # The reference tools of the checks that compare the page with the real thing (tests/format_check.py, the
 # sentencepiece comparisons of T126, tests/gguf_check.py's tokenizers): never used by the page or the deploy.
-# Into a venv of its own (docs/dev-setup.md). The versions are the ones the checks of 2026-09-26 ran with, but for
+# Into a venv of its own (docs/notes/dev-setup.md). The versions are the ones the checks of 2026-09-26 ran with, but for
 # transformers: the checks ran with a build from git that called itself 5.12.1, and 5.12.1 to 5.15.1 of PyPI refuse
 # tokenizers 0.23.1 (they ask for <=0.23.0, also when imported); 5.16.1 gives the same results where the records have
 # them (T139). For some models with a tokenizer.model its reference is not the real one (AGENTS.md, format_check.py).
