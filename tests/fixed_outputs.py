@@ -32,17 +32,29 @@ FIXTURES = HERE / "fixtures" / "fixed-outputs.json"
 NEW_TOKENS = 16
 CHUNK = 8 << 20
 # one per architecture and way in: GPT-NeoX, GPT-2, a Llama from a GGUF (T74), a Llama with a Unigram tokenizer.json,
-# and a Qwen3 (T124: the norms of q and k, heads of 128 in a dim of 1024). Pythia and GPT-2 come from GGUFs since
+# and a Qwen3 (T124: the norms of q and k, heads of 128 in a dim of 1024), from its GGUF and from its safetensors
+# (T212). Pythia and GPT-2 come from GGUFs since
 # T136's third stage, so a GPT-2 from a safetensors file too (T204): rinna's, whose names begin with "transformer.",
 # whose Conv1D matrices the plan transposes as they come, and whose sentencepiece model normalizes as nmt_nfkc.
+# The list takes Qwen3 from a GGUF since T203, so its safetensors, the way ?hf= opens a Qwen3 (the norms of q and k and
+# the size of the heads read from config.json and the tensors' names), gets a fixed output of its own too (T212): the
+# same entry with the weights of the original repository its vocabulary comes from, named as the page's hfEntry()
+# names them.
+SAFETENSORS = {"hf-qwen3-0.6b-safetensors": "hf-qwen3-0.6b"}
 MODELS = ["hf-pythia-70m", "hf-gpt2", "hf-japanese-gpt2-small", "hf-smollm2-135m-instruct", "hf-llm-jp-3-150m-instruct3",
-          "hf-qwen3-0.6b"]
+          "hf-qwen3-0.6b", "hf-qwen3-0.6b-safetensors"]
 
 
 def entries():
+    wanted = [SAFETENSORS.get(id, id) for id in MODELS]
     script = ("import('./src/models.js').then(({ MODELS }) => console.log(JSON.stringify("
-              f"MODELS.filter((m) => {json.dumps(MODELS)}.includes(m.id)))))")
+              f"MODELS.filter((m) => {json.dumps(wanted)}.includes(m.id)))))")
     found = {entry["id"]: entry for entry in json.loads(subprocess.check_output(["node", "-e", script], cwd=HERE.parent))}
+    for id, of in SAFETENSORS.items():
+        original = found[of]["hf"]["vocabulary"]
+        found[id] = {**found[of], "id": id, "hf": {"repo": original["repo"], "revision": original["revision"],
+                     "weights": "model.safetensors", "config": "config.json",
+                     "tokenizer": ["tokenizer.json", "tokenizer.model", "spiece.model"]}}
     return [found[id] for id in MODELS]
 
 
@@ -151,7 +163,9 @@ def main():
     for entry in entries():
         if only and entry["id"] not in only[0]:
             continue
-        text = written(entry, *converted(entry, directory))
+        conversion, checkpoint = converted(entry, directory)
+        text = written(entry, conversion, checkpoint)
+        checkpoint.unlink()  # 2.4 GB for each Qwen3 0.6B: one float32 checkpoint at a time on the runner's disk
         got[entry["id"]] = {"prompt": entry["prompt"], "text": text}
         same = expected.get(entry["id"], {}).get("text") == text
         print(f"{'ok  ' if same else 'DIFF'} {entry['id']}: {json.dumps(text, ensure_ascii=False)}", flush=True)

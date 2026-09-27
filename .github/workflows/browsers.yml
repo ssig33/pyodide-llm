@@ -233,7 +233,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       # T86: real models (tests/fixed_outputs.py's MODELS: GPT-NeoX, GPT-2 from GGUFs and from a safetensors, Llamas, a
-      # Qwen3) against the text a
+      # Qwen3 from its GGUF and from its safetensors) against the text a
       # person read and found sound. Not the site: the converter and engine of this checkout, in native Python, so
       # "it runs but writes nonsense" (T72) fails here. Once is enough, so only in the small half.
       - name: Real models write what they wrote before (T86)
