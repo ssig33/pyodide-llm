@@ -1,11 +1,11 @@
 {
   "hf-pythia-70m": {
     "prompt": "Once upon a time",
-    "text": ", the\n\n\"Battle of the First World War\" was a series"
+    "text": ", the first time I had to go to the hospital, I had to go"
   },
   "hf-gpt2": {
     "prompt": "Once upon a time",
-    "text": ", the world was a place of peace and harmony. But now, the world"
+    "text": ", the world was a place of peace and harmony. But now, it is"
   },
   "hf-smollm2-135m-instruct": {
     "prompt": "What will be popular next? Name three things.",
