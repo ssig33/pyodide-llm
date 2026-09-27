@@ -315,3 +315,38 @@ export function layerTable(step, check, ceilings, gpu = {}) {
       : `| ${tableCell(row.form)}${wrong(row) ? " (WRONG in the check)" : ""} | ${row.dispatches} | ${row.unsteady ? "unsteady: " : ""}${number(row.msPerLayer, 2)} | ` +
         `${GBps(row)} | ${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
 }
+
+/**
+ * T151: the GPU section's table of tokens generated on the GPU (public/shaders.js's EMBED, fusedMatVec and SAMPLE: the
+ * sampling on the GPU too, the state carried from token to token there). step: {name, result: {model, layers, vocab,
+ * GB, dispatches, tokens, settings, work: {ms, unsteady}, rows: [{perSubmission, msPerToken, fixedMs}], sampling:
+ * {vocab, msEach, unsteady}}} or {name, error}; check: the shaders against JavaScript ("sampling" and "tokens on the
+ * GPU"); gpu: { fallback, lost }. A row a way of submitting: one token a submission, each read back as it comes, and
+ * several in one submission, read back once. "A submission besides its tokens" is what a submission costs past its
+ * tokens' work (the wait and the reading back: a row's ms a token times its tokens, less a token's work, the
+ * difference of 2n tokens in one submission and n), and "faster than one a submission" the first row's ms a token
+ * over the row's: neither where noRatios() says none, where the check found the sampling or the run WRONG, nor
+ * (the first) where a token's work was unsteady. A submission's cost below 0 (a token's work read higher than the
+ * row's time allows) is "under the noise".
+ */
+export function generateTable(step, check, gpu = {}) {
+  if (!step) return [];
+  if (step.error || !step.result) return [`**Tokens generated on the GPU**: ${tableCell(step.error ?? "not measured")}`];
+  const r = step.result, none = noRatios(gpu);
+  const wrong = ["sampling", "tokens on the GPU"].some((key) => check?.[key] && !check[key].ok);
+  const derived = !none && !wrong;
+  const one = r.rows.find((row) => row.perSubmission === 1);
+  const s = r.settings ?? {};
+  return [`**Tokens generated on the GPU** (${tableCell(r.model)}: ${r.layers} layers, a vocabulary of ${r.vocab}, ${number(r.GB, 2)} GB of weights a token; ` +
+    `a token is ${r.dispatches} dispatches: its row of the embedding, the layers fused as T150's, the classifier, and the sampling on the GPU, ` +
+    `penalty ${s.penalty}, temperature ${s.temperature}, top-p ${s.topp}). The same ${r.tokens} tokens each way, the ways in turn; ` +
+    "a token's work alone is a submission of 2n tokens less one of n. A submission besides its tokens: what it costs past their work (submitting, waiting, reading the ids back)." +
+    `${wrong ? " The check found the sampling on the GPU WRONG." : ""}`,
+    ...(none ? [`Besides its tokens and faster: ${none}.`] : []), "",
+    "| tokens a submission | GPU ms a token | a submission besides its tokens, ms | faster than one a submission |", "|---|---:|---:|---:|",
+    ...r.rows.map((row) => `| ${row.perSubmission === 1 ? "1, each read back as it comes" : `${row.perSubmission}, read back once`}${wrong ? " (WRONG in the check)" : ""} | ` +
+      `${number(row.msPerToken, 2)} | ${derived && Number.isFinite(row.fixedMs) ? (row.fixedMs < 0 ? "under the noise" : number(row.fixedMs, 2)) : ""} | ` +
+      `${derived && row !== one && one ? times(one.msPerToken / row.msPerToken) : ""} |`),
+    "", `A token's work: ${r.work ? `${r.work.unsteady ? "unsteady: " : ""}${number(r.work.ms, 2)} ms` : "not measured here"}; ` +
+    `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens): ${r.sampling ? `${r.sampling.unsteady ? "unsteady: " : ""}${number(r.sampling.msEach, 3)} ms` : "not measured here"}.`];
+}

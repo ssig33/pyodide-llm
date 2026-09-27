@@ -3,7 +3,7 @@
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
 import { FULL_ROUNDS, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, environmentOf, loginUrl, parseReport, reportBody,
-         layerTable, matVecTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, layerTable, matVecTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -227,4 +227,33 @@ assert.ok(layerTable(unsteadyStep, layerRight).includes("| fused (T150) | 5 | un
 const slowStep = { ...layerStep, result: { ...layerStep.result, rows: [{ ...layerStep.result.rows[0], msPerLayer: 2900, GBps: 0.0236 }] } };
 assert.ok(layerTable(slowStep, layerRight, undefined, { fallback: true }).includes("| separate steps | 14 | 2900.00 | 0.024 | 46400.0 |  |"));
 assert.equal(layerTable({ name: "a layer of a token", error: "x | y" })[0], "**A layer of a token**: x \\| y");
+// T151: the table of tokens generated on the GPU: what a submission costs besides its tokens and how many times faster
+// several a submission are than one, neither after a lost device, on a fallback adapter or with the sampling WRONG
+const generateStep = { name: "tokens generated on the GPU", result: { model: "Llama 3.2 1B's width", layers: 2, vocab: 32000, GB: 0.21,
+  dispatches: 13, tokens: 16, settings: { temperature: 0.7, topp: 0.9, penalty: 1.3 }, work: { ms: 9.1 },
+  rows: [{ perSubmission: 1, msPerToken: 14.2, fixedMs: 5.1 }, { perSubmission: 4, msPerToken: 10.4, fixedMs: 5.2 }, { perSubmission: 16, msPerToken: 9.4, fixedMs: 4.8 }],
+  sampling: { vocab: 128256, msEach: 0.31 } } };
+const generateRight = { sampling: { ok: true }, "tokens on the GPU": { ok: true } };
+const generateLines = generateTable(generateStep, generateRight);
+assert.ok(generateLines.includes("| 1, each read back as it comes | 14.20 | 5.10 |  |"), generateLines.join("\n"));
+assert.ok(generateLines.includes("| 16, read back once | 9.40 | 4.80 | 1.5× |"), generateLines.join("\n"));
+assert.ok(generateLines.at(-1).includes("9.10 ms") && generateLines.at(-1).includes("0.310 ms"), generateLines.at(-1));
+for (const [label, lines] of [["right", generateLines], ["lost", generateTable(generateStep, generateRight, { lost: "lost" })],
+  ["fallback", generateTable(generateStep, generateRight, { fallback: true })], ["wrong", generateTable(generateStep, { ...generateRight, sampling: { ok: false } })],
+  ["no check", generateTable(generateStep)]]) {
+  const rowsOf = lines.filter((line) => line.startsWith("|"));
+  assert.equal(rowsOf.length, 2 + generateStep.result.rows.length, label);
+  for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
+  assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), label);
+  if (label !== "right" && label !== "no check") {
+    assert.ok(rowsOf.slice(2).every((line) => cellsOf(line).slice(2).every((cell) => cell.trim() === "")), `${label}: no derived numbers\n${lines.join("\n")}`);
+  }
+}
+const noisy = { ...generateStep, result: { ...generateStep.result, rows: [generateStep.result.rows[0], { perSubmission: 8, msPerToken: 9.0, fixedMs: -0.8 }] } };
+assert.ok(generateTable(noisy, generateRight).includes("| 8, read back once | 9.00 | under the noise | 1.6× |"), generateTable(noisy, generateRight).join("\n"));
+assert.ok(generateTable(generateStep, { ...generateRight, "tokens on the GPU": { ok: false } }).some((line) => line.startsWith("| 4, read back once (WRONG in the check) |")));
+assert.ok(generateTable(generateStep, generateRight, { fallback: true }).some((line) => line.includes("none on a fallback adapter")));
+assert.equal(generateTable({ name: "x", error: "a | b" })[0], "**Tokens generated on the GPU**: a \\| b");
+const unmeasured = generateTable({ ...generateStep, result: { ...generateStep.result, work: undefined, sampling: undefined, rows: [{ perSubmission: 1, msPerToken: 900 }, { perSubmission: 2, msPerToken: 800 }] } }, generateRight, { fallback: true });
+assert.ok(unmeasured.at(-1).includes("not measured here"), unmeasured.at(-1));
 console.log("ok");

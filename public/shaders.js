@@ -1734,16 +1734,21 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(num_workgroups) num_wg
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 // input: "norm" (x is the residual stream, normed on the read with norm_weight from params.normAt) or "plain".
-// output: "rope" (rows of q, then kvRows of k, then of v: q into q, k and v into the cache at params.pos), "add" (added
-// to dst: the residual stream) or "swiglu" (silu(gate) × up into dst, up's rows params.second after gate's).
-// Bindings: 0 the weights, 1 their scales, 2 x, 3 params; 4 norm_weight (norm); 5 dst (add, swiglu), or 5 q, 6 the
-// keys, 7 the values, 8 the angles (rope: the cos of the position's headSize / 2 angles, then their sin).
+// output: "rope" (rows of q, then kvRows of k, then of v: q into q, k and v into the cache at step.pos), "add" (added
+// to dst: the residual stream), "swiglu" (silu(gate) × up into dst, up's rows params.second after gate's) or "write"
+// (into dst: the classifier's logits, T151).
+// Bindings: 0 the weights, 1 their scales, 2 x, 3 params; 4 norm_weight (norm); 5 dst (add, swiglu, write), or 5 q,
+// 6 the keys, 7 the values, 8 the angles and 9 the step (rope). T151 (T150's review, (c)): the position is the Step's
+// (a uniform of its own, which a run of tokens on the GPU copies from the sampler's state after each token), and the
+// angles are the whole table of RoPE on the GPU, a row a position: the cos of its headSize / 2 angles, then their sin
+// (the rows of the CPU's table: the model's own, Llama 3's scaling too).
 export const fusedMatVec = ({ input, output, subgroups }) => {
   const norm = input === "norm", glu = output === "swiglu", rope = output === "rope";
   const matrices = glu ? 2 : 1, sums = MUL_MAT_VEC_ROWS * matrices + (norm ? 1 : 0);
   return /* wgsl */ `${subgroups ? "enable subgroups;\nrequires subgroup_id;\n" : ""}
-struct Params { rows: u32, words: u32, perRow: u32, second: u32, eps: f32, normAt: u32, pos: u32, qRows: u32,
-                kvRows: u32, headSize: u32, turned: u32, unused: u32 }
+struct Params { rows: u32, words: u32, perRow: u32, second: u32, eps: f32, normAt: u32, qRows: u32, kvRows: u32,
+                headSize: u32, turned: u32, unused0: u32, unused1: u32 }
+${STEP}
 @group(0) @binding(0) var<storage, read> src0: array<u32>;
 @group(0) @binding(1) var<storage, read> scales: array<f32>;
 @group(0) @binding(2) var<storage, read> src1: array<f32>;
@@ -1752,7 +1757,8 @@ ${norm ? "@group(0) @binding(4) var<storage, read> norm_weight: array<f32>;" : "
 ${rope ? `@group(0) @binding(5) var<storage, read_write> q: array<f32>;
 @group(0) @binding(6) var<storage, read_write> keys: array<u32>;
 @group(0) @binding(7) var<storage, read_write> values: array<u32>;
-@group(0) @binding(8) var<storage, read> angles: array<f32>;` : "@group(0) @binding(5) var<storage, read_write> dst: array<f32>;"}
+@group(0) @binding(8) var<storage, read> angles: array<f32>;
+@group(0) @binding(9) var<uniform> step: Step;` : "@group(0) @binding(5) var<storage, read_write> dst: array<f32>;"}
 
 const WG_SIZE = 256u;
 const OUTPUTS_PER_WG = ${MUL_MAT_VEC_ROWS}u;
@@ -1906,11 +1912,12 @@ ${rope ? `    // a pair of neighbouring rows a thread: q's turned into q; k's tu
             let v1 = totals[2u * thread_id + 1u] * scale;
             let size = params.headSize;
             let half = size / 2u;
+            let at = step.pos * size;  // the position's row of the table: its cos, then its sin
             if (row < params.qRows) {
                 let in_head = row % size;
                 if (in_head < params.turned) {
-                    let c = angles[in_head / 2u];
-                    let s = angles[half + in_head / 2u];
+                    let c = angles[at + in_head / 2u];
+                    let s = angles[at + half + in_head / 2u];
                     q[row] = v0 * c - v1 * s;
                     q[row + 1u] = v0 * s + v1 * c;
                 } else {
@@ -1922,14 +1929,14 @@ ${rope ? `    // a pair of neighbouring rows a thread: q's turned into q; k's tu
                 var key = vec2<f32>(v0, v1);
                 let in_head = j % size;
                 if (in_head < params.turned) {
-                    let c = angles[in_head / 2u];
-                    let s = angles[half + in_head / 2u];
+                    let c = angles[at + in_head / 2u];
+                    let s = angles[at + half + in_head / 2u];
                     key = vec2<f32>(key.x * c - key.y * s, key.x * s + key.y * c);
                 }
-                keys[params.pos * params.kvRows / 2u + j / 2u] = pack2x16float(key);
+                keys[step.pos * params.kvRows / 2u + j / 2u] = pack2x16float(key);
             } else {
                 let j = row - params.qRows - params.kvRows;
-                values[params.pos * params.kvRows / 2u + j / 2u] = pack2x16float(vec2<f32>(v0, v1));
+                values[step.pos * params.kvRows / 2u + j / 2u] = pack2x16float(vec2<f32>(v0, v1));
             }
         }
     }` : `    if (thread_id < OUTPUTS_PER_WG) {
@@ -1939,9 +1946,548 @@ ${rope ? `    // a pair of neighbouring rows a thread: q's turned into q; k's tu
             // llama.cpp's result *= silu(gate_value), as the GLU writes it (glu.wgsl's OP_SWIGLU)
             let gate = value;
             let up = totals[OUTPUTS_PER_WG + thread_id] * scale;
-            dst[row] = gate / (1.0 + exp(-gate)) * up;` : `
+            dst[row] = gate / (1.0 + exp(-gate)) * up;` : output === "write" ? `
+            dst[row] = value;` : `
             dst[row] = dst[row] + value;`}
         }
     }`}
 }`;
 };
+
+// ---- T151: a run of generated tokens on the GPU, the ids read back once for all of them. Each token of the run is
+// one compute pass: EMBED (the token's row of the embedding into the residual stream), the layers (fusedMatVec, T150),
+// the final norm and the classifier (fusedMatVec, "write"), then SAMPLE (the repetition penalty, softmax, top-p and
+// the draw), which writes the token into `chosen` and the state the next pass starts from; between passes the state's
+// first four words are copied into the Step uniform that fusedMatVec and flashTile read (copyBufferToBuffer: a
+// uniform is not a shader's to write). What the CPU gets back: chosen[0 .. sampled) and the state, after the run.
+// For /benchmark/'s GPU section first (T151), and for the model's GPU worker when it generates on the GPU (T152).
+//
+// What the GPU does is the CPU's sampling (kernels/kernel.ts's penalize() and sample(), the engine's generate()),
+// token for token: the same random number (the CPU draws them, in order, one a sampled token: randoms[sampled]) picks
+// the same token but where a float32 sum in another order moves a border (sampleLikeCpu below is that CPU in
+// JavaScript; tests/smoke.mjs holds it to the kernel, /benchmark/'s check holds SAMPLE to it). Their forms:
+//   - the penalty: MLC LLM's apply_penalty_inplace (a thread a token of the window, the logit divided where positive
+//     and multiplied where not; mlc_llm/compiler_pass/attach_logit_processor.py, Apache-2.0), with the CPU's window
+//     (the latest REPETITION_WINDOW tokens of the history, the prompt and BOS in it) and its once for each distinct
+//     token, where MLC counts them (its presence and frequency penalties are not the engine's)
+//   - the largest logit and its first index, and softmax: llama.cpp's WebGPU argmax.wgsl (the pairs reduced in the
+//     workgroup's memory; here the smaller index of two equal, as NumPy's argmax and ARGMAX above) and soft_max.wgsl
+//     (exp(value - max), summed by the workgroup's tree), with kernel.ts's temperature and its floor of the nucleus
+//     (a token under a ten millionth of the best one's probability is left out before exp())
+//   - top-p without sorting: MLC LLM's top_p_pivot (mlc_llm/op/top_p_pivot.py, Apache-2.0): pivots between a bound
+//     known to keep at least top-p of the mass and one known not to, the sum of the probabilities at or over each
+//     pivot added up in one pass, the bounds moved to the pivots, until the smallest probability of the nucleus is
+//     found. Changed: the pivots are spaced over the bits of the float (a positive float orders as its bits), so the
+//     search ends on that probability itself, where MLC's ends within 1e-7 of it; the probabilities are those left
+//     after the floor, gathered in the order of their index (below) where MLC reads the whole vocabulary each round
+//   - the draw: where the CPU sorts the nucleus and walks it from the most probable token to the random number times
+//     its mass (WebLLM's sample_with_top_p does the same after an argsort on the GPU: TVM's
+//     sample_top_p_top_k_from_sorted_prob, Apache-2.0), SAMPLE finds the token by the same pivots: the probability of
+//     the token the walk stops at is the largest p whose mass at or over it passes the random number (tokens of equal
+//     probability are taken in the order of their index: the CPU's quicksort takes them in no set order). Without a
+//     nucleus the CPU walks the tokens in the order of their index, and so does SAMPLE: llama.cpp's WebGPU
+//     cumsum.wgsl (a thread a run of consecutive tokens, their sums scanned in the workgroup's memory), the first token
+//     whose running sum passes the random number
+//   - gathering the tokens over the floor in the order of their index (for the pivots, and the order of equals):
+//     cumsum.wgsl's scan again, of the counts
+//   - the token's row of the embedding: llama.cpp's WebGPU get_rows.wgsl (copy_elements of Q8_0: each weight times
+//     its block's scale), for this project's int8 in groups of 32
+// This project's: the state that carries the loop from one token to the next (the input token, the position, the
+// window, the stop), and stopping: a token of settings.stop is written into chosen and ends the run (the passes after
+// it change nothing: the position and the state stay, so a pass recomputes the same position and writes the same
+// cache row), as the CPU's generate() breaks at a stop token.
+//
+// Adapted from llama.cpp, ggml/src/ggml-webgpu/wgsl-shaders/argmax.wgsl, soft_max.wgsl, cumsum.wgsl and get_rows.wgsl
+// (https://github.com/ggml-org/llama.cpp, commit 95887577, 2026-09-26), under the MIT License:
+//
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+// Adapted from MLC LLM, python/mlc_llm/op/top_p_pivot.py and python/mlc_llm/compiler_pass/attach_logit_processor.py
+// (https://github.com/mlc-ai/mlc-llm, commit 9fa644f5, 2026-08-17), and from the sampling of WebLLM
+// (https://github.com/mlc-ai/web-llm, src/llm_chat.ts) and Apache TVM (python/tvm/relax/frontend/nn/op.py,
+// https://github.com/apache/tvm, commit e0ed4aad), under the Apache License, Version 2.0. Changed as described above.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+
+// the engine's REPETITION_WINDOW (llama2_numpy.py): the penalty looks at this many of the latest tokens
+export const REPETITION_WINDOW = 64;
+// the most stop tokens settings hold (the list's models have up to 5, src/models.js)
+export const STOPS_MOST = 8;
+// State: Step's four words first (copied into the Step uniform after each token), then the loop's own
+const STATE = /* wgsl */ `struct State {
+  tokens: u32, pos: u32, unused0: u32, unused1: u32,
+  token: u32,     // the input of the next pass: EMBED's row
+  sampled: u32,   // the tokens sampled so far in this run: the index of the next random number and of chosen[]
+  history: u32,   // how long the history is (BOS, the prompt, the sampled tokens): recent[history % WINDOW] is next
+  stopped: u32,   // 1 once a stop token was sampled
+  recent: array<u32, ${REPETITION_WINDOW}>,
+}`;
+export const STATE_BYTES = 32 + 4 * REPETITION_WINDOW;
+/** The state a run starts from: the token it feeds first, at pos, and the history before it (BOS, the prompt and
+ * the tokens sampled before, the fed token last: the penalty's window is its latest REPETITION_WINDOW). */
+export function samplingState({ token, pos, history }) {
+  const words = new Uint32Array(STATE_BYTES / 4);
+  words.set([1, pos, 0, 0, token, 0, history.length, 0]);
+  for (let at = Math.max(0, history.length - REPETITION_WINDOW); at < history.length; at++) {
+    words[8 + (at % REPETITION_WINDOW)] = history[at];
+  }
+  return words;
+}
+// Sampling, a uniform: the settings of the engine's generate()
+const SAMPLING = /* wgsl */ `struct Sampling {
+  vocab: u32, stops: u32, unused0: u32, unused1: u32,
+  temperature: f32, topp: f32, penalty: f32, unused2: f32,
+  stop: array<vec4<u32>, ${STOPS_MOST / 4}>,
+}`;
+export const SAMPLING_BYTES = 32 + 4 * STOPS_MOST;
+/** Sampling's bytes: the engine's settings (temperature 0: the most likely token; top-p outside (0, 1): no nucleus;
+ * penalty 1: none) and its stop tokens. */
+export function samplingSettings({ vocab, temperature, topp, penalty = 1, stops = [] }) {
+  if (stops.length > STOPS_MOST) throw new Error(`more than ${STOPS_MOST} stop tokens`);
+  const bytes = new ArrayBuffer(SAMPLING_BYTES), words = new Uint32Array(bytes), values = new Float32Array(bytes);
+  words.set([vocab, stops.length]);
+  values.set([temperature, topp, penalty], 4);
+  words.set(stops, 8);
+  return new Uint8Array(bytes);
+}
+
+// the token's row of the embedding (int8, groups of 32 with a float32 scale each, 4 to a u32) into the stream x.
+// Bindings: 0 the table, 1 its scales, 2 the state (its token), 3 x, 4 the row's width (x of a vec4)
+export const EMBED = /* wgsl */ `
+${STATE}
+@group(0) @binding(0) var<storage, read> table: array<u32>;
+@group(0) @binding(1) var<storage, read> scales: array<f32>;
+@group(0) @binding(2) var<storage, read> state: State;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(4) var<uniform> shape: vec4<u32>;
+
+fn get_byte_i32(value: u32, index: u32) -> i32 {
+    return bitcast<i32>(((value >> (index * 8)) & 0xFF) << 24) >> 24;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = shape.x;
+    let words = n / 4u;
+    let row = state.token;
+    for (var word = lid.x; word < words; word += 256u) {
+        let q_packed = table[row * words + word];
+        let d = scales[(row * n + word * 4u) / 32u];
+        for (var k = 0u; k < 4u; k++) {
+            dst[word * 4u + k] = f32(get_byte_i32(q_packed, k)) * d;
+        }
+    }
+}`;
+
+// The penalty, softmax, top-p and the draw of one token, in one workgroup: see above. Bindings: 0 the logits (the
+// penalty is applied to them in place, as the CPU does), 1 and 2 scratch of the vocabulary's size (probabilities and
+// the indices of those gathered), 3 the state, 4 chosen, 5 the random numbers, 6 the settings.
+export const SAMPLE = /* wgsl */ `
+${STATE}
+${SAMPLING}
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> probs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> order: array<u32>;
+@group(0) @binding(3) var<storage, read_write> state: State;
+@group(0) @binding(4) var<storage, read_write> chosen: array<u32>;
+@group(0) @binding(5) var<storage, read> randoms: array<f32>;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+
+const WG_SIZE = 256u;
+const WINDOW = ${REPETITION_WINDOW}u;
+// MLC's num_pivots: three pivots a round, the fourth lane of the sums unused
+const PIVOTS = 3u;
+// the bits of 1.0: the most probable token's probability is exp(0), and none is larger
+const ONE_BITS = 0x3F800000u;
+// kernel.ts's floor of the nucleus: ln 1e7
+const NUCLEUS_FLOOR = 16.118095;
+// the largest float below 1: a random number of 1.0 (a float64 just under 1 rounded) would pass every sum
+const BELOW_ONE = 0.99999994;
+const NONE = 0xFFFFFFFFu;
+
+var<workgroup> best_value: array<f32, WG_SIZE>;
+var<workgroup> best_index: array<u32, WG_SIZE>;
+var<workgroup> shared_sum: array<f32, WG_SIZE>;
+var<workgroup> shared_sums: array<vec4<f32>, WG_SIZE>;
+var<workgroup> uniform_word: u32;
+var<workgroup> bounds: vec2<u32>;
+var<workgroup> bound_sum: f32;
+var<workgroup> found: atomic<u32>;
+
+// cumsum.wgsl's scan: (the sum of the values of the threads before t, the sum of all), in the same order every run
+fn scan(value: f32, t: u32) -> vec2<f32> {
+    shared_sum[t] = value;
+    workgroupBarrier();
+    // upsweep
+    var offset = 1u;
+    while (offset < WG_SIZE) {
+        let idx = (t + 1u) * offset * 2u - 1u;
+        if (idx < WG_SIZE) {
+            shared_sum[idx] = shared_sum[idx] + shared_sum[idx - offset];
+        }
+        workgroupBarrier();
+        offset <<= 1u;
+    }
+    let all = shared_sum[WG_SIZE - 1u];
+    workgroupBarrier();
+    // set last to 0 for exclusive sum
+    if (t == 0u) {
+        shared_sum[WG_SIZE - 1u] = 0.0;
+    }
+    workgroupBarrier();
+    // downsweep
+    offset = WG_SIZE >> 1u;
+    while (offset > 0u) {
+        let idx = (t + 1u) * offset * 2u - 1u;
+        if (idx < WG_SIZE) {
+            let x = shared_sum[idx - offset];
+            shared_sum[idx - offset] = shared_sum[idx];
+            shared_sum[idx] = shared_sum[idx] + x;
+        }
+        workgroupBarrier();
+        offset >>= 1u;
+    }
+    let before = shared_sum[t];
+    workgroupBarrier();
+    return vec2<f32>(before, all);
+}
+
+// soft_max.wgsl's tree, four sums at once (a pivot's each)
+fn total4(value: vec4<f32>, t: u32) -> vec4<f32> {
+    shared_sums[t] = value;
+    workgroupBarrier();
+    var offset = WG_SIZE / 2u;
+    while (offset > 0u) {
+        if (t < offset) {
+            shared_sums[t] += shared_sums[t + offset];
+        }
+        offset = offset / 2u;
+        workgroupBarrier();
+    }
+    let sums = shared_sums[0];
+    workgroupBarrier();
+    return sums;
+}
+
+// top_p_pivot's search, over the bits of the probabilities gathered (probs[0 .. count)): from lo, whose sum is
+// lo_sum and passes, to hi, which does not, the largest bits whose probability has a sum at or over it that passes:
+// at or over limit (the nucleus: strict false), or over it (the draw: strict true). Returns (those bits, that sum)
+fn pivot(lo_start: u32, lo_sum_start: f32, limit: f32, strict: bool, count: u32, t: u32) -> vec2<f32> {
+    // the bounds as every thread reads them from thread 0 (uniform: the loop's rounds have barriers)
+    if (t == 0u) {
+        bounds = vec2<u32>(lo_start, ONE_BITS + 1u);
+        bound_sum = lo_sum_start;
+    }
+    let start = workgroupUniformLoad(&bounds);
+    var lo = start.x;
+    var hi = start.y;
+    var lo_sum = workgroupUniformLoad(&bound_sum);
+    while (hi - lo > 1u) {
+        // three pivots spaced over (lo, hi), in bits: a positive float orders as its bits
+        let spacing = max((hi - lo) / (PIVOTS + 1u), 1u);
+        let u = min(vec3<u32>(lo + spacing, lo + 2u * spacing, lo + 3u * spacing), vec3<u32>(hi - 1u));
+        let f = bitcast<vec3<f32>>(u);
+        var acc = vec4<f32>(0.0);
+        for (var k = t; k < count; k += WG_SIZE) {
+            let p = probs[k];
+            acc += select(vec4<f32>(0.0), vec4<f32>(p), vec4<bool>(p >= f.x, p >= f.y, p >= f.z, false));
+        }
+        let sums = total4(acc, t);
+        if (t == 0u) {
+            var new_lo = lo;
+            var new_hi = hi;
+            var new_sum = lo_sum;
+            for (var j = 0u; j < PIVOTS; j++) {
+                let passes = select(sums[j] >= limit, sums[j] > limit, strict);
+                if (passes && u[j] > new_lo) {
+                    new_lo = u[j];
+                    new_sum = sums[j];
+                } else if (!passes && u[j] < new_hi) {
+                    new_hi = u[j];
+                }
+            }
+            bounds = vec2<u32>(new_lo, new_hi);
+            bound_sum = new_sum;
+        }
+        let b = workgroupUniformLoad(&bounds);
+        lo = b.x;
+        hi = b.y;
+        lo_sum = workgroupUniformLoad(&bound_sum);
+    }
+    return vec2<f32>(bitcast<f32>(lo), lo_sum);
+}
+
+// the token into chosen and the state: the next pass's input at the next position, into the window; or the end
+fn finish(token: u32) {
+    let at = state.sampled;
+    chosen[at] = token;
+    state.sampled = at + 1u;
+    var stop = false;
+    for (var j = 0u; j < settings.stops; j++) {
+        stop = stop || settings.stop[j / 4u][j % 4u] == token;
+    }
+    if (stop) {
+        state.stopped = 1u;
+    } else {
+        state.token = token;
+        state.pos = state.pos + 1u;
+        state.recent[state.history % WINDOW] = token;
+        state.history = state.history + 1u;
+    }
+}
+
+@compute @workgroup_size(WG_SIZE)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    // a run that stopped changes nothing more
+    if (t == 0u) {
+        uniform_word = state.stopped;
+        atomicStore(&found, NONE);
+    }
+    if (workgroupUniformLoad(&uniform_word) != 0u) {
+        return;
+    }
+
+    // the repetition penalty (apply_penalty_inplace's thread a token): each distinct token of the window once
+    let window = min(state.history, WINDOW);
+    if (settings.penalty != 1.0 && t < window) {
+        let token = state.recent[t];
+        var seen = false;
+        for (var j = 0u; j < t; j++) {
+            seen = seen || state.recent[j] == token;
+        }
+        if (!seen && token < settings.vocab) {
+            let value = logits[token];
+            logits[token] = select(value * settings.penalty, value / settings.penalty, value > 0.0);
+        }
+    }
+    storageBarrier();
+
+    // a run of consecutive tokens a thread (cumsum.wgsl's): the largest logit and its first index (argmax.wgsl's pairs)
+    let vocab = settings.vocab;
+    let chunk = (vocab + WG_SIZE - 1u) / WG_SIZE;
+    let begin = min(t * chunk, vocab);
+    let end = min(begin + chunk, vocab);
+    var value = -3.4e38;
+    var at = NONE;
+    for (var i = begin; i < end; i++) {
+        let v = logits[i];
+        if (v > value) {
+            value = v;
+            at = i;
+        }
+    }
+    best_value[t] = value;
+    best_index[t] = at;
+    workgroupBarrier();
+    var offset = WG_SIZE / 2u;
+    while (offset > 0u) {
+        if (t < offset) {
+            let b = best_value[t + offset];
+            let bi = best_index[t + offset];
+            if (b > best_value[t] || (b == best_value[t] && bi < best_index[t])) {
+                best_value[t] = b;
+                best_index[t] = bi;
+            }
+        }
+        workgroupBarrier();
+        offset >>= 1u;
+    }
+    let best = best_value[0];
+    let argmax = best_index[0];
+
+    if (settings.temperature == 0.0) {
+        if (t == 0u) {
+            finish(argmax);
+        }
+        return;
+    }
+
+    // softmax's exp(value - max), at the temperature; with a nucleus only over the floor (kernel.ts)
+    let nucleus = settings.topp > 0.0 && settings.topp < 1.0;
+    let inverse = 1.0 / settings.temperature;
+    let lowest = select(-3.4e38, best - settings.temperature * NUCLEUS_FLOOR, nucleus);
+    var sum = 0.0;
+    var kept = 0u;
+    for (var i = begin; i < end; i++) {
+        let v = logits[i];
+        if (v >= lowest) {
+            let p = exp((v - best) * inverse);
+            kept++;
+            sum += p;
+            if (!nucleus) {
+                probs[i] = p;
+            }
+        } else if (!nucleus) {
+            probs[i] = 0.0;
+        }
+    }
+    let sums = scan(sum, t);
+    let total = sums.y;
+    let r = min(randoms[state.sampled], BELOW_ONE);
+
+    if (!nucleus) {
+        // the draw in the order of the index: the first token whose running sum passes r × total, else the last
+        let goal = r * total;
+        var running = sums.x;
+        for (var i = begin; i < end; i++) {
+            running += probs[i];
+            if (running > goal) {
+                atomicMin(&found, i);
+                break;
+            }
+        }
+        workgroupBarrier();
+        if (t == 0u) {
+            let hit = atomicLoad(&found);
+            finish(select(hit, vocab - 1u, hit == NONE));
+        }
+        return;
+    }
+
+    // the tokens over the floor gathered in the order of their index (their counts scanned): their indices into order,
+    // then their probabilities into probs, the same exp() of the same logit as above
+    let counts = scan(f32(kept), t);
+    let count = u32(counts.y);
+    var into = u32(counts.x);
+    for (var i = begin; i < end; i++) {
+        if (logits[i] >= lowest) {
+            order[into] = i;
+            into++;
+        }
+    }
+    storageBarrier();
+    for (var k = t; k < count; k += WG_SIZE) {
+        probs[k] = exp((logits[order[k]] - best) * inverse);
+    }
+    storageBarrier();
+
+    // the nucleus: the smallest probability p whose tokens at or over it hold topp of the mass
+    let limit = settings.topp * total;
+    let nucleus_found = pivot(0u, total, limit, false, count, t);
+    let mass = nucleus_found.y;
+    // the draw: the largest probability whose tokens at or over it hold more than r × the nucleus's mass
+    let goal = r * mass;
+    let drawn = pivot(bitcast<u32>(nucleus_found.x), mass, goal, true, count, t);
+    let w = drawn.x;
+
+    // the tokens of probability w, the mass over it, and which of the equal ones: the order of their index
+    let run = (count + WG_SIZE - 1u) / WG_SIZE;
+    let first = min(t * run, count);
+    let last = min(first + run, count);
+    var equal = 0u;
+    var over = 0.0;
+    for (var k = first; k < last; k++) {
+        let p = probs[k];
+        if (p == w) {
+            equal++;
+        } else if (p > w) {
+            over += p;
+        }
+    }
+    let equals = scan(f32(equal), t);
+    let above = scan(over, t).y;
+    let ties = u32(equals.y);
+    let nth = min(u32(max(floor((goal - above) / w), 0.0)), max(ties, 1u) - 1u);
+    var rank = u32(equals.x);
+    for (var k = first; k < last; k++) {
+        if (probs[k] == w) {
+            if (rank == nth) {
+                atomicStore(&found, order[k]);
+            }
+            rank++;
+        }
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        let hit = atomicLoad(&found);
+        finish(select(hit, argmax, hit == NONE));
+    }
+}`;
+
+// The CPU's sampling in JavaScript (kernels/kernel.ts's penalize() and sample(), as the engine's generate() calls
+// them): what SAMPLE is held to (/benchmark/'s check), and itself held to the kernel (tests/smoke.mjs). logits: a
+// Float32Array, changed in place by the penalty as the kernel changes them. history: BOS, the prompt and the sampled
+// tokens, the token fed last.
+export function penalizeLikeCpu(logits, history, penalty) {
+  if (penalty === 1) return;
+  const f = Math.fround, p = f(penalty);
+  for (const token of new Set(history.slice(-REPETITION_WINDOW))) {
+    const value = logits[token];
+    logits[token] = value > 0 ? f(value / p) : f(value * p);
+  }
+}
+/** The token kernel.ts's sample() draws for random (in [0, 1)): float32 probabilities, float64 sums; the nucleus
+ * sorted from the most probable, equal ones in the order of their index (the kernel's quicksort takes them in no set
+ * order: either is its distribution). temperature 0: the first index of the largest logit (NumPy's argmax). */
+export function sampleLikeCpu(logits, temperature, topp, random) {
+  if (temperature === 0) return argmaxLikeCpu(logits);
+  const { tokens, cumulative, mass } = walkLikeCpu(logits, temperature, topp);
+  const goal = random * mass;
+  for (let k = 0; k < tokens.length; k++) if (cumulative[k] > goal) return tokens[k];
+  return tokens[tokens.length - 1];
+}
+export function argmaxLikeCpu(logits) {
+  let best = -Infinity, first = 0;
+  for (let i = 0; i < logits.length; i++) if (logits[i] > best) [best, first] = [logits[i], i];
+  return first;
+}
+/** The tokens kernel.ts's sample() walks for a random number, in its order (the nucleus's, sorted; else the index's),
+ * the running sum after each (float64) and the mass the random number is a share of. */
+export function walkLikeCpu(logits, temperature, topp) {
+  const f = Math.fround, n = logits.length, best = logits[argmaxLikeCpu(logits)];
+  const nucleus = topp > 0 && topp < 1;
+  const lowest = nucleus ? f(best - f(f(temperature) * f(16.118095))) : -Infinity, inverse = f(1 / f(temperature));
+  const probs = [], index = [];
+  for (let i = 0; i < n; i++) {
+    if (logits[i] >= lowest) {
+      probs.push(f(Math.exp(f(f(logits[i] - best) * inverse))));
+      index.push(i);
+    }
+  }
+  let total = 0;
+  for (const p of probs) total += p;
+  let order = probs.map((_, k) => k), last = probs.length - 1;
+  if (nucleus) {
+    const cutoff = ((1 - f(topp)) / (probs.length > 1 ? probs.length - 1 : 1)) * total;
+    order = order.filter((k) => probs[k] >= cutoff).sort((a, b) => probs[b] - probs[a] || index[a] - index[b]);
+    const limit = f(topp) * total;
+    let sum = 0;
+    last = order.length - 1;
+    for (let k = 0; k < order.length; k++) {
+      sum += probs[order[k]];
+      if (sum >= limit) {
+        last = k;
+        break;
+      }
+    }
+  }
+  const tokens = [], cumulative = [];
+  let sum = 0;
+  for (let k = 0; k <= last; k++) {
+    sum += probs[order[k]];
+    tokens.push(index[order[k]]);
+    cumulative.push(sum);
+  }
+  return { tokens, cumulative, mass: sum };
+}

@@ -14,6 +14,8 @@
 //                                         logit
 //   { step: "layer" }                     T150: one layer of a token of Llama 3.2 1B's width, as its fourteen separate
 //                                         steps and fused into five dispatches (shaders.js's fusedMatVec), ms a layer
+//   { step: "generate" }                  T151: tokens generated on the GPU (the sampling too), each read back as it
+//                                         comes against 4, 8 and 16 a submission read back once, ms a token
 //   { step: "overhead" }                  what a token costs besides the weights: 240 empty dispatches, a submission
 //                                         with and without waiting for it, reading back 4 bytes and all the logits
 //   { step: "prompt", counts }            the tokens of a prompt through the matrices all at once (matrix × matrix,
@@ -342,6 +344,8 @@ async function check() {
   Object.assign(verdicts, await checkTiled());
   verdicts.argmax = await checkArgmax();
   Object.assign(verdicts, await checkLayer());
+  verdicts.sampling = await checkSampling();
+  Object.assign(verdicts, await checkGeneration());
   return verdicts;
 }
 // T149: every matrix × vector shader of its own (llama.cpp's and ONNX Runtime's) on 300 rows cut into chunks of 101 (a
@@ -396,6 +400,10 @@ async function checkMatVec() {
       verdicts[shader.name] = { worstRelative: worst, ok: !over && !touched, ...(touched ? { wrotePastTheRows: true } : {}) };
     } catch (error) {
       verdicts[shader.name] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+    } finally {
+      // the page stops a section that says nothing for 5 minutes: SwiftShader compiles a shader for up to 90 s, and
+      // the checks before the layer's took 380 s together under load (T151)
+      postMessage({ alive: true });
     }
   }
   return verdicts;
@@ -458,6 +466,10 @@ async function checkTiled() {
       verdicts[shader.name] = { worstRelative: worst, ok: !over && !far && apart <= 0.01 * values, ...quantizing };
     } catch (error) {
       verdicts[shader.name] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+    } finally {
+      // the page stops a section that says nothing for 5 minutes: SwiftShader compiles a shader for up to 90 s, and
+      // the checks before the layer's took 380 s together under load (T151)
+      postMessage({ alive: true });
     }
   }
   return verdicts;
@@ -774,10 +786,14 @@ function layerParts(shape, pos, copies, owned, data) {
   }
   const cacheBytes = (pos + 1) * kvDim * 2;
   const v = { h: make(dim * 4), xb: make(dim * 4), q: make(dim * 4), k: make(kvDim * 4), v: make(kvDim * 4), att: make(dim * 4),
-    t: make(dim * 4), g: make(hidden * 4), u: make(hidden * 4), norms: make(2 * dim * 4), angles: make(headSize * 4),
+    t: make(dim * 4), g: make(hidden * 4), u: make(hidden * 4), norms: make(2 * dim * 4), angles: make((pos + 1) * headSize * 4),
     keys: make(cacheBytes), values: make(cacheBytes) };
-  const angles = data?.angles ?? layerAngles(headSize, pos), eps = data?.eps ?? EPS;
-  device.queue.writeBuffer(v.angles, 0, angles);
+  const eps = data?.eps ?? EPS;
+  // RoPE's table on the GPU, a row a position up to pos (T151: fusedMatVec reads the Step's row; ROPE, the prompt's,
+  // takes the rows of its block's positions, here the row at pos bound on its own: a row of headSize 64 is 256 bytes,
+  // the alignment of a binding's offset)
+  device.queue.writeBuffer(v.angles, 0, ropeTable(headSize, pos + 1));
+  const angleRow = { buffer: v.angles, offset: pos * headSize * 4, size: headSize * 4 };
   // the state a layer starts from: the residual stream, the norms' weights, the cache of the positions before
   const reset = (state) => {
     device.queue.writeBuffer(v.h, 0, state.h);
@@ -796,10 +812,11 @@ function layerParts(shape, pos, copies, owned, data) {
   const flashParams = new ArrayBuffer(16);
   new Uint32Array(flashParams, 0, 2).set([heads, kvHeads]);
   new Float32Array(flashParams, 8, 1)[0] = 1 / Math.sqrt(headSize);
-  // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, pos, qRows, kvRows, headSize, turned
+  // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, qRows, kvRows, headSize, turned (T151: the
+  // position is the Step's)
   const fusedParams = (rows, n, second = 0, normAt = 0) => {
     const bytes = new ArrayBuffer(48);
-    new Uint32Array(bytes).set([rows, n / 4, n / GROUP, second, 0, normAt, pos, dim, kvDim, headSize, headSize, 0]);
+    new Uint32Array(bytes).set([rows, n / 4, n / GROUP, second, 0, normAt, dim, kvDim, headSize, headSize, 0, 0]);
     new Float32Array(bytes, 16, 1)[0] = eps;
     return uniform(new Uint8Array(bytes));
   };
@@ -822,7 +839,7 @@ function layerParts(shape, pos, copies, owned, data) {
     const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
     if (form.normApart) {
       return [norm(u.attentionNorm),
-        [pipes.qkvPlain, group(pipes.qkvPlain, [[0, m.qkv.w], [1, m.qkv.s], [2, v.xb], [3, u.qkv], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles]]), groups(m.qkv.rows), 1],
+        [pipes.qkvPlain, group(pipes.qkvPlain, [[0, m.qkv.w], [1, m.qkv.s], [2, v.xb], [3, u.qkv], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles], [9, u.step]]), groups(m.qkv.rows), 1],
         attention,
         [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
         norm(u.ffnNorm),
@@ -831,7 +848,7 @@ function layerParts(shape, pos, copies, owned, data) {
     }
     if (form.fused) {
       return [
-        [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles]]), groups(m.qkv.rows), 1],
+        [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles], [9, u.step]]), groups(m.qkv.rows), 1],
         attention,
         [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
         [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
@@ -843,7 +860,7 @@ function layerParts(shape, pos, copies, owned, data) {
       [2, x], [3, y], [4, shapeOf(rows, n)]]), groups(rows), 1];
     const add = [pipes.small, group(pipes.small, [[0, v.t], [1, v.h]]), 1, 1];
     return [norm(u.attentionNorm), product(m.qkv, 0, dim, v.xb, v.q), product(m.qkv, dim, kvDim, v.xb, v.k), product(m.qkv, dim + kvDim, kvDim, v.xb, v.v),
-      [pipes.rope, group(pipes.rope, [[0, v.q], [1, v.k], [2, v.v], [3, v.keys], [4, v.values], [5, v.angles], [6, u.rope], [7, u.step]]), 1, 1],
+      [pipes.rope, group(pipes.rope, [[0, v.q], [1, v.k], [2, v.v], [3, v.keys], [4, v.values], [5, angleRow], [6, u.rope], [7, u.step]]), 1, 1],
       attention, product(m.o, 0, dim, v.att, v.t), add, norm(u.ffnNorm), product(m.gateUp, 0, hidden, v.xb, v.g),
       product(m.gateUp, hidden, hidden, v.xb, v.u), [pipes.swiglu, group(pipes.swiglu, [[0, v.g], [1, v.u], [2, u.swiglu], [3, u.step]]), Math.ceil(hidden / 64), 1],
       product(m.down, 0, dim, v.g, v.t), add];
@@ -859,6 +876,13 @@ function layerAngles(headSize, pos) {
     angles[half + i] = Math.sin(angle);
   }
   return angles;
+}
+// T151: RoPE's table of positions 0 to count - 1, a row of layerAngles() each (as the model's GPU worker would hold the
+// CPU's, T152)
+function ropeTable(headSize, count) {
+  const table = new Float32Array(count * headSize);
+  for (let p = 0; p < count; p++) table.set(layerAngles(headSize, p), p * headSize);
+  return table;
 }
 // a made-up state: the residual stream, the norms' weights about 1, and the cache before pos of float16 pairs
 function layerState({ dim, kvDim }, pos) {
@@ -1049,6 +1073,493 @@ async function layer() {
     rows.push(...timed.map((t) => t.row));
   });
   return { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, rows };
+}
+
+// ---- T151: generated tokens on the GPU (shaders.js's EMBED, fusedMatVec and SAMPLE): a token a compute pass, the
+// sampler's state carried from one to the next on the GPU, and the ids read back once for the run: against reading
+// each one back, whose wait (3 to 8.6 ms for 4 bytes on the owner's Android, T134) a token pays alone.
+// The layers are T150's fused form with the workgroup's reduction (the form every device runs: which is faster is
+// the layer table's, and both forms here run the same work, so their difference is the reading back alone)
+const GENERATE_MODEL = { ...PROMPT_MODEL, vocab: 32000 };  // the CPU section's model and its vocabulary
+// the settings a token is timed with: the list's sampled models' (src/models.js: temperature 0.7, top-p 0.9, and
+// tiny-lm's penalty 1.3)
+const GENERATE_SETTINGS = { temperature: 0.7, topp: 0.9, penalty: 1.3 };
+// the forms, in turn: tokens a submission (1: each read back as it comes), GENERATE_TOKENS tokens each round
+const GENERATE_COUNTS = [1, 4, 8, 16], GENERATE_TOKENS = 16, GENERATE_ROUNDS = 5, GENERATE_MOST = 64, GENERATE_POS = 127;
+// a fallback adapter runs the check's small model, 2 tokens a form once: its times are no GPU's
+const GENERATE_CHECK = { dim: 256, hidden: 512, heads: 4, kvHeads: 2, layers: 2, vocab: 1003 };
+async function generationPipes(headSize) {
+  const { maxComputeWorkgroupStorageSize: memory, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX } = device.limits;
+  const flash = WGSL.flashShape({ headSize, half: false, subgroups: false, memory, threads: Math.min(maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX) });
+  if (flash.none) throw new Error(flash.none);
+  const pipes = {};
+  for (const [key, code] of [["embed", WGSL.EMBED], ["sample", WGSL.SAMPLE], ["flash", WGSL.flashTile(flash)],
+    ["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups: false })], ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups: false })],
+    ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups: false })], ["classifier", WGSL.fusedMatVec({ input: "norm", output: "write", subgroups: false })]]) {
+    pipes[key] = await compiled(code);
+    postMessage({ alive: true });
+  }
+  return pipes;
+}
+// A model on the GPU for a run of tokens: its layers (T150's four matrices each, the cache of its own), the norms
+// (two a layer, then the final one), the classifier (the embedding too: tied, as Llama 3.2 1B's), RoPE's table of
+// `positions`, and the sampler's buffers. data: the check's ({layers: [{qkv, o, gateUp, down: {w, s}}], classifier,
+// norms, keys, values}), else random. encode(encoder): one token's pass and the Step copied from the state after it
+function generationParts(model, pipes, positions, owned, data) {
+  const shape = layerShape(model), { dim, hidden, heads, kvDim, headSize } = shape, { vocab, layers } = model;
+  const make = (bytes, usage = STORAGE | COPY_DST | COPY_SRC) => {
+    const b = buffer(bytes, usage);
+    owned.push(b);
+    return b;
+  };
+  const uniform = (bytes) => {
+    const b = make(bytes.byteLength, UNIFORM | COPY_DST);
+    device.queue.writeBuffer(b, 0, bytes);
+    return b;
+  };
+  const weights = ([rows, n], given) => {
+    if (rows * n > device.limits.maxStorageBufferBindingSize) throw new Error(`a matrix of ${rows} × ${n} is past a binding of this device`);
+    const w = make(rows * n), s = make((rows * n / GROUP) * 4);
+    if (given) {
+      device.queue.writeBuffer(w, 0, given.w);
+      device.queue.writeBuffer(s, 0, given.s);
+    } else {
+      fill(w, rows * n);
+      device.queue.writeBuffer(s, 0, floats(rows * n / GROUP, 0.002));
+    }
+    return { w, s, rows };
+  };
+  const cacheBytes = positions * kvDim * 2;
+  const stack = [...Array(layers)].map((_, l) => {
+    const m = Object.fromEntries(Object.entries(shape.matrices).map(([key, matrix]) => [key, weights(matrix, data?.layers[l][key])]));
+    const keys = make(cacheBytes), values = make(cacheBytes);
+    if (data) {
+      device.queue.writeBuffer(keys, 0, data.keys[l]);
+      device.queue.writeBuffer(values, 0, data.values[l]);
+    }
+    return { ...m, keys, values };
+  });
+  const classifier = weights([vocab, dim], data?.classifier);
+  const v = { h: make(dim * 4), q: make(dim * 4), att: make(dim * 4), g: make(hidden * 4), logits: make(vocab * 4),
+    probs: make(vocab * 4), order: make(vocab * 4), norms: make((2 * layers + 1) * dim * 4), angles: make(positions * headSize * 4),
+    state: make(WGSL.STATE_BYTES), chosen: make(Math.max(positions, 4) * 4), randoms: make(positions * 4),
+    step: make(16, UNIFORM | COPY_DST), settings: make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST) };
+  device.queue.writeBuffer(v.norms, 0, data?.norms ?? new Float32Array((2 * layers + 1) * dim).map(() => 0.5 + Math.random()));
+  device.queue.writeBuffer(v.angles, 0, ropeTable(headSize, positions));
+  const eps = data?.eps ?? EPS;
+  // fusedMatVec's Params: rows, words, perRow, second, eps, normAt, qRows, kvRows, headSize, turned
+  const params = (rows, n, second = 0, normAt = 0) => {
+    const bytes = new ArrayBuffer(48);
+    new Uint32Array(bytes).set([rows, n / 4, n / GROUP, second, 0, normAt, dim, kvDim, headSize, headSize, 0, 0]);
+    new Float32Array(bytes, 16, 1)[0] = eps;
+    return uniform(new Uint8Array(bytes));
+  };
+  const flashParams = new ArrayBuffer(16);
+  new Uint32Array(flashParams, 0, 2).set([heads, shape.kvHeads]);
+  new Float32Array(flashParams, 8, 1)[0] = 1 / Math.sqrt(headSize);
+  const u = { flash: uniform(new Uint8Array(flashParams)), embed: uniform(new Uint32Array([dim, 0, 0, 0])),
+    classifier: params(vocab, dim, 0, 2 * layers * dim), o: params(dim, dim), down: params(dim, hidden),
+    layers: stack.map((_, l) => ({ qkv: params(dim + 2 * kvDim, dim, 0, 2 * l * dim), gateUp: params(hidden, dim, hidden, (2 * l + 1) * dim) })) };
+  const group = (pipeline, entries) => device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+    entries: entries.map(([binding, resource]) => ({ binding, resource: { buffer: resource } })) });
+  const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
+  const dispatches = [[pipes.embed, group(pipes.embed, [[0, classifier.w], [1, classifier.s], [2, v.state], [3, v.h], [4, u.embed]]), 1, 1]];
+  stack.forEach((m, l) => dispatches.push(
+    [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.layers[l].qkv], [4, v.norms], [5, v.q], [6, m.keys], [7, m.values], [8, v.angles], [9, v.step]]), groups(m.qkv.rows), 1],
+    [pipes.flash, group(pipes.flash, [[0, v.q], [1, m.keys], [2, m.values], [3, v.att], [4, u.flash], [5, v.step]]), heads, 1],
+    [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
+    [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.layers[l].gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
+    [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]));
+  const across = Math.min(groups(vocab), device.limits.maxComputeWorkgroupsPerDimension);
+  dispatches.push([pipes.classifier, group(pipes.classifier, [[0, classifier.w], [1, classifier.s], [2, v.h], [3, u.classifier], [4, v.norms], [5, v.logits]]), across, Math.ceil(groups(vocab) / across)],
+    [pipes.sample, group(pipes.sample, [[0, v.logits], [1, v.probs], [2, v.order], [3, v.state], [4, v.chosen], [5, v.randoms], [6, v.settings]]), 1, 1]);
+  const encode = (encoder) => {
+    const pass = encoder.beginComputePass();
+    dispatches.forEach((d) => run(pass, d));
+    pass.end();
+    // the Step of the next token: the state's first four words (a uniform is not a shader's to write)
+    encoder.copyBufferToBuffer(v.state, 0, v.step, 0, 16);
+  };
+  // a run from the start: the state (samplingState), the random numbers and the settings (samplingSettings)
+  const reset = (state, randoms, settings) => {
+    device.queue.writeBuffer(v.state, 0, state);
+    device.queue.writeBuffer(v.step, 0, state.subarray(0, 4));
+    if (randoms) device.queue.writeBuffer(v.randoms, 0, randoms);
+    if (settings) device.queue.writeBuffer(v.settings, 0, settings);
+  };
+  const bytes = layers * Object.values(shape.matrices).reduce((sum, matrix) => sum + matrixBytes(matrix), 0) + matrixBytes([vocab, dim]);
+  return { vectors: v, encode, reset, dispatches: dispatches.length, bytes };
+}
+// what submitting the tokens of a run and reading back their ids and the state costs: count tokens, per of them a
+// submission (each read back before the next is submitted, as a token's text is shown), from the state given. Returns
+// the ms and what came back: the ids and the state's words
+async function generationRun(parts, count, per, target) {
+  const v = parts.vectors, bytes = per * 4 + WGSL.STATE_BYTES;
+  const into = target ?? buffer(bytes, MAP_READ | COPY_DST);
+  const ids = new Uint32Array(count);
+  let state;
+  const began = performance.now();
+  for (let done = 0; done < count; done += per) {
+    const encoder = device.createCommandEncoder();
+    for (let i = 0; i < per; i++) parts.encode(encoder);
+    encoder.copyBufferToBuffer(v.chosen, done * 4, into, 0, per * 4);
+    encoder.copyBufferToBuffer(v.state, 0, into, per * 4, WGSL.STATE_BYTES);
+    device.queue.submit([encoder.finish()]);
+    await into.mapAsync(MAP_READ);
+    const words = new Uint32Array(into.getMappedRange(0, bytes).slice(0));
+    into.unmap();
+    ids.set(words.subarray(0, per), done);
+    state = words.subarray(per);
+  }
+  const ms = performance.now() - began;
+  if (!target) into.destroy();
+  return { ms, ids, state };
+}
+// made-up random numbers in [0, 1) (the engine's are NumPy's generator's, drawn by the CPU in the same order)
+const randomsOf = (count) => new Float32Array(count).map(() => Math.fround(Math.random()) % 1);
+async function generate() {
+  await gpu();
+  const model = fallback ? GENERATE_CHECK : GENERATE_MODEL, headSize = model.dim / model.heads;
+  const counts = fallback ? [1, 2] : GENERATE_COUNTS, tokens = fallback ? 2 : GENERATE_TOKENS;
+  const positions = GENERATE_POS + 2 * GENERATE_MOST + GENERATE_TOKENS + 1;
+  const history = [...Array(GENERATE_POS + 1)].map(() => (Math.random() * model.vocab) | 0);
+  const start = WGSL.samplingState({ token: history[history.length - 1], pos: GENERATE_POS, history });
+  const randoms = randomsOf(positions);
+  return scoped(async (owned) => {
+    const pipes = await generationPipes(headSize);
+    const parts = generationParts(model, pipes, positions, owned);
+    parts.reset(start, randoms, WGSL.samplingSettings({ vocab: model.vocab, ...GENERATE_SETTINGS }));
+    await device.queue.onSubmittedWorkDone();
+    const targets = new Map(counts.map((per) => [per, buffer(per * 4 + WGSL.STATE_BYTES, MAP_READ | COPY_DST)]));
+    owned.push(...targets.values());
+    postMessage({ alive: true });
+    // the ms of a run of `tokens` from the start, per of them a submission
+    const timed = async (per) => {
+      parts.reset(start);
+      return (await generationRun(parts, tokens, per, targets.get(per))).ms;
+    };
+    // the work of a token without the reading back: n tokens in one submission against 2n (paired(): T168's)
+    let work;
+    if (!fallback) {
+      const r = await paired(async (n) => {
+        parts.reset(start);
+        return (await generationRun(parts, n, n)).ms;
+      }, GENERATE_MOST);
+      work = { ms: r.ms / r.dispatches, tokens: r.dispatches, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
+    }
+    postMessage({ alive: true });
+    // the forms in turn (T150's review), each a run of `tokens`, after one run each to warm up
+    const rounds = fallback ? 1 : GENERATE_ROUNDS, times = counts.map(() => []);
+    if (!fallback) for (const per of counts) await timed(per);
+    for (let round = 0; round < rounds; round++) {
+      for (let i = 0; i < counts.length; i++) times[i].push(await timed(counts[i]));
+      postMessage({ alive: true });
+    }
+    const rows = counts.map((per, i) => {
+      const msPerToken = middle(times[i]) / tokens;
+      // what a submission costs besides its tokens' work: the submission, the wait and the ids read back
+      const fixed = work && !work.unsteady ? msPerToken * per - work.ms * per : undefined;
+      return { perSubmission: per, msPerToken, ...(fixed === undefined ? {} : { fixedMs: fixed }) };
+    });
+    // the sampling alone, on Llama 3's vocabulary (128256 logits, made up: a spread of 2 and 20 tokens far above it)
+    const sampling = fallback ? undefined : await samplingAlone();
+    return { model: fallback ? "the check's small model" : "Llama 3.2 1B's width", layers: model.layers, vocab: model.vocab,
+      GB: parts.bytes / 1e9, dispatches: parts.dispatches, tokens, settings: GENERATE_SETTINGS, work, rows, sampling };
+  });
+}
+async function samplingAlone() {
+  const vocab = MODELS["Llama 3.2 1B"].vocab, positions = 2 * GENERATE_MOST + 2;
+  return scoped(async (owned) => {
+    const sample = await compiled(WGSL.SAMPLE);
+    const make = (bytes, usage = STORAGE | COPY_DST) => {
+      const b = buffer(bytes, usage);
+      owned.push(b);
+      return b;
+    };
+    const logits = make(vocab * 4), probs = make(vocab * 4), order = make(vocab * 4), state = make(WGSL.STATE_BYTES),
+      chosen = make(positions * 4), randoms = make(positions * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST);
+    device.queue.writeBuffer(logits, 0, madeUpLogits(vocab, 2));
+    device.queue.writeBuffer(randoms, 0, randomsOf(positions));
+    device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab, ...GENERATE_SETTINGS }));
+    const history = [...Array(64)].map(() => (Math.random() * vocab) | 0), start = WGSL.samplingState({ token: history[63], pos: 0, history });
+    const group = device.createBindGroup({ layout: sample.getBindGroupLayout(0),
+      entries: [logits, probs, order, state, chosen, randoms, settings].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+    const r = await paired(async (n) => {
+      device.queue.writeBuffer(state, 0, start);
+      const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+      for (let i = 0; i < n; i++) run(pass, [sample, group, 1, 1]);
+      pass.end();
+      const began = performance.now();
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      return performance.now() - began;
+    }, GENERATE_MOST);
+    return { vocab, msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) };
+  });
+}
+// logits as a model's look (a few tokens far above the rest), made up: a normal spread and `peaks` tokens 8 to 14 over it
+function madeUpLogits(vocab, spread, peaks = 20) {
+  const logits = new Float32Array(vocab);
+  for (let i = 0; i < vocab; i++) logits[i] = spread * Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+  for (let i = 0; i < peaks; i++) logits[(Math.random() * vocab) | 0] += 8 + 6 * Math.random();
+  return logits;
+}
+
+// The check of SAMPLE (T151) against the CPU's sampling in JavaScript (shaders.js's sampleLikeCpu and
+// penalizeLikeCpu, which tests/smoke.mjs holds to the kernel): the same logits, history and random number must pick
+// the same token. Where a float32 sum in another order moves a border, a token next to it is as right: the token
+// passes when it is what the CPU picks, or where the CPU's walk (walkLikeCpu, with top-p as it is and moved by EDGE)
+// passes it within EDGE of the mass of the random number's share (a relative 1e-4: a wrong border moves the draw by a
+// token's probability, 1e-3 of the mass or more), or a token of the same logit (equal probabilities, which the CPU
+// takes in no set order); temperature 0 (the most likely token): the first index of the largest logit and, where
+// logits come from the GPU's own forward pass, any within `band` of it (and of a token acceptable otherwise). The
+// count of tokens that passed by an edge only is in the verdict.
+const EDGE = 1e-4;
+function acceptable(logits, { temperature, topp }, random, band = 0) {
+  const picks = new Set([WGSL.sampleLikeCpu(logits, temperature, topp, random)]), [first] = picks;
+  const near = (token) => band > 0 ? logits.forEach((value, i) => Math.abs(value - logits[token]) <= band && picks.add(i)) : picks.add(token);
+  // the most likely token: NumPy's first index of the largest logit, exactly where the logits are the same
+  if (temperature === 0) {
+    near(first);
+    return { first, picks };
+  }
+  const nucleus = topp > 0 && topp < 1;
+  for (const p of nucleus ? [topp, topp * (1 - EDGE), topp * (1 + EDGE)] : [topp]) {
+    const { tokens, cumulative, mass } = WGSL.walkLikeCpu(logits, temperature, p);
+    const low = (random - EDGE) * mass, high = (random + EDGE) * mass;
+    tokens.forEach((token, k) => (k ? cumulative[k - 1] : 0) <= high && cumulative[k] >= low && near(token));
+  }
+  // equal probabilities, which the CPU takes in no set order
+  for (const token of [...picks]) logits.forEach((value, i) => value === logits[token] && picks.add(i));
+  return { first, picks };
+}
+// The sampler alone: cases of logits (a vocabulary of 1003, not a multiple of 256, and Llama 3's 128256; normal
+// spreads from flat to steep, and tokens far above them), top-p 0.9, 0.5 and none, random numbers at 0, inside and
+// just under 1, temperature 0 and 1.3 too, the penalty (the window's tokens among the most likely, a repeated one,
+// negative ones, and likely ones older than the window that must not be penalized), and equal logits at the top and
+// at the border. Then runs of four tokens in one submission (the i-th random number for the i-th token, the logits
+// penalized again each time as the CPU's would be), and a run with a stop token: it is written, the state stops and
+// nothing after it changes.
+async function checkSampling() {
+  const pipeline = await compiled(WGSL.SAMPLE);
+  postMessage({ alive: true });
+  const cases = [];
+  for (const vocab of [1003, 128256]) {
+    for (const spread of vocab === 1003 ? [0.5, 2, 6, 12] : [2, 6]) {
+      for (const topp of [0.9, 0.5, 1]) {
+        for (const random of [0, Math.random(), 1 - 2 ** -24]) cases.push({ vocab, spread, topp, temperature: 0.7, penalty: 1.3, random });
+      }
+      cases.push({ vocab, spread, topp: 0.9, temperature: 0, penalty: 1.3, random: 0.5 });
+      cases.push({ vocab, spread, topp: 0.9, temperature: 1.3, penalty: 1, random: Math.random() });
+    }
+  }
+  // a history shorter than the window (its empty slots must not count: token 0, among the most likely, is in none)
+  for (const spread of [0.5, 2, 6]) for (let i = 0; i < 3; i++) cases.push({ vocab: 1003, spread, topp: 0.9, temperature: 0.7, penalty: 1.3, random: Math.random(), short: true });
+  cases.push({ vocab: 1003, spread: 2, topp: 0.9, temperature: 0.7, penalty: 1.3, random: 0.3, ties: true });
+  cases.push({ vocab: 1003, spread: 2, topp: 0.9, temperature: 0, penalty: 1, random: 0.3, ties: true });
+  const most = 128256, owned = [];
+  let wrong = 0, edge = 0, checked = 0;
+  const problems = [];
+  try {
+    await validated(async () => {
+      const make = (bytes, usage = STORAGE | COPY_DST | COPY_SRC) => {
+        const b = buffer(bytes, usage);
+        owned.push(b);
+        return b;
+      };
+      const logitsBuffer = make(most * 4), probs = make(most * 4), order = make(most * 4), state = make(WGSL.STATE_BYTES),
+        chosen = make(16 * 4), randoms = make(16 * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST);
+      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+        entries: [logitsBuffer, probs, order, state, chosen, randoms, settings].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+      const back = make(16 * 4 + WGSL.STATE_BYTES, MAP_READ | COPY_DST);
+      // steps SAMPLE dispatches in one submission, from the case's history; the ids and the state back
+      const sampled = async (c, logits, history, draws, steps, stops = []) => {
+        device.queue.writeBuffer(logitsBuffer, 0, logits);
+        device.queue.writeBuffer(state, 0, WGSL.samplingState({ token: history[history.length - 1], pos: 40, history }));
+        device.queue.writeBuffer(chosen, 0, new Uint32Array(16).fill(SENTINEL_ID));
+        device.queue.writeBuffer(randoms, 0, new Float32Array(draws));
+        device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab: c.vocab, temperature: c.temperature, topp: c.topp, penalty: c.penalty, stops }));
+        const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+        for (let i = 0; i < steps; i++) run(pass, [pipeline, group, 1, 1]);
+        pass.end();
+        encoder.copyBufferToBuffer(chosen, 0, back, 0, 16 * 4);
+        encoder.copyBufferToBuffer(state, 0, back, 16 * 4, WGSL.STATE_BYTES);
+        device.queue.submit([encoder.finish()]);
+        await back.mapAsync(MAP_READ);
+        const words = new Uint32Array(back.getMappedRange().slice(0));
+        back.unmap();
+        return { ids: words.subarray(0, 16), state: words.subarray(16) };
+      };
+      // the tokens of a run held to the CPU's, step by step (the CPU's history goes on with the GPU's tokens)
+      const judge = (c, logits, history, draws, got, stops = []) => {
+        const cpu = Float32Array.from(logits), seen = [...history];
+        let k = 0;
+        for (; k < draws.length; k++) {
+          WGSL.penalizeLikeCpu(cpu, seen, c.penalty);
+          const { first, picks } = acceptable(cpu, c, draws[k]);
+          checked++;
+          if (!picks.has(got.ids[k])) {
+            wrong++;
+            problems.push(`${c.vocab} spread ${c.spread} top-p ${c.topp} T ${c.temperature} r ${draws[k].toFixed(3)}: ${got.ids[k]}, the CPU ${first}`);
+            return;
+          }
+          if (got.ids[k] !== first) edge++;
+          if (stops.includes(got.ids[k])) break;
+          seen.push(got.ids[k]);
+        }
+        // the state: stopped after a stop token (its id written, nothing after it), else at the next position
+        const stopped = k < draws.length, taken = stopped ? k + 1 : draws.length;
+        const s = got.state, fed = stopped ? k : draws.length;
+        const right = s[5] === taken && s[7] === (stopped ? 1 : 0) && s[1] === 40 + fed && s[6] === history.length + fed &&
+          s[4] === (fed ? got.ids[fed - 1] : history[history.length - 1]) && got.ids[taken] === SENTINEL_ID &&
+          (fed === 0 || s[8 + ((history.length + fed - 1) % WGSL.REPETITION_WINDOW)] === got.ids[fed - 1]);
+        if (!right) {
+          wrong++;
+          problems.push(`the state after ${draws.length} tokens${stops.length ? " and a stop token" : ""}: ${[...s.subarray(0, 8)].join(" ")}`);
+        }
+      };
+      for (const c of cases) {
+        const logits = madeUpLogits(c.vocab, c.spread);
+        const ranked = [...logits.keys()].sort((a, b) => logits[b] - logits[a]);
+        // 70 tokens: the 6 before the window two of the most likely (3rd and 4th, which must not be penalized), then the
+        // window: the three most likely twice each (a repeat is penalized once), early and late in it (both halves of
+        // the ring), with likely ones and negative ones between. Short: 20 tokens, and token 0 made one of the most likely
+        const history = c.short ? [ranked[1], ranked[5], ...ranked.slice(10, 28)]
+          : [ranked[3], ranked[4], ...ranked.slice(-4), ranked[0], ...ranked.slice(5, 35), ranked[1], ...ranked.slice(-30, -10), ranked[0], ranked[2],
+            ranked[1], ...ranked.slice(35, 43), ranked[2]];
+        if (c.short) logits[0] = (logits[ranked[0]] + logits[ranked[1]]) / 2;
+        let random = c.random;
+        if (c.ties) {
+          // equal logits: at the top (the first index is the most likely), and a run of 20 further down, where the
+          // random number falls on the fifth of them in the CPU's walk (the draw among equals)
+          logits[ranked[1]] = logits[ranked[0]];
+          for (let i = 10; i < 30; i++) logits[ranked[i]] = logits[ranked[10]];
+          const penalized = Float32Array.from(logits);
+          WGSL.penalizeLikeCpu(penalized, history, c.penalty);
+          const walk = c.temperature ? WGSL.walkLikeCpu(penalized, c.temperature, c.topp) : null;
+          const k = walk ? walk.tokens.map((token, at) => [token, at]).filter(([token]) => penalized[token] === penalized[ranked[10]])[4]?.[1] : undefined;
+          if (k !== undefined) random = (walk.cumulative[k - 1] + walk.cumulative[k]) / 2 / walk.mass;
+        }
+        judge(c, logits, history, [random], await sampled(c, logits, history, [random], 1));
+        postMessage({ alive: true });
+      }
+      // runs: the i-th random number for the i-th token, and a stop token (the run's third token, taken again)
+      for (const vocab of [1003, 128256]) {
+        const c = { vocab, spread: 1, topp: 0.9, temperature: 0.7, penalty: 1.3 }, logits = madeUpLogits(vocab, 1, 40);
+        const history = [...Array(20)].map(() => (Math.random() * vocab) | 0), draws = [0.05, 0.95, 0.5, 0.25];
+        const got = await sampled(c, logits, history, draws, 4);
+        judge(c, logits, history, draws, got);
+        const stop = got.ids[2];
+        judge(c, logits, history, draws, await sampled(c, logits, history, draws, 4, [123456, stop]), [123456, stop]);
+      }
+    });
+  } catch (error) {
+    return { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+  } finally {
+    owned.forEach((b) => b.destroy());
+  }
+  return { worstRelative: 0, ok: wrong === 0, tokens: checked, edge, ...(problems.length ? { problems: problems.slice(0, 3) } : {}) };
+}
+const SENTINEL_ID = 0xdeadbeef;
+// The check of a run of tokens on the GPU (T151): the check's small model (two layers of 256, 4 heads of 64 and 2 of
+// K and V, a vocabulary of 1003) generates 6 tokens in one submission from position 5, greedy and sampled (top-p 0.9,
+// the penalty), and each token is held to what the CPU's sampling picks from the logits of the same forward pass in
+// JavaScript (layerReference's layers, the embedding and the classifier in float64), fed the GPU's tokens before it:
+// the first index of the largest logit or one within 1e-4 of the logits' largest magnitude of it (the GPU's float32
+// forward pass is off by about 1e-6 of it), or a token acceptable() takes. Then the sampled run again with its fourth
+// token as a stop token: the same three tokens, the stop written, and the run stopped there.
+const GENERATION_CHECK_POS = 5, GENERATION_CHECK_TOKENS = 6;
+async function checkGeneration() {
+  const model = GENERATE_CHECK, shape = layerShape(model), { dim, hidden, kvDim, headSize } = shape;
+  const pos = GENERATION_CHECK_POS, count = GENERATION_CHECK_TOKENS, positions = pos + count + 1;
+  const matrix = ([rows, n], scale) => ({ w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, scale) });
+  const cache = () => new Uint16Array(positions * kvDim).map((_, i) => (i < pos * kvDim ? toHalf((Math.random() - 0.5) * 4) : 0));
+  const data = { layers: [...Array(model.layers)].map(() => Object.fromEntries(Object.entries(shape.matrices).map(([key, m]) => [key, matrix(m, 0.01 * Math.sqrt(256 / m[1]))]))),
+    classifier: matrix([model.vocab, dim], 0.002), norms: new Float32Array((2 * model.layers + 1) * dim).map(() => 0.5 + Math.random()),
+    keys: [...Array(model.layers)].map(cache), values: [...Array(model.layers)].map(cache), eps: EPS };
+  const history = [...Array(pos + 1)].map(() => (Math.random() * model.vocab) | 0), draws = randomsOf(count);
+  const embedded = (token) => {
+    const signed = new Int8Array(data.classifier.w.buffer), h = new Float64Array(dim);
+    for (let i = 0; i < dim; i++) h[i] = signed[token * dim + i] * data.classifier.s[(token * dim + i) / GROUP | 0];
+    return h;
+  };
+  // the logits of the GPU's tokens, position by position, in float64 (the caches go on as the GPU's)
+  const referenceLogits = (tokens) => {
+    const keys = data.keys.map((k) => Uint16Array.from(k)), values = data.values.map((v) => Uint16Array.from(v)), out = [];
+    for (let k = 0; k < tokens.length; k++) {
+      const p = pos + k;
+      let h = embedded(tokens[k]);
+      data.layers.forEach((m, l) => {
+        const r = layerReference(shape, p, { ...m, h, norms: data.norms.subarray(2 * l * dim, (2 * l + 2) * dim), keys: keys[l], values: values[l],
+          angles: layerAngles(headSize, p), eps: data.eps });
+        keys[l].set(r.keys, p * kvDim);
+        values[l].set(r.values, p * kvDim);
+        h = r.h;
+      });
+      let squares = 0;
+      for (const value of h) squares += value * value;
+      const scale = 1 / Math.sqrt(squares / dim + data.eps), final = 2 * model.layers * dim;
+      const x = h.map((value, i) => data.norms[final + i] * (scale * value));
+      const signed = new Int8Array(data.classifier.w.buffer), logits = new Float32Array(model.vocab);
+      for (let r = 0; r < model.vocab; r++) {
+        let sum = 0;
+        for (let i = 0; i < dim; i++) sum += signed[r * dim + i] * data.classifier.s[(r * dim + i) / GROUP | 0] * x[i];
+        logits[r] = sum;
+      }
+      out.push(logits);
+    }
+    return out;
+  };
+  const verdicts = {};
+  let tokens = 0, edge = 0;
+  const problems = [];
+  try {
+    await scoped(async (owned) => {
+      const pipes = await generationPipes(headSize);
+      const parts = generationParts(model, pipes, positions, owned, data);
+      for (const settings of [{ temperature: 0, topp: 0.9, penalty: 1 }, { ...GENERATE_SETTINGS }]) {
+        const runOnce = async (stops = []) => {
+          // (the caches need no reset: a run writes each position's row before its attention reads it)
+          parts.reset(WGSL.samplingState({ token: history[pos], pos, history }), draws, WGSL.samplingSettings({ vocab: model.vocab, ...settings, stops }));
+          return generationRun(parts, count, count);
+        };
+        const got = await runOnce();
+        const sampled = Math.min(got.state[5], count), fed = [history[pos], ...got.ids.subarray(0, sampled - 1)];
+        const logits = referenceLogits(fed), seen = [...history];
+        for (let k = 0; k < sampled; k++) {
+          const cpu = logits[k];
+          WGSL.penalizeLikeCpu(cpu, seen, settings.penalty);
+          let largest = 0;
+          for (const value of cpu) largest = Math.max(largest, Math.abs(value));
+          const { first, picks } = acceptable(cpu, settings, draws[k], 1e-4 * largest);
+          tokens++;
+          if (!picks.has(got.ids[k])) {
+            problems.push(`T ${settings.temperature}, token ${k}: ${got.ids[k]}, the CPU ${first}`);
+            break;
+          }
+          if (got.ids[k] !== first) edge++;
+          seen.push(got.ids[k]);
+        }
+        if (got.state[5] !== count || got.state[1] !== pos + count || got.state[7] !== 0) problems.push(`T ${settings.temperature}: the state ${[...got.state.subarray(0, 8)].join(" ")}`);
+        if (settings.temperature) {
+          // the fourth token a stop token (where it is not among the first three)
+          const stop = got.ids[3];
+          if (!got.ids.subarray(0, 3).includes(stop)) {
+            const again = await runOnce([stop]);
+            const same = again.ids.subarray(0, 4).every((id, k) => id === got.ids[k]);
+            if (!same || again.state[5] !== 4 || again.state[7] !== 1 || again.state[1] !== pos + 3) {
+              problems.push(`a stop token: ${[...again.ids.subarray(0, 4)].join(" ")} against ${[...got.ids.subarray(0, 4)].join(" ")}, the state ${[...again.state.subarray(0, 8)].join(" ")}`);
+            }
+          }
+        }
+        postMessage({ alive: true });
+      }
+    });
+    verdicts["tokens on the GPU"] = { worstRelative: 0, ok: problems.length === 0, tokens, edge, ...(problems.length ? { problems } : {}) };
+  } catch (error) {
+    verdicts["tokens on the GPU"] = { worstRelative: NaN, ok: false, error: String(error?.message ?? error) };
+  }
+  return verdicts;
 }
 
 // ---- what a token costs besides its weights: the dispatches of Llama 3.2 1B's token (seven matrices and seven small
@@ -1353,6 +1864,7 @@ onmessage = async ({ data }) => {
     else if (data.step === "bandwidth") result = await bandwidth(data.shape);
     else if (data.step === "token") result = await token(data.model, data.kind, data);
     else if (data.step === "layer") result = await layer();
+    else if (data.step === "generate") result = await generate();
     else if (data.step === "overhead") result = await overhead();
     else if (data.step === "prompt") result = await prompt(data.counts);
     else if (data.step === "ceilings") result = await ceilings();

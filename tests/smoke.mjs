@@ -323,5 +323,52 @@ llama2_convert.checkpoint_size([64, 96, 2, 4, 2, 320, 24], "int8", {"qk_norm": T
   if (!refused) throw new Error("checkpoint_dtype() took the file without its head_dim");
   engine.destroy();
 }
+// T151: the CPU's sampling in JavaScript (public/shaders.js's penalizeLikeCpu and sampleLikeCpu: what /benchmark/ holds
+// the GPU's SAMPLE to) is the kernel's: the same logits, history and random number, the same penalized logits and the
+// same token (or, as above, a neighbour of about the same logit where rounding moves a border: the kernel's exp() is a
+// polynomial, JavaScript's is not)
+{
+  const { penalizeLikeCpu, sampleLikeCpu } = await import("../public/shaders.js");
+  pyodide.runPython(`
+def kernel_pick(buffer, temperature, topp, value, history, penalty):
+    logits = np.frombuffer(buffer.to_bytes(), dtype=np.float32).copy()
+    if penalty != 1.0:
+        fast.penalize(logits, [int(token) for token in history], penalty)
+    return fast.sample(logits, temperature, topp, Fixed(value)), logits.tobytes()
+`);
+  const pick = pyodide.globals.get("kernel_pick"), vocab = pyodide.globals.get("fast").vocab_size;
+  let cases = 0, same = 0;
+  for (const spread of [0.5, 2, 6, 12]) {
+    for (const topp of [0.9, 0.5, 1]) {
+      for (const temperature of [0.7, 1.3, 0]) {
+        for (const penalty of [1, 1.3]) {
+          for (const value of [0, Math.random(), 1 - 1e-12]) {
+            const logits = new Float32Array(vocab).map(() => spread * Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random()));
+            // the window: 64 of the most likely (a repeated one among them) and older tokens that must not count
+            const ranked = [...logits.keys()].sort((a, b) => logits[b] - logits[a]);
+            const history = [...ranked.slice(0, 10), ...ranked.slice(10, 70), ranked[12], ranked.at(-1), ranked.at(-2)];
+            const result = pick(new Uint8Array(logits.buffer), temperature, topp, value, history, penalty);
+            const [theirs, penalized] = result.toJs();
+            result.destroy();
+            const ours = Float32Array.from(logits);
+            penalizeLikeCpu(ours, history, penalty);
+            if (!ours.every((v, i) => v === new Float32Array(penalized.buffer, penalized.byteOffset, vocab)[i])) {
+              throw new Error(`penalizeLikeCpu is not the kernel's penalize (penalty ${penalty})`);
+            }
+            const token = sampleLikeCpu(ours, temperature, topp, value);
+            if (token !== theirs && !(Math.abs(ours[token] - ours[theirs]) < 1e-3)) {
+              throw new Error(`sampleLikeCpu picked ${token}, the kernel ${theirs} (spread ${spread}, top-p ${topp}, T ${temperature}, r ${value})`);
+            }
+            cases++;
+            same += token === theirs;
+          }
+        }
+      }
+    }
+  }
+  pick.destroy();
+  if (same < 0.95 * cases) throw new Error(`sampleLikeCpu picked the kernel's token in ${same} of ${cases} cases only`);
+  console.log(`T151: sampleLikeCpu picked the kernel's token in ${same} of ${cases} cases (the rest a neighbour of the same logit)`);
+}
 console.log(`Pyodide ${version}, ${report} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
 console.log("ok");

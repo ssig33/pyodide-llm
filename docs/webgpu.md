@@ -62,6 +62,7 @@ The shapes are taken from public implementations, and each file keeps their noti
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
 | One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |
 | The device's ceilings (benchmark only) | the loops of clpeak (GPL-3.0): the shapes only, no lines copied |
+| Sampling on the GPU and several tokens a submission (benchmark only): the repetition penalty, softmax, top-p and the draw, the next token's row of the embedding | the penalty of MLC LLM (Apache-2.0); llama.cpp's `argmax`, `soft_max`, `cumsum` and `get_rows` (MIT); top-p without sorting from MLC LLM's `top_p_pivot` (Apache-2.0). Carrying the state from one token to the next, and the draw by the same pivots, are ours. |
 
 ## Measured
 
@@ -81,16 +82,19 @@ say only that the shaders are right, not how fast a GPU is.
   subgroups, in Chromium's SwiftShader and in Node with Dawn and Mesa's lavapipe.
 - Deliberately broken shaders (a wrong causal mask, a RoPE sign, a GQA head mapping, a missing quantization step
   and others) fail these checks.
+- The sampling on the GPU picks the token the CPU's sampling picks for the same logits and random number (or, where
+  a float32 sum moves a border, one next to it: within 1e-4 of the probability mass), in the benchmark's check; the JavaScript it
+  is held to is held to the CPU's kernel in `tests/smoke.mjs`.
 - On the device, the page checks each shader against JavaScript before it uses it.
 
 ## Next
 
-In order: several tokens on the GPU with one read back, then generation on the GPU where the device measures it
-faster; then Qwen2 and Qwen3, GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
+In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
+GPU with the CPU's random numbers so that a seed gives the same text, is in the benchmark); then Qwen2 and Qwen3, GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
 instead of twice. The tasks are in [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself
 
 Open [/benchmark/](https://takano32.github.io/pyodide-llm/benchmark/) and press the GPU section's button. It
-measures the device's ceilings, a prompt through each shader, one token's matrix × vector, and the fused layer,
-and can open the report as a GitHub issue.
+measures the device's ceilings, a prompt through each shader, one token's matrix × vector, the fused layer, and
+tokens generated on the GPU read back one at a time or several at once, and can open the report as a GitHub issue.
