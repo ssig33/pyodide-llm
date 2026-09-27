@@ -123,8 +123,10 @@ page.on("pageerror", (error) => {
   errors.push(String(error));
   remember(`[pageerror] ${error}`);
 });
+let threadReports = 0;  // T172: the page's lines about the worker's search for the number of threads
 page.on("console", (message) => {
   if (message.type() === "error") errors.push(message.text());
+  if (/^threads: /.test(message.text())) threadReports++;
   remember(`[${message.type()}] ${message.text()}`);
 });
 
@@ -209,6 +211,20 @@ if (!process.env.E2E_LONG) await page.evaluate(() => {
 if (process.env.E2E_LONG) {
   await page.fill("#prompt", Array.from({ length: Number(process.env.E2E_LONG) }, (_, i) => i + 1).join(" "));
 }
+// T172: until the answer's speed line is there, the button stays the stop button and the model stays chosen. The
+// worker's reports in the middle of a text (the search for the number of threads, T114) once read as "the worker is
+// idle": the button went back to Run, and a press started a second text on the same engine. Whether such a report
+// came is in the console ("threads:"), so that a pass without one is not taken for a pass with one
+await page.evaluate(() => {
+  const run = document.getElementById("run"), select = document.getElementById("model");
+  const answered = () => document.querySelectorAll(".model .meta").length > 0;
+  window.__early = [];
+  new MutationObserver(() => {
+    if (!answered() && run.getAttribute("aria-label") === "Run") window.__early.push("the button went back to Run");
+    if (!answered() && !select.disabled) window.__early.push("the choice of model came back");
+  }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ["aria-label", "disabled"] });
+});
+const threadsBefore = threadReports;
 // Enter alone breaks the line
 await page.press("#prompt", "Control+Enter");
 await page.waitForFunction(() => document.querySelector(".model .meta") || document.querySelector(".error"), null, { timeout: 0 });
@@ -224,17 +240,20 @@ const result = await page.evaluate(() => ({
   pageScrolls: document.documentElement.scrollHeight > innerHeight,
   // T93: whether the service worker made the page cross-origin isolated (the software threads need it)
   isolated: self.crossOriginIsolated,
+  early: window.__early,
 }));
 const failures = [];
 if (result.error) failures.push(`the page reported: ${result.error}`);
 if (errors.length) failures.push(`console errors: ${errors.join(" | ")}`);
 if (!/tok\/s/.test(result.meta)) failures.push("no speed line under the answer");
 if (result.pageScrolls) failures.push("the page itself scrolls");
+if (result.early.length) failures.push(`before the answer ended: ${[...new Set(result.early)].join(", ")}`);
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
 if (gpuAsked && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
 console.log(`${engine} ${browserVersion}, ${model}: ready in ${readySeconds.toFixed(1)}s, ${result.meta}`);
 console.log(`status: ${result.status}${result.isolated ? "" : " (not cross-origin isolated)"}`);
 if (result.prompt) console.log(result.prompt);
+console.log(`thread reports during the answer: ${threadReports - threadsBefore}`);
 console.log(result.text.slice(0, 160).replace(/\n/g, " / "));
 const then = [];
 for (const next of (process.env.E2E_THEN ?? "").split(/\s+/).filter(Boolean)) {

@@ -862,8 +862,11 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       message("model error", data.memory ? memoryFailure(model, data.heap, data.message) : data.message);
       statusText.textContent = ready ? `${model.name}` : `Could not load ${model.name}`;
     }
-    // anything but a progress report means the worker is idle again
-    if (!["status", "progress", "token"].includes(data.type)) {
+    // T172: only the messages that end a piece of the worker's work mean it is idle again (a load: ready, the
+    // benchmark: bench, a text: done, any of them: error). The others come in the middle of one: status, progress
+    // and token, and the search for the number of threads (threads, threads-compared), which runs inside a text; read
+    // as idle, they gave the run button back and a press started a second text on the same engine
+    if (["ready", "bench", "done", "error"].includes(data.type)) {
       progress.hidden = true;
       setGenerating(false);
       run.disabled = !ready || benchmarking;  // a prompt sent during the benchmark would find no model ready
