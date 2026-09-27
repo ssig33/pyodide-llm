@@ -176,9 +176,11 @@ const promptGMACsOf = (r, row) => (r.layerWeights && row.promptMsPerToken > 0 ? 
  * rows, ceilings}): the forward pass at each count of software threads, and T163's ceilings beside it. A token's share
  * of reading alone with the same count counts all it reads (tokenMegabytes: with relaxed SIMD matmul_q8r's corrections
  * too), while its GB/s column stays the checkpoint's (T157 turns that into other models' speeds). A prompt's G MAC/s
- * with one thread is held against relaxed_dot with its two loads, the form of today's kernels (a weight and an
- * activation loaded for each dot), on one thread; with more threads it is not (threads on cores of different speeds do
- * not add up to a count times one). No share against a ceiling that failed or was unsteady.
+ * with one thread is held against relaxed_dot with its two loads, on one thread; with more threads it is not (threads
+ * on cores of different speeds do not add up to a count times one). That loop is the one-token kernel's form (a weight
+ * and an activation loaded for each dot); a prompt's tile (T159, four rows by four tokens) loads half a vector of data
+ * a dot, so the share can pass 100%, and the text says where its bound lies (T198). No share against a ceiling that
+ * failed or was unsteady.
  */
 export function cpuTable(r) {
   const c = r.ceilings ?? {};
@@ -195,14 +197,20 @@ export function cpuTable(r) {
   };
   const lines = [`${r.backend}, ${number(r.megabytes, 0)} MB a token${r.shared ? "" : " (not cross-origin isolated: one thread only)"}. ` +
     "In parentheses, the share of this device's ceiling below: a token's reads (with the kernel's corrections) of reading alone with as many threads, " +
-    "a prompt's G MAC/s (a multiply-add for each weight of the layers and token) of relaxed_dot with its two loads, one thread.", "",
+    "a prompt's G MAC/s (a multiply-add for each weight of the layers and token) of relaxed_dot with its two loads, one thread. " +
+    "A token reads each weight once, so its bound is reading. A prompt's 16 tokens go through tiles of four rows by four tokens (T159): " +
+    "for each group of 32 weights a tile loads the four rows' weights once for the four tokens and the four tokens' activations once for the four rows, " +
+    "32 relaxed_dots on 16 loads of data (and 12 of scales and corrections), where the loop below loads two for each dot. " +
+    "So a prompt can pass 100% of that loop. Its bound lies between that loop and relaxed_dot on registers alone, " +
+    "and below the second by the tile's own work: each row, token and group's sum is turned, scaled and added (on arm64, 32 of the 108 vector instructions a tile spends on a group are dots).", "",
     "| software threads | ms a token | GB/s | tok/s | ms a token of a prompt, 16 at once | G MAC/s of the prompt |", "|---:|---:|---:|---:|---:|---:|",
     ...r.rows.map((row) => (row.none ? `| ${row.asked} | ${tableCell(row.none)} | | | | |`
       : `| ${row.threads} | ${number(row.msPerToken)} | ${number(row.GBps)}${share(read(row), readAt(row.threads))} | ${number(1000 / row.msPerToken)} | ` +
         `${number(row.promptMsPerToken, 2)} | ${number(promptGMACs(row))}${row.threads === 1 ? share(promptGMACs(row), dot) : ""} |`))];
   lines.push("", "**Ceilings** (T163): loops of one kind of instruction, each timed as 2n passes less n. " +
-    "Reading alone reads the model's weights above, a megabyte at a time taken in turn by the threads; relaxed_dot with its loads reads 8 KB that stay in the first cache, " +
-    "on registers alone it is the instruction's own rate (what a form that keeps weights and tokens in registers could reach).");
+    "Reading alone reads the model's weights above, a megabyte at a time taken in turn by the threads. " +
+    "relaxed_dot with its two loads reads 8 KB that stay in the first cache, a weight and an activation for each dot, as the one-token kernel (matmul_q8r) does. " +
+    "On registers alone it is the instruction's own rate, which no kernel that loads its weights and tokens reaches; a prompt's tiles, with half a load of data for each dot, lie between the two.");
   if (c.error) return [...lines, "", tableCell(`Not measured: ${c.error}`)];
   lines.push("", "| loop | software threads | ceiling |", "|---|---:|---:|",
     ...(c.read ?? []).map((one) => `| reading alone | ${one.threads} | ${ceiling(one, "GBps", "GB/s")} |`),
