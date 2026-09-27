@@ -7,7 +7,8 @@
 //   { step: "cpu", threads }                    the forward pass of forward.js, the one the model page runs, on a
 //                                               made-up int8 model of Llama 3.2 1B's width (random weights, two
 //                                               layers), one token at a time at each count of software threads, and
-//                                               a prompt's tokens 16 at a time (T108), as the GPU section does them
+//                                               a prompt's tokens 16 at a time (T108), as the GPU section does them;
+//                                               and the CPU's ceilings beside them (T163)
 //   { step: "line", site, hf, rates, seconds }  the line: a part of the site's model and a range of a model on
 //                                               huggingface.co, how long until the first byte and how fast; then
 //                                               huggingface.co read no faster than each of rates (MB/s)
@@ -157,6 +158,13 @@ async function cpu(counts = [1, 2, 4]) {
   const { memory, base } = forward.weightsMemory(model.size, { shared, after });
   fillWeights(memory, base, model);
   const engine = forward.createForward({ memory, base, size: model.size, kernels, plan: model.plan, spawn: shared ? spawn : undefined });
+  // T163: the ceilings' loops on the same memory (no memory more: T96); their failure leaves the forward pass alone
+  let ceilings = null, ceilingsFailed;
+  try {
+    ceilings = await ceilingsOf(memory, base, model.size, shared);
+  } catch (error) {
+    ceilingsFailed = `${error?.name ?? "Error"}: ${error?.message ?? error}`;
+  }
   const rows = [];
   try {
     for (const asked of counts) {
@@ -189,11 +197,170 @@ async function cpu(counts = [1, 2, 4]) {
       blocks.sort((a, b) => a - b);
       rows.push({ asked, threads, msPerToken: ms, GBps: model.size / (ms / 1000) / 1e9,
                   promptMsPerToken: blocks[blocks.length >> 1] / PROMPT.length, finite: logits.every(Number.isFinite) });
+      // T163: the reading ceiling at the same count, right after it (a phone that warms up slows both alike)
+      if (ceilings) ceilings.read.push({ threads, ...(await attempt(() => ceilings.reading(threads))) });
+    }
+    if (ceilings) {
+      ceilings.dot = ceilings.relaxed ? await attempt(ceilings.dotting) : { none: "no relaxed SIMD in this browser" };
+      ceilings.fma = await attempt(ceilings.fmaing);
     }
   } finally {
     engine.release();
+    ceilings?.stop();
   }
-  return { backend: engine.backend, shared, megabytes: model.size / 1e6, rows };
+  const { read, dot, fma } = ceilings ?? {};
+  return { backend: engine.backend, shared, megabytes: model.size / 1e6, layerWeights: layerWeights(model),
+           rows, ceilings: ceilings ? { read, dot, fma } : { error: ceilingsFailed } };
+}
+
+// the weights of the layers' matrices: a multiply-add each for every token of a prompt (no classifier there)
+const layerWeights = ({ plan }) => ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
+  .reduce((sum, name) => sum + plan.tensors[name].shape.reduce((a, b) => a * b, 1), 0);
+
+// ---- T163: the CPU's ceilings, loops of one kind of instruction (kernels/ceilings.ts, kernels/ceilings_relaxed.ts,
+// the forms of T158's audit): reading alone (GB/s) at each count of software threads, over the made-up model's weights
+// (the bytes a token reads); relaxed_dot with its two loads from L1 and f32 multiply + add on registers (G MAC/s), one
+// thread. Timed as the GPU section's ceilings are (T168): passes doubled until one run takes PAIR_MS, then PAIRS runs of
+// n and of 2n passes, the median of the differences; a ratio of 2n to n past STEADY takes the pairs once more, then is
+// unsteady. The watch on a loop the compiler cut short: its checksum of n passes must be the one computed here, and it
+// must take PAIR_MS by MOST_PASSES (cutShort: the section is then wrong, as for logits that are not finite).
+const PAIR_MS = 20, PAIRS = 5, STEADY = [1.6, 2.2], MOST_PASSES = 2 ** 30;
+const cutShort = (message) => Object.assign(new Error(message), { cutShort: true });
+const middle = (values) => [...values].sort((a, b) => a - b)[values.length >> 1];
+// run(n): the ms of n passes; right(n): whether the loop's checksum of n passes is the one computed here
+function paired(run, right) {
+  run(1);
+  let n = 1, ms;
+  while ((ms = run(n)) < PAIR_MS && n < MOST_PASSES) n *= 2;
+  if (ms < PAIR_MS) throw cutShort(`${n} passes took ${ms.toFixed(3)} ms: the loop was compiled away`);
+  if (!right(n)) throw cutShort(`the checksum of ${n} passes is not the loop's work: the compiler cut it short`);
+  for (let tries = 0; ; tries++) {
+    const differences = [], ratios = [];
+    for (let i = 0; i < PAIRS; i++) {
+      const once = run(n), twice = run(2 * n);
+      differences.push(twice - once);
+      ratios.push(twice / once);
+    }
+    const ratio = middle(ratios), took = middle(differences), steady = took > 0 && ratio >= STEADY[0] && ratio <= STEADY[1];
+    if (steady) return { ms: took, passes: n, ratio };
+    if (tries) {
+      if (!(took > 0)) throw cutShort(`${2 * n} passes took no longer than ${n}: the loop was compiled away, or the load moved`);
+      return { ms: took, passes: n, ratio, unsteady: true };
+    }
+  }
+}
+const attempt = async (measure) => {
+  try {
+    return await measure();
+  } catch (error) {
+    return { error: `${error?.name ?? "Error"}: ${error?.message ?? error}`, ...(error?.cutShort ? { cutShort: true } : {}) };
+  }
+};
+const timed = (loop) => (n) => {
+  const began = performance.now();
+  loop(n);
+  return performance.now() - began;
+};
+const rate = (work, r) => ({ rate: (work * r.passes) / (r.ms / 1000) / 1e9, passes: r.passes, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) });
+// the checksum of the int loops: the lane j of their sum is n times one pass's (lanes[j]), wrapped to 32 bits
+const xorOf = (lanes, n) => lanes.reduce((x, lane) => x ^ Math.imul(n, lane), 0);
+
+// the control words of the reading threads, on a SharedArrayBuffer of their own (not a WebAssembly memory: T96)
+const GO = 0, DONE = 1, COUNT = 2, PASSES = 3, STOP = 4;
+
+// The loops on the memory of the made-up model, its weights at base (size bytes): nothing new is reserved (T96). The
+// forward pass must be done with the weights before dotting(), which makes 4 KB of them 7-bit (see ceilings_relaxed.ts).
+async function ceilingsOf(memory, base, size, shared) {
+  const kind = shared ? "shared" : "plain";
+  const [plain, relaxed] = await Promise.all([`ceilings_${kind}.wasm`, `ceilings_relaxed_${kind}.wasm`].map((name) =>
+    fetch(at(name)).then((res) => (res.ok ? res.arrayBuffer() : null)).catch(() => null)));
+  if (!plain) throw new Error("the ceilings' loops could not be fetched");
+  const module = new WebAssembly.Module(plain);
+  const loops = new WebAssembly.Instance(module, { env: { memory } }).exports;
+  let dot = null;
+  try {
+    dot = relaxed && new WebAssembly.Instance(new WebAssembly.Module(relaxed), { env: { memory } }).exports.dot;
+  } catch {
+    // no relaxed SIMD here (Safari): the row says so
+  }
+  // the weights, cut into equal parts of whole 64-byte steps, one for each thread
+  const partOf = (count) => Math.floor(size / count / 64) * 64;
+  const control = shared ? new Int32Array(new SharedArrayBuffer(8 * 4)) : null;
+  const readers = [];
+  const started = async (count) => {
+    while (readers.length < count - 1) {
+      const worker = new Worker(at("benchmark/reader.js"), { type: "module" });
+      await new Promise((resolve, reject) => {
+        worker.onmessage = resolve;
+        worker.onerror = (event) => reject(new Error(event.message ?? "a reading thread did not start"));
+        worker.postMessage({ module, memory, control: control.buffer, base, size, share: readers.length + 1 });
+      });
+      readers.push(worker);
+    }
+  };
+  return {
+    relaxed: Boolean(dot),
+    read: [],
+    // reading alone with count threads: this worker reads the first part, the reading threads the others (the same
+    // loop: the checksum of this worker's part stands for them)
+    async reading(count) {
+      await started(count);
+      const part = partOf(count);
+      const ints = new Int32Array(memory.buffer, base, part / 4), lanes = [0, 0, 0, 0];
+      for (let i = 0; i < ints.length; i++) lanes[i & 3] = (lanes[i & 3] + ints[i]) | 0;
+      const r = paired((n) => {
+        if (count > 1) {
+          Atomics.store(control, DONE, 0);
+          Atomics.store(control, COUNT, count);
+          Atomics.store(control, PASSES, n);
+          Atomics.add(control, GO, 1);
+          Atomics.notify(control, GO);
+        }
+        const began = performance.now();
+        loops.read(base, part, n);
+        for (let done; count > 1 && (done = Atomics.load(control, DONE)) < count - 1;) Atomics.wait(control, DONE, done);
+        return performance.now() - began;
+      }, (n) => loops.read(base, part, n) === xorOf(lanes, n));
+      const { rate: GBps, ...rest } = rate(part * count, r);
+      return { GBps, ...rest };
+    },
+    dotting() {
+      const w = new Int8Array(memory.buffer, base, 4096), x = new Uint8Array(memory.buffer, base + 4096, 4096);
+      for (let i = 0; i < x.length; i++) x[i] &= 0x7f;
+      const lanes = [0, 0, 0, 0];
+      for (let i = 0; i < w.length; i++) lanes[(i >> 2) & 3] += w[i] * x[i];
+      const { rate: GMACs, ...rest } = rate(4096, paired(timed((n) => dot(base, n)), (n) => dot(base, n) === xorOf(lanes, n)));
+      return { GMACs, ...rest };
+    },
+    fmaing() {
+      const { rate: GMACs, ...rest } = rate(32, paired(timed((n) => loops.fma(n)), (n) => loops.fma(n) === fmaSum(n)));
+      return { GMACs, ...rest };
+    },
+    stop() {
+      if (control) {
+        Atomics.store(control, STOP, 1);
+        Atomics.add(control, GO, 1);
+        Atomics.notify(control, GO);
+      }
+      readers.forEach((worker) => worker.terminate());
+    },
+  };
+}
+
+// ceilings.ts's fma(n) in float32, one lane (the four are alike) of the 8 accumulators, which start at 0 to 7, rounded
+// as WebAssembly rounds each step
+function fmaSum(n) {
+  const f = Math.fround, d = f(1e-7);
+  let w = f(1.0001), x = f(0.9999);
+  const a = [0, 1, 2, 3, 4, 5, 6, 7];
+  for (let i = 0; i < n; i++) {
+    const p = f(w * x);
+    for (let k = 0; k < 8; k++) a[k] = f(a[k] + p);
+    w = f(w + d);
+    x = f(x - d);
+  }
+  const lane = f(f(f(a[0] + a[1]) + f(a[2] + a[3])) + f(f(a[4] + a[5]) + f(a[6] + a[7])));  // as the loop sums them
+  return f(f(f(lane + lane) + lane) + lane);
 }
 
 // ---- the line. A fetch read to its end, or read no faster than rate (MB/s): each piece is taken only when the bytes

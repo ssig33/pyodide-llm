@@ -49,7 +49,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
       <section data-section="cpu">
         <h2>CPU</h2>
         <p class="about">The model page's own forward pass on a made-up int8 model as wide as Llama 3.2 1B (211 MB of
-          weights a token), with 1, 2, 4 and on software threads, doubling up to the logical cores.</p>
+          weights a token), with 1, 2, 4 and on software threads, doubling up to the logical cores. Beside it, the CPU's
+          ceilings: how fast it reads alone, and loops of int8 dots and of float multiply-adds.</p>
       </section>
       <section data-section="model">
         <h2>Model</h2>
@@ -134,7 +135,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 </style>
 
 <script>
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -347,13 +348,13 @@ const BENCH_MODEL = "llm-jp-3-150m";
       if (answer.error) return { status: "error", markdown: answer.error };
       const r = answer.result;
       if (r.none) return { status: "none", markdown: r.none };
-      const wrong = r.rows.some((row: any) => row.finite === false);
-      const lines = [`${r.backend}, ${fixed(r.megabytes, 0)} MB a token${r.shared ? "" : " (not cross-origin isolated: one thread only)"}`, "",
-        "| software threads | ms a token | GB/s | tok/s | ms a token of a prompt, 16 at once |", "|---:|---:|---:|---:|---:|",
-        ...r.rows.map((row: any) => row.none ? `| ${row.asked} | ${row.none} | | | |`
-          : `| ${row.threads} | ${fixed(row.msPerToken)} | ${fixed(row.GBps)} | ${fixed(1000 / row.msPerToken)} | ${fixed(row.promptMsPerToken, 2)} |`)];
-      if (wrong) lines.push("", "**The logits were not finite numbers: the forward pass computed something wrong.**");
-      return { status: wrong ? "wrong" : "ok", data: r, markdown: lines.join("\n") };
+      const c = r.ceilings ?? {};
+      const cutShort = [...(c.read ?? []), c.dot, c.fma].some((one: any) => one?.cutShort);
+      const notFinite = r.rows.some((row: any) => row.finite === false);
+      const lines = cpuTable(r);
+      if (notFinite) lines.push("", "**The logits were not finite numbers: the forward pass computed something wrong.**");
+      if (cutShort) lines.push("", "**A ceiling's loop did not do its work (its checksum or its time): the compiler cut it short, and its number is no ceiling.**");
+      return { status: notFinite || cutShort ? "wrong" : "ok", data: r, markdown: lines.join("\n") };
     } finally {
       w.terminate();
     }

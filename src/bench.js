@@ -152,6 +152,43 @@ export function threadCounts(cores) {
 }
 
 /**
+ * The CPU section's Markdown (the lines), from its result r ({backend, shared, megabytes, layerWeights, rows, ceilings}):
+ * the forward pass at each count of software threads, and T163's ceilings beside it. The GB/s of a token is held
+ * against reading alone with the same count of threads, the G MAC/s of a prompt with one thread against relaxed_dot
+ * with its two loads on one thread; with more threads the prompt is not (threads on cores of different speeds do not
+ * add up to a count times one). No share against a ceiling that failed or was unsteady.
+ */
+export function cpuTable(r) {
+  const c = r.ceilings ?? {};
+  const steady = (ceiling, key) => (ceiling && !ceiling.error && !ceiling.none && !ceiling.unsteady && ceiling[key] > 0 ? ceiling[key] : undefined);
+  const share = (value, whole) => (whole && Number.isFinite(value) ? ` (${number((100 * value) / whole, 0)}%)` : "");
+  const readAt = (threads) => steady((c.read ?? []).find((one) => one.threads === threads), "GBps");
+  const dot = steady(c.dot, "GMACs");
+  const promptGMACs = (row) => (r.layerWeights && row.promptMsPerToken > 0 ? r.layerWeights / (row.promptMsPerToken / 1000) / 1e9 : undefined);
+  const ceiling = (one, key, unit) => {
+    if (!one) return "not measured";
+    if (one.none) return tableCell(one.none === "no relaxed SIMD in this browser" ? "not in this browser" : one.none);
+    if (one.error) return tableCell(`failed: ${one.error}`);
+    return `${one.unsteady ? "unsteady: " : ""}${number(one[key])} ${unit}`;
+  };
+  const lines = [`${r.backend}, ${number(r.megabytes, 0)} MB a token${r.shared ? "" : " (not cross-origin isolated: one thread only)"}. ` +
+    "In parentheses, the share of this device's ceiling below: a token's GB/s of reading alone with as many threads, " +
+    "a prompt's G MAC/s (a multiply-add for each weight of the layers and token) of relaxed_dot with its loads, one thread.", "",
+    "| software threads | ms a token | GB/s | tok/s | ms a token of a prompt, 16 at once | G MAC/s of the prompt |", "|---:|---:|---:|---:|---:|---:|",
+    ...r.rows.map((row) => (row.none ? `| ${row.asked} | ${tableCell(row.none)} | | | | |`
+      : `| ${row.threads} | ${number(row.msPerToken)} | ${number(row.GBps)}${share(row.GBps, readAt(row.threads))} | ${number(1000 / row.msPerToken)} | ` +
+        `${number(row.promptMsPerToken, 2)} | ${number(promptGMACs(row))}${row.threads === 1 ? share(promptGMACs(row), dot) : ""} |`))];
+  lines.push("", "**Ceilings** (T163): loops of one kind of instruction, each timed as 2n passes less n. " +
+    "Reading alone reads the model's weights above, a part for each thread; relaxed_dot reads 8 KB that stay in the first cache.");
+  if (c.error) return [...lines, "", tableCell(`Not measured: ${c.error}`)];
+  lines.push("", "| loop | software threads | ceiling |", "|---|---:|---:|",
+    ...(c.read ?? []).map((one) => `| reading alone | ${one.threads} | ${ceiling(one, "GBps", "GB/s")} |`),
+    `| relaxed_dot with its two loads (int8) | 1 | ${ceiling(c.dot, "GMACs", "G MAC/s")} |`,
+    `| f32 multiply + add, registers only | 1 | ${ceiling(c.fma, "GMACs", "G MAC/s")} |`);
+  return lines;
+}
+
+/**
  * The CPU the GPU is held against: of the CPU section's rows, the fastest count of software threads for a token and,
  * each on its own, for a prompt's tokens 16 at once. section: the page's result of the CPU section ({status, data}),
  * or undefined where it has not run. Where it gives nothing to hold against, { why } says so, and no estimate stands

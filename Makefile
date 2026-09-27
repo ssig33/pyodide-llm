@@ -30,7 +30,7 @@ public/models/.done:	$(CHECKPOINTS) $(TOKENIZERS)
 # The WASM SIMD kernels that llama2_numpy.py loads with ctypes, compiled by AssemblyScript (no binary is committed)
 kernels:	public/simdkernel.so
 
-public/simdkernel.so:	kernels/kernel.ts kernels/kernel_relaxed.ts kernels/six.ts kernels/wasm64.mjs kernels/build.py node_modules
+public/simdkernel.so:	kernels/kernel.ts kernels/kernel_relaxed.ts kernels/six.ts kernels/ceilings.ts kernels/ceilings_relaxed.ts kernels/wasm64.mjs kernels/build.py node_modules
 	python3 kernels/build.py public
 
 # int8, 3.5x smaller than float32 (quantize.py)

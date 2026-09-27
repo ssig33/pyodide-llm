@@ -65,3 +65,9 @@ if __name__ == "__main__":
         kind = "shared" if shared else "plain"
         plain_module(here / "kernel.ts", out / f"simdkernel_{kind}64.wasm", "simd,relaxed-simd", shared=shared, wasm64=True)
         plain_module(here / "kernel_relaxed.ts", out / f"simdkernel_relaxed_{kind}64.wasm", "simd,relaxed-simd", shared=shared, wasm64=True)
+    # T163: the CPU section's ceilings of /benchmark/ (loops, not kernels), on the memory of its made-up model: plain,
+    # and shared where the page is cross-origin isolated (the reading threads)
+    for shared in (False, True):
+        kind = "shared" if shared else "plain"
+        plain_module(here / "ceilings.ts", out / f"ceilings_{kind}.wasm", "simd", shared=shared)
+        plain_module(here / "ceilings_relaxed.ts", out / f"ceilings_relaxed_{kind}.wasm", "simd,relaxed-simd", shared=shared)
