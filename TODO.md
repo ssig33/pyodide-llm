@@ -548,7 +548,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 入れたもの: `.github/workflows/tests.yml`（デプロイと同じ試験と threads-check と build を、どのブランチでも。`extra=` で後にコマンドを足せる: 速さの前後比較など）。AGENTS.md の持ち主の指示に「試験は全部 CI で」。担当は編集と `node --check` まで、試験は push して `node tests/ci.mjs run tests.yml --ref <ブランチ>` を裏で。結果は待たずに次へ、落ちたら後でまとめて直す。
 - 確かめ: 本線で 1 回回す。
 
-### T187 [試験] gpu-check の logits と DP4A の線を、CPU の誤差でなく自分の目盛りで — 状態: **レビュー済み（must-fix 1 を直した、2026-09-27）。残り 2 つ（層ごとの線、作り物の Qwen2 の bias）はブランチ `t187-followup` でレビュー待ち**（2026-09-27、T153 の担当と T175 のレビューから。Opus medium、ブランチ `t187-yardsticks`。規模 小〜中）
+### T187 [試験] gpu-check の logits と DP4A の線を、CPU の誤差でなく自分の目盛りで — 状態: **完了（本線に入れた 91be986 と、レビューの残り 2 つ 63c645c）。レビュー済み**
 - 根拠: gpu-check の logits の線（GPU の差 ≤ 1.5 × CPU の差）と DP4A の K と V の線（CPU の誤差の 0.75 倍）は CPU の誤差に対する比で、(1) CPU の計算が変わると動く、(2) 壊し方を通す（T153 の「どの層も層 0 の bias」で logits は CPU の 0.5 倍、DP4A は 2.15e-1 対 線 3.87e-1 で通った）、(3) 正しいのに越える（T183 の CI で SmolLM2 360M の f16 と subgroups の無い attention の logits が 1.53 倍、Qwen2.5 0.5B の DP4A が線の 0.98 倍）。
 - 作るもの: logits は float16 のキャッシュの答えの差（L16、`answers()` がもう回している）を目盛りに、線を max(1.5 × CPU, k × L16)。DP4A は NumPy の活性値を CPU と同じ 8 ビットにした答えを目盛りに。k は CI の数字で決める。ほかに、T175 のレビューが見つけた norm の尺度の小さな誤り（平均を n−1 で割る）を RMSNORM の道で見逃す件（T150・T147 のプロンプトの経路）を、norm の後の量子化かその出力の線で捕まえる。
 - 完了条件: 上の壊し方が全部の形で落ち、正しい実物のモデル（CI の real=）が全部通る。
