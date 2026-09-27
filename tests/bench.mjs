@@ -261,7 +261,7 @@ assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, DP4A, sep
 
 // T202: where a layer's time goes. The times are multiples of 1/64 ms, so that every sum below is exact: the fused
 // form's steps sum to 3.25 ms (matrices 2.75, attention 0.25, norms and quantizing 0.25), its layer 3.5 (the chain
-// 0.25), the matrices alone 2.0 (their writes 0.75); the form with the norms apart sums to 3.375 against a layer of
+// 0.25), the matrices alone 2.0 (fusing adds 0.75); the form with the norms apart sums to 3.375 against a layer of
 // 3.25 (the chain less than nothing, as it can come out)
 const NQ = "the norm with its quantizing (NORM_QUANTIZE)", NORM = "the norm (RMSNORM)", QD = "a vector of 2048 quantized (QUANTIZE)",
   QH = "a vector of 8192 quantized (QUANTIZE)", QKV = "q, k and v with RoPE and the cache", ATT = "the attention (flash attention's tile)",
@@ -286,10 +286,14 @@ assert.ok(stepsLines.includes(`| ${QD} | 62.5 | 3 × = 187.5 | 1 × = 62.5 |`), 
 assert.ok(stepsLines.includes("| gate and up alone | 1250.0 |  |  |"), stepsText);
 assert.ok(stepsText.includes('- "DP4A, fused (T175)", 9 dispatches: the layer 3.50 ms. Its steps one by one 3.25 ms (the matrices with what they write 2.75, ' +
   "the attention 0.25, the norms and quantizing 0.25); the layer less them, what the chain costs beyond each step alone: 0.25 ms. " +
-  "The matrices alone 2.00 ms (34.2 GB/s, 85.5% of the buffer's reads (40.0 GB/s)); the layer less them, 1.50 ms, is what the matrices' writes add 0.75 " +
+  "The matrices alone 2.00 ms (34.2 GB/s, 85.5% of the buffer's reads (40.0 GB/s)); the layer less them, 1.50 ms, is what fusing adds to the matrices 0.75 " +
   "+ the attention 0.25 + the norms and quantizing 0.25 + the chain 0.25. A dispatch of one workgroup takes 15.6 µs: 9 of them 0.14 ms."), stepsText);
 assert.ok(stepsText.includes('- "DP4A, fused (T175), the norms apart", 11 dispatches: the layer 3.25 ms. Its steps one by one 3.38 ms'), stepsText);
 assert.ok(stepsText.includes("what the chain costs beyond each step alone: −0.13 ms"), stepsText);
+// the fewest MB read before the same weights again (T202's review: a matrix alone on ranges of all the copies), and
+// without it a word, never "undefined"
+assert.ok(layerStepsTable({ ...stepsStep, result: { ...stepsStep.result, cycleMB: 75.5 } }, layerRight, layerCeilings)[0].includes("(none read again before 76 MB of other weights: not from the GPU's caches)"));
+assert.ok(stepsLines[0].includes("(none read again soon: not from the GPU's caches)"), stepsLines[0]);
 // every row as wide as the head, nothing undefined, NaN or empty: right, a lost device, a fallback adapter, no check,
 // a step that failed, one unsteady, and a form that failed
 const stepsFailed = { ...stepsStep, result: { ...stepsStep.result, steps: stepsStep.result.steps.map((one) => (one.step === ATT ? { step: ATT, kind: "attention", error: "a | b\nc" } : one)) } };
@@ -518,7 +522,7 @@ assert.ok(afterLost[0].endsWith("; the device was lost (gone)") && !/\(\d[\d.]*�
 // T202: the summary says where the fastest broken-down layer's time goes (the norms apart: 3.25 ms, its small steps
 // 0.375, its chain −0.125), not after a lost device
 const withSteps = gpuSummary([...aSteps, stepsStep], aBaseline);
-assert.ok(withSteps.includes("GPU, where the time of a layer DP4A, fused (T175), the norms apart goes: 3.25 ms, the matrices alone 2.00, their writes 0.75, " +
+assert.ok(withSteps.includes("GPU, where the time of a layer DP4A, fused (T175), the norms apart goes: 3.25 ms, the matrices alone 2.00, fusing adds 0.75, " +
   "the attention 0.25, the norms and quantizing 0.38, the chain -0.13"), withSteps.join("\n"));
 assert.ok(!gpuSummary([...aSteps, stepsStep], aBaseline, { lost: "gone" }).join().includes("where the time"));
 const wrongDp4a = gpuSummary(aSteps.map((s) => (s.name === "the shaders against JavaScript" ? { ...s, result: { ...aCheck, "ORT DP4A small M, 4 rows": { ok: false, worstRelative: 1 }, "ORT DP4A 64×64, subgroups": { ok: false, worstRelative: 1 } } } : s)), aBaseline);

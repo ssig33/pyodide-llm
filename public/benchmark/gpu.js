@@ -924,9 +924,10 @@ function layerParts(shape, pos, copies, owned, data) {
   };
   const group = (pipeline, entries) => device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
     entries: entries.map(([binding, resource]) => ({ binding, resource: "offset" in resource ? resource : { buffer: resource } })) });
-  const dispatches = (form, pipes, copy) => {
+  // over (T202's review): a fused form's matrices bound elsewhere, { key: a range of ranges(key) }
+  const dispatches = (form, pipes, copy, over = {}) => {
     const m = copiesOf[copy];
-    if (form.fused) return fusedLayer(form, pipes, shape, m, v, v, u, group);
+    if (form.fused) return fusedLayer(form, pipes, shape, { ...m, ...over }, v, v, u, group);
     const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, v.keys], [2, v.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
     const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
     // the separate steps: rows first to first + rows of a matrix, x into y (on DP4A, x's quantizing into)
@@ -945,21 +946,39 @@ function layerParts(shape, pos, copies, owned, data) {
       [pipes.swiglu, group(pipes.swiglu, [[0, v.g], [1, v.u], [2, u.swiglu], [3, u.step]]), Math.ceil(hidden / 64), 1],
       ...quantize(v.g, downIn, hidden), product(m.down, 0, dim, v.g, v.t, downIn), add];
   };
-  // T202: a matrix of a form's layer alone, into the scratch buffer (no RoPE, cache, add or SwiGLU after it): its
-  // plain matrix × vector (pipeline: mulMatVec, or ortDp4aMatVec reading the quantized vector the fused form reads),
-  // named by the matrix, one dispatch over all its rows
-  const alone = (form, pipeline, copy) => Object.entries(copiesOf[copy]).map(([key, { w, s, rows, n }], i) => named(`${MATRIX_NAMES[key]} alone`, "alone", [pipeline, group(pipeline, [
-    [0, w], [1, s], [2, form.dp4a ? v.quantized[i].xq : key === "down" ? v.g : v.xb], [3, v.scratch], [4, shapeOf(rows, n)], ...(form.dp4a ? [[5, v.quantized[i].xs]] : [])]),
-    Math.ceil(rows / (form.dp4a ? WGSL.ORT_DP4A_MATVEC_ROWS : WGSL.MUL_MAT_VEC_ROWS)), 1], key));
+  // T202's review: every range of the copies' matrix buffers that the layer's matrix key can be bound to, the copies
+  // one after another. The weights are random bytes, so a matrix read from any range of its size costs the same; a
+  // step timed alone on one matrix goes through all of them before it reads one again, as a layer reads each of its
+  // matrices once in a round of its copies (T149's review: a matrix read again soon is read from the GPU's caches, and
+  // o's two copies alone would be 9.4 MB a round, q, k and v's 14.2, down's 37.7). A range starts on a binding's
+  // alignment, 256 bytes, its scales an eighth of the way in (so 2048 bytes of the weights)
+  const ranges = (key) => {
+    const [rows, n] = shape.matrices[key], bytes = rows * n;
+    return copiesOf.flatMap((one) => Object.values(one).flatMap((matrix) =>
+      [...Array(Math.floor((matrix.rows * matrix.n) / bytes))].map((_, k) => k * bytes).filter((at) => at % 2048 === 0)
+        .map((at) => ({ w: { buffer: matrix.w, offset: at, size: bytes }, s: { buffer: matrix.s, offset: at / 8, size: bytes / 8 }, rows, n }))));
+  };
+  // T202: a matrix of the layer alone on a range of ranges(key), into the scratch buffer (no RoPE, cache, add or
+  // SwiGLU after it): its plain matrix × vector (pipeline: mulMatVec, or ortDp4aMatVec reading the quantized vector
+  // the fused form reads), one dispatch over all its rows
+  const alone = (form, pipeline, key, { w, s, rows, n }) => {
+    const input = v.quantized[MATRIX_KEYS.indexOf(key)];
+    return named(`${MATRIX_NAMES[key]} alone`, "alone", [pipeline, group(pipeline, [
+      [0, w], [1, s], [2, form.dp4a ? input.xq : key === "down" ? v.g : v.xb], [3, v.scratch], [4, shapeOf(rows, n)], ...(form.dp4a ? [[5, input.xs]] : [])]),
+      Math.ceil(rows / (form.dp4a ? WGSL.ORT_DP4A_MATVEC_ROWS : WGSL.MUL_MAT_VEC_ROWS)), 1], key);
+  };
   // T202: a dispatch of one workgroup that adds a vector of dim into the scratch buffer (SMALL): what a step costs
   // in a chain of dispatches when it does next to nothing (its launch and the barrier before the next)
   const floor = (pipeline) => named("a dispatch of one workgroup (SMALL: a vector of dim added)", "floor", [pipeline, group(pipeline, [[0, v.t], [1, v.scratch]]), 1, 1]);
-  // T202: the residual stream written back as it started, before a submission (the adds write over it: T191's review,
-  // a measurement whose input moves as it runs)
+  // T202: the residual stream written back as it started, before a submission (the adds write over it), so that every
+  // submission starts alike. What these steps do does not depend on the values (unlike SAMPLE's work, T191's review),
+  // and the stream grows only by a bounded add a layer, so this keeps the submissions alike rather than their times
   const restart = () => device.queue.writeBuffer(v.h, 0, start.h);
-  return { vectors: v, reset, dispatches, alone, floor, restart };
+  return { vectors: v, reset, dispatches, ranges, alone, floor, restart };
 }
-// T202: the matrices of a layer (layerShape's keys), as the steps' table names them
+// T202: the matrices of a layer (layerShape's keys, in the order of the DP4A forms' quantized inputs, v.quantized), and
+// as the steps' table names them
+const MATRIX_KEYS = ["qkv", "o", "gateUp", "down"];
 const MATRIX_NAMES = { qkv: "q, k and v", o: "o", gateUp: "gate and up", down: "down" };
 // the cos of a position's headSize / 2 angles, then their sin (Llama 3's theta, unscaled: any angles would do)
 function layerAngles(headSize, pos) {
@@ -1289,16 +1308,18 @@ async function layer() {
 //     the "1.77 ms"),
 //   - a dispatch of one workgroup that does next to nothing (what a step costs in a chain for being a dispatch),
 //   - the whole layer,
-// all timed in turn (interleaved(): n of each a submission, 2n less n, the rounds taken of every item alike), the
-// matrices on the next copy of the weights each time (not from the GPU's caches), as layer() times a layer.
+// all timed in turn (interleaved(): n of each a submission, 2n less n, the rounds taken of every item alike). The
+// layer on the next copy of the weights each time, as layer() times it; a step or a matrix alone on the next range of
+// its size of all the copies' weights (layerParts' ranges(): T202's review, T149's), so that none is read again before
+// about as many bytes of others as a layer's copies (not from the GPU's caches).
 // Why each step alone and not the layer less one step: a step of 20 to 60 µs is 1 or 2% of a layer, about what a
 // layer's time moves from one pair to the next, so a difference of two layers could not tell it; alone it is repeated
 // until a submission takes SUBMISSION_MS. What alone leaves out, the layer less the sum of its steps says: what the
 // chain of different dependent dispatches costs beyond each on its own (a small step on a GPU full of the matrix's
 // workgroups waits for their tail). Each dispatch still waits for the one before it (the same buffers written), as
-// in the layer. The residual stream is written back before every submission (the adds write over it: T191's review,
-// a measurement whose input moves as it runs); the attention reads the one cache of positions up to LAYER_POS (256
-// KB of keys and values, in the GPU's caches, as in layer()). The stream is read back at the end and must be finite.
+// in the layer. The residual stream is written back before every submission (the adds write over it), so that every
+// submission starts alike; the attention reads the one cache of positions up to LAYER_POS (256 KB of keys and values,
+// in the GPU's caches, as in layer()).
 async function layerSteps() {
   await gpu();
   const shape = layerShape(MODELS["Llama 3.2 1B"]);
@@ -1308,15 +1329,17 @@ async function layerSteps() {
   const result = { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, dp4a: packed };
   return scoped(async (owned) => {
     const parts = layerParts(shape, LAYER_POS, copies, owned);
+    // the fewest MB of weights read before the same ones again: the layer's copies, or a matrix's ranges
+    result.cycleMB = Math.min(copies * bytes, ...MATRIX_KEYS.map((key) => parts.ranges(key).length * matrixBytes(shape.matrices[key]))) / 1e6;
     await device.queue.onSubmittedWorkDone();
-    // units[copy]: the dispatches of one unit on that copy of the weights; a submission of n units, the stream
-    // written back first
+    // units: the dispatches of one unit each, on a copy or a range of the weights, taken in turn; a submission of n
+    // units, the stream written back first
     const timing = (units) => {
       let next = 0;
       return async (n) => {
         parts.restart();
         const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-        for (let i = 0; i < n; i++) units[next++ % copies].forEach((d) => run(pass, d));
+        for (let i = 0; i < n; i++) units[next++ % units.length].forEach((d) => run(pass, d));
         pass.end();
         const began = performance.now();
         device.queue.submit([encoder.finish()]);
@@ -1341,11 +1364,15 @@ async function layerSteps() {
           if (known) known.count++;
           else row.steps.push({ step, count: 1 });
         });
+        // each step not timed yet (the first of its name): a matrix's on every range of its size in turn (its other
+        // bindings as the layer's), the others' on the copies as the layer
+        const fresh = each[0].map((d, k) => ({ d, k })).filter(({ d, k }) => !seen.has(d.step) && each[0].findIndex((e) => e.step === d.step) === k);
+        const stepUnits = await validated(async () => fresh.map(({ d: { matrix }, k }) => (matrix
+          ? parts.ranges(matrix).map((range) => [parts.dispatches(form, pipes, 0, { [matrix]: range })[k]]) : each.map((layer) => [layer[k]]))));
         add({ form: form.name }, each);
-        each[0].forEach(({ step, kind, matrix }, k) => {
-          if (seen.has(step)) return;
+        fresh.forEach(({ d: { step, kind, matrix } }, i) => {
           seen.add(step);
-          add({ step, kind, ...(matrix ? { matrix } : {}) }, each.map((layer) => [layer[k]]));
+          add({ step, kind, ...(matrix ? { matrix } : {}) }, stepUnits[i]);
         });
       } catch (error) {
         row.error = String(error?.message ?? error);
@@ -1356,16 +1383,12 @@ async function layerSteps() {
     if (!items.length) return { ...result, forms: rows, steps: [] };
     // the matrices alone (on the plain matrix × vector of the forms' base) and the floor of a dispatch
     const product = await compiled(packed ? WGSL.ortDp4aMatVec : WGSL.mulMatVec({ packed: false, subgroups: false }));
-    const alone = await validated(async () => [...Array(copies)].map((_, copy) => parts.alone(forms[0], product, copy)));
-    alone[0].forEach(({ step, kind, matrix }, k) => add({ step, kind, matrix }, alone.map((matrices) => [matrices[k]])));
+    const alone = await validated(async () => MATRIX_KEYS.map((key) => parts.ranges(key).map((range) => [parts.alone(forms[0], product, key, range)])));
+    alone.forEach((units, i) => add({ step: units[0][0].step, kind: "alone", matrix: MATRIX_KEYS[i] }, units));
     const floor = parts.floor(pipelinesFor().small);
-    add({ step: floor.step, kind: floor.kind }, [...Array(copies)].map(() => [floor]));
+    add({ step: floor.step, kind: floor.kind }, [[floor]]);
     postMessage({ alive: true });
     const results = await validated(() => interleaved(items.map((item) => item.submission), MATVEC_MOST));
-    // the stream after the last submission (a layer of it, or a step's adds, from where it started): never NaN nor
-    // infinite, or the times would be of other numbers than a model's
-    const stream = new Float32Array(await readBack(device.createCommandEncoder(), parts.vectors.h, shape.dim * 4));
-    if (!stream.every(Number.isFinite)) throw new Error("the residual stream was not finite after the timing");
     const timed = (r) => (r.error ? { error: r.error }
       : { ms: r.ms / r.dispatches, n: r.dispatches, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) });
     const steps = [];

@@ -438,8 +438,9 @@ function layerSplit(r, form) {
  * "attention", "small", "alone", "floor"), matrix, ms, unsteady} or {step, kind, error}]}} or {name, error}; check:
  * the shaders against JavaScript (a form's verdict under its check); ceilings: T168's (the share of the buffer's reads
  * the matrices alone read the weights at); gpu: {fallback, lost}. Under the table, for each form: the layer, its
- * steps' sum and what the chain costs beyond it, the matrices alone and the layer less them split into what the
- * matrices' writes add, the attention, the norms and quantizing, and the chain.
+ * steps' sum and what the chain costs beyond it, the matrices alone and the layer less them split into what fusing adds
+ * to the matrices (their writes; the norm on the read and gate with up in one workgroup where so), the attention, the
+ * norms and quantizing, and the chain. cycleMB: the fewest MB of weights read before the same ones again.
  */
 export function layerStepsTable(step, check, ceilings, gpu = {}) {
   if (!step) return [];
@@ -455,10 +456,14 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
     `the layers a token would run here: on ${r.dp4a ? "ONNX Runtime's DP4A (the packed int8 dot is here)" : "llama.cpp's matrix × vector (no packed int8 dot here)"}, fused and fused with the norms apart). ` +
     "Each step of a layer alone, as a submission of 2n of its one dispatch less one of n; the four matrices alone (the plain matrix × vector over all of a matrix's rows, " +
     "nothing folded into what it writes: what the matrices themselves take); a dispatch of one workgroup that does next to nothing (what a step costs for being a dispatch in a chain); " +
-    "and the whole layer: all timed in turn, the weights read from copies of them in turn, the residual stream written back before every submission. " +
+    "and the whole layer: all timed in turn, the residual stream written back before every submission. " +
+    `The layer reads its copies of the weights in turn, a matrix alone or a step with a matrix the ranges of its size of all of them in turn${Number.isFinite(r.cycleMB) ? ` (none read again before ${number(r.cycleMB, 0)} MB of other weights` : " (none read again soon"}: not from the GPU's caches). ` +
     "Each step alone, not the layer less that step: a small step is 1 or 2% of a layer, about what a layer's time moves from one pair of submissions to the next, " +
     "so the difference of two layers could not tell it; alone it is repeated until a submission takes long enough. What the steps alone leave out is the layer less their sum: " +
-    "what a chain of different dispatches, each waiting for the one before, costs beyond each on its own. The attention reads one cache (the positions up to this one) every time, in the GPU's caches as in the layer table.",
+    "what a chain of different dispatches, each waiting for the one before, costs beyond each on its own. " +
+    "The fused matrices less the matrices alone is what fusing adds to them: the writes folded in (RoPE and the cache, the residual's add, SwiGLU), in llama.cpp's fused form the norm folded into the read, " +
+    "and gate with up in one workgroup, which can take less than the two alone (so this can come out less than nothing). " +
+    "The attention reads one cache (the positions up to this one) every time, in the GPU's caches as in the layer table.",
   ...(none ? [`Read nothing from these times: ${none.replace(/^none:? /, "")}.`] : []), "",
   `| step | µs each | ${forms.map((form) => `in "${tableCell(form.form)}"${wrong(form) ? " (WRONG in the check)" : ""}, µs a layer`).join(" | ")} |`,
   `|---|---:|${forms.map(() => "---:|").join("")}`,
@@ -477,7 +482,7 @@ export function layerStepsTable(step, check, ceilings, gpu = {}) {
       `Its steps one by one ${signed(steps)} ms (the matrices with what they write ${signed(matrices)}, the attention ${signed(attention)}, the norms and quantizing ${signed(small)}); ` +
       `the layer less them, what the chain costs beyond each step alone: ${signed(chain)} ms. ` +
       `The matrices alone ${signed(aloneMs)} ms (${GBps(aloneMs)}); the layer less them, ${signed(less(layer, aloneMs))} ms, is ` +
-      `what the matrices' writes add ${signed(less(matrices, aloneMs))} + the attention ${signed(attention)} + the norms and quantizing ${signed(small)} + the chain ${signed(chain)}. ` +
+      `what fusing adds to the matrices ${signed(less(matrices, aloneMs))} + the attention ${signed(attention)} + the norms and quantizing ${signed(small)} + the chain ${signed(chain)}. ` +
       `A dispatch of one workgroup takes ${microseconds(floor)} µs: ${form.dispatches} of them ${stepMs(floor) === undefined ? "?" : number(form.dispatches * floor.ms, 2)} ms.`);
   }
   if (r.steps.some((one) => one.unsteady) || r.forms.some((form) => form.unsteady)) lines.push("", "Unsteady: the pairs of a submission of n and of 2n were not about twice each other, so those times are rough.");
@@ -708,7 +713,7 @@ export function gpuSummary(steps, baseline = {}, gpu = {}) {
     .sort((x, y) => x.ms - y.ms)[0];
   if (splitForm && !none) {
     const parts = layerSplit(split, splitForm), two = (value) => (value === undefined ? "?" : number(value, 2));
-    lines.push(`GPU, where the time of a layer ${splitForm.form} goes: ${two(parts.layer)} ms, the matrices alone ${two(parts.alone)}, their writes ${two(less(parts.matrices, parts.alone))}, ` +
+    lines.push(`GPU, where the time of a layer ${splitForm.form} goes: ${two(parts.layer)} ms, the matrices alone ${two(parts.alone)}, fusing adds ${two(less(parts.matrices, parts.alone))}, ` +
       `the attention ${two(parts.attention)}, the norms and quantizing ${two(parts.small)}, the chain ${two(parts.chain)}`);
   }
   const prompt = find("a prompt all at once")?.result;
