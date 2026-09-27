@@ -348,37 +348,72 @@ export function attention_f16(out: usize, q: usize, kc: usize, vc: usize, att: u
   return sizeof<T>() == 2 ? half(p) : load<f32>(p);
 }
 
+// T161: the sums of four accumulators, lane by lane: [sum a0, sum a1, sum a2, sum a3], each as (l0 + l2) + (l1 + l3),
+// the order of sum4 below (a transpose by shuffles, then two adds: six instructions for four sums)
+// @ts-ignore: decorator
+@inline function sums4(a0: v128, a1: v128, a2: v128, a3: v128): v128 {
+  const s01 = f32x4.add(v128.shuffle<f32>(a0, a1, 0, 4, 1, 5), v128.shuffle<f32>(a0, a1, 2, 6, 3, 7));  // a0 l0+l2, a1 l0+l2, a0 l1+l3, a1 l1+l3
+  const s23 = f32x4.add(v128.shuffle<f32>(a2, a3, 0, 4, 1, 5), v128.shuffle<f32>(a2, a3, 2, 6, 3, 7));
+  return f32x4.add(v128.shuffle<f32>(s01, s23, 0, 1, 4, 5), v128.shuffle<f32>(s01, s23, 2, 3, 6, 7));
+}
+// @ts-ignore: decorator
+@inline function sum4(a: v128): f32 {
+  return (f32x4.extract_lane(a, 0) + f32x4.extract_lane(a, 2)) + (f32x4.extract_lane(a, 1) + f32x4.extract_lane(a, 3));
+}
+
 // @ts-ignore: decorator
 @inline function attentionOf<T>(out: usize, q: usize, kc: usize, vc: usize, att: usize, pos: i32, nh: i32, nkv: i32, hs: i32, h0: i32, h1: i32): void {
   const E: usize = sizeof<T>();  // bytes per key or value
   const kvDim = nkv * hs;
   const kvMul = nh / nkv;
-  const hs16 = hs & ~15, hs4 = hs & ~3;
-  const count = pos + 1;
+  const hs4 = hs & ~3;
+  const count = pos + 1, count4 = count & ~3;
   const isq: f32 = <f32>1.0 / sqrt<f32>(<f32>hs);
-  // 1. the scores of every head against every position
-  for (let t = 0; t < count; t++) {
+  const stride = <usize>kvDim * E;
+  // 1. the scores of every head against every position. T161: four positions of a head at a time, each with its own
+  // accumulator, so that the query's four floats are loaded once for four keys and one transposing reduction turns
+  // the four accumulators into the four scores, stored at once (the scores of a head are side by side in att). The
+  // form of several rows against one shared vector is llama.cpp's ggml_vec_dot_f16_unroll (ggml/src/ggml-cpu/vec.h,
+  // MIT; no line of it is copied). A last position left over takes the same sums in the same order, one accumulator,
+  // so a score does not depend on where its position falls.
+  let t = 0;
+  for (; t < count4; t += 4) {
+    const row = kc + <usize>(t * kvDim) * E;
+    for (let h = h0; h < h1; h++) {
+      const qh = q + (<usize>(h * hs) << 2);
+      const k0 = row + <usize>((h / kvMul) * hs) * E;
+      const k1 = k0 + stride, k2 = k1 + stride, k3 = k2 + stride;
+      let a0 = f32x4.splat(0), a1 = f32x4.splat(0), a2 = f32x4.splat(0), a3 = f32x4.splat(0);
+      let j = 0;
+      for (; j < hs4; j += 4) {
+        const x = v128.load(qh + (<usize>j << 2)), e = <usize>j * E;
+        a0 = f32x4.add(a0, f32x4.mul(x, kv4<T>(k0 + e)));
+        a1 = f32x4.add(a1, f32x4.mul(x, kv4<T>(k1 + e)));
+        a2 = f32x4.add(a2, f32x4.mul(x, kv4<T>(k2 + e)));
+        a3 = f32x4.add(a3, f32x4.mul(x, kv4<T>(k3 + e)));
+      }
+      let sc = sums4(a0, a1, a2, a3);
+      for (; j < hs; j++) {
+        const x = load<f32>(qh + (<usize>j << 2)), e = <usize>j * E;
+        sc = f32x4.add(sc, f32x4(x * kv<T>(k0 + e), x * kv<T>(k1 + e), x * kv<T>(k2 + e), x * kv<T>(k3 + e)));
+      }
+      v128.store(att + (<usize>(h * count + t) << 2), f32x4.mul(sc, f32x4.splat(isq)));
+    }
+  }
+  for (; t < count; t++) {
     const row = kc + <usize>(t * kvDim) * E;
     for (let h = h0; h < h1; h++) {
       const qh = q + (<usize>(h * hs) << 2);
       const kt = row + <usize>((h / kvMul) * hs) * E;
-      let a0 = f32x4.splat(0), a1 = f32x4.splat(0), a2 = f32x4.splat(0), a3 = f32x4.splat(0);
+      let a = f32x4.splat(0);
       let j = 0;
-      for (; j < hs16; j += 16) {
-        const o = <usize>j << 2, k = kt + <usize>j * E;
-        a0 = f32x4.add(a0, f32x4.mul(v128.load(qh + o), kv4<T>(k)));
-        a1 = f32x4.add(a1, f32x4.mul(v128.load(qh + o + 16), kv4<T>(k + 4 * E)));
-        a2 = f32x4.add(a2, f32x4.mul(v128.load(qh + o + 32), kv4<T>(k + 8 * E)));
-        a3 = f32x4.add(a3, f32x4.mul(v128.load(qh + o + 48), kv4<T>(k + 12 * E)));
-      }
-      for (; j < hs4; j += 4) a0 = f32x4.add(a0, f32x4.mul(v128.load(qh + (<usize>j << 2)), kv4<T>(kt + <usize>j * E)));
-      let sc: f32 = hsum(f32x4.add(f32x4.add(a0, a1), f32x4.add(a2, a3)));
+      for (; j < hs4; j += 4) a = f32x4.add(a, f32x4.mul(v128.load(qh + (<usize>j << 2)), kv4<T>(kt + <usize>j * E)));
+      let sc: f32 = sum4(a);
       for (; j < hs; j++) sc += load<f32>(qh + (<usize>j << 2)) * kv<T>(kt + <usize>j * E);
       store<f32>(att + (<usize>(h * count + t) << 2), sc * isq);
     }
   }
   // 2. softmax, head by head, four exponentials at a time
-  const count4 = count & ~3;
   for (let h = h0; h < h1; h++) {
     const scores = att + (<usize>(h * count) << 2);
     let mx: f32 = -f32.MAX_VALUE;
@@ -405,9 +440,7 @@ export function attention_f16(out: usize, q: usize, kc: usize, vc: usize, att: u
   // 3. the weighted sum of the values, again row by row, four positions at a time: out is loaded and stored once
   // for the four of them
   for (let j = h0 * hs; j < h1 * hs; j++) store<f32>(out + (<usize>j << 2), 0);
-  const stride = <usize>kvDim * E;
-  let t = 0;
-  for (; t < count4; t += 4) {
+  for (t = 0; t < count4; t += 4) {
     const row = vc + <usize>(t * kvDim) * E;
     for (let h = h0; h < h1; h++) {
       const weights = att + (<usize>(h * count + t) << 2);
