@@ -2866,7 +2866,9 @@ export function finiteLikeCpu(logits) {
 export function walkLikeCpu(logits, temperature, topp) {
   const f = Math.fround, n = logits.length, best = logits[argmaxLikeCpu(finiteLikeCpu(logits))];
   const nucleus = topp > 0 && topp < 1;
-  const lowest = nucleus ? f(best - f(f(temperature) * f(16.118095))) : -Infinity, inverse = f(1 / f(temperature));
+  // without a nucleus the kernel's floor is -f32.MAX_VALUE (and SAMPLE's -3.4e38): a -inf logit is left out, not
+  // given the exp(-87) of vexp() below (T195: with a random number of 0 that drew a token at -inf)
+  const lowest = nucleus ? f(best - f(f(temperature) * f(16.118095))) : -3.4028234663852886e38, inverse = f(1 / f(temperature));
   const probs = [], index = [];
   for (let i = 0; i < n; i++) {
     if (logits[i] >= lowest) {
