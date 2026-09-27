@@ -2905,7 +2905,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 // This project's: where a chunk's tokens go in order[] (the tokens over the floor of the chunks before it, summed by
 // every workgroup), the penalty applied by the workgroup whose chunk holds the token, and the draw without a nucleus in
 // two steps (the chunk whose running sum passes, then the token in it; where the rounding of the two scans leaves none
-// passing in that chunk, its last token).
+// passing in that chunk, its last token). What one stage computes and a later one needs to agree with is handed on in
+// the partial results, never computed again in the later pipeline (the floor: SAMPLE_GATHER's comment).
 // Bindings, of the same numbers as SAMPLE's (each stage binds those it reads: samplerStages): 0 the logits, 1 probs, 2
 // order, 3 the state, 4 chosen, 5 the random numbers, 6 the settings, and 7 the chunks' partial results
 // (samplePartsBytes: CHUNKS_COMMON's counted()).
@@ -3080,7 +3081,11 @@ ${CHUNK_MAIN} {
     if (settings.temperature == 0.0 || !nucleus) {
         return;
     }
-    // the largest and the floor as SAMPLE_SUM counted the chunks by
+    // the largest and the floor as SAMPLE_SUM counted the chunks by: read, never computed here again. The same
+    // expression in another pipeline may round 1 ulp apart (WGSL lets an implementation fuse the multiply into the
+    // subtraction), and a token on that ulp would be counted by SUM and not gathered here, or the other way: the
+    // chunks' places in order[] and probs[] would overlap, or keep a token of the draw before. No check sees it (lavapipe
+    // rounds both pipelines alike: Fable's broken copy that computes it again passed), so this read is what keeps it
     let head = parts[0];
     let best = bitcast<f32>(head.x);
     let lowest = bitcast<f32>(head.y);
