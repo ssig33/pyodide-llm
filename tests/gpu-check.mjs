@@ -29,7 +29,10 @@
 // of this directory has it). T153: "synthetic-qwen2", the same with biases of q, k and v (Qwen2's) and an epsilon of
 // 1e-6; "synthetic-qwen3", the norms of every head of q and k (Qwen3's), heads of 32 where dim / heads is 16 (q and
 // the attention's output 128 wide, dim 64), and an epsilon of 0.5, near mean(x²) (T150: an epsilon far below it
-// hides a wrong one); both of three layers. The others are the models of this directory (make models kernels), or <prefix>.json: a
+// hides a wrong one); both of three layers. T154: "synthetic-gpt2", GPT-2's form (LayerNorm with biases, a bias after
+// every matrix, an FFN of two matrices and GELU, learned positions and no RoPE), and "synthetic-neox", GPT-NeoX's (the
+// same with RoPE on the first quarter of every head, as Pythia's rotary_pct 0.25, and the parallel residual), both of
+// three layers and 4 heads of keys and values (neither has grouped-query attention). The others are the models of this directory (make models kernels), or <prefix>.json: a
 // model tests/perplexity_prepare.py converted (<prefix>.bin, <prefix>.tokenizer.bin, and the options in <prefix>.json;
 // gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
 // the native Python ($PYTHON, python3 by default).
@@ -55,11 +58,13 @@ const engine = option("--engine", "chromium");
 // T147: --forms <part,part>: only the matrices' shaders whose names hold one of these (all of them by default)
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
-const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "stories15M", "tiny-lm", "llm-jp-3-150m"];
+const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "synthetic-gpt2", "synthetic-neox", "stories15M", "tiny-lm", "llm-jp-3-150m"];
 // T153: the made-up models of another form (see above). Three layers: a layer's vectors are read at l × their size,
 // which a second layer alone would not tell from 0 + size
 const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias: true }, { bias: true, rms_norm_eps: 1e-6 }],
-  "synthetic-qwen3": [{ layers: 3, qk_norm: true, head_dim: 32 }, { qk_norm: true, head_dim: 32, rms_norm_eps: 0.5 }] };
+  "synthetic-qwen3": [{ layers: 3, qk_norm: true, head_dim: 32 }, { qk_norm: true, head_dim: 32, rms_norm_eps: 0.5 }],
+  "synthetic-gpt2": [{ layers: 3, kv_heads: 4, arch: "gpt2" }, { arch: "gpt2" }],
+  "synthetic-neox": [{ layers: 3, kv_heads: 4, arch: "neox" }, { arch: "neox", rotary: 4, parallel_residual: true }] };
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
@@ -230,7 +235,7 @@ function caseOf(id, options, reference, bytes) {
   for (const [name, value] of Object.entries(plan.derived)) plan.derived[name] = Buffer.from(value).toString("base64");
   const name = path.basename(id), file = path.join(directory, `${name}.bin`);
   fs.writeFileSync(file, bytes);
-  return { id, plan, headDim: options.head_dim ?? 0, checkpoint: `/case/${name}.bin`, file, reference, planSeconds: (performance.now() - began) / 1000 };
+  return { id, plan, headDim: options.head_dim ?? 0, arch: options.arch ?? "llama", checkpoint: `/case/${name}.bin`, file, reference, planSeconds: (performance.now() - began) / 1000 };
 }
 
 // ---- the browser: a page that is cross-origin isolated (its own headers), a worker that runs forward.js
@@ -261,7 +266,7 @@ try {
     const plan = c.plan;
     for (const name of Object.keys(plan.derived)) plan.derived[name] = Uint8Array.from(atob(plan.derived[name]), (ch) => ch.charCodeAt(0));
     const checkpoint = await fetched(c.checkpoint), size = checkpoint.length, tokens = c.reference.tokens, n = tokens.length - 1;
-    const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start, head_dim: c.headDim }) });
+    const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start, head_dim: c.headDim, arch: c.arch }) });
     new Uint8Array(memory.buffer, base, size).set(checkpoint);
     // T148: SwiftShader and lavapipe are fallback adapters, which the page refuses: the tests take them (fallback),
     // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU)

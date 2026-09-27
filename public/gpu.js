@@ -30,7 +30,11 @@
 // norms of every head of q and k (Qwen3) where the model has them, RoPE with the keys and values into the
 // GPU's own cache (float16), the attention (llama.cpp's flash attention with tiles: every token sees the positions up to
 // its own), the output matrix added to the residual, the RMSNorm, the gate and the up matrices, SwiGLU, the down matrix
-// added. The last layer stops at its keys and values: nothing of a prompt's token after them is used. Then the block's
+// added. T154: GPT-2 and GPT-NeoX (plan.layerNorm) have LayerNorm with a bias for either norm, a bias after every
+// matrix, no gate (the up matrix is w1, then GELU), GPT-2 no RoPE at all (plan.turned 0: its learned positions are in
+// the rows forward.js embeds) and GPT-NeoX RoPE on a part of every head; GPT-NeoX's parallel residual (plan.parallel)
+// has the FFN's norm read the layer's input before the output matrix adds to it, into a buffer of its own (xn). The
+// last layer stops at its keys and values: nothing of a prompt's token after them is used. Then the block's
 // keys and values of every layer are copied out and read back. The activations are float32 (quantized to 8 bits first
 // for the packed shaders, as the CPU's matmul_q8 takes them), the weights int8 widened or multiplied as int8.
 //
@@ -160,7 +164,7 @@ const adapterKey = (adapter) => {
 function shadersKey(wgsl, forms) {
   let hash = 0x811c9dc5;
   for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
-    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile)]) {
+    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile), wgsl.LAYER_NORM, wgsl.GELU]) {
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
   }
   return (hash >>> 0).toString(16);
@@ -246,9 +250,10 @@ function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
   pass.dispatchWorkgroups(x, y, z);
 }
 
-// every layer's matrices (values and scales, as the checkpoint holds them) and its vectors: the weights of its two
-// norms, and (T153) Qwen2's biases of q, k and v, Qwen3's norms of a head of q and of k (plan.vectors: each one's
-// address in the shared memory and its floats a layer)
+// every layer's matrices (values and scales, as the checkpoint holds them; T154: no w3 where there is no gate) and its
+// vectors: the weights of its two norms, and (T153) Qwen2's biases of q, k and v, Qwen3's norms of a head of q and of
+// k, (T154) GPT-2's and GPT-NeoX's biases of the two LayerNorms and of every matrix (plan.vectors: each one's address in
+// the shared memory and its floats a layer)
 async function upload(m) {
   const { plan } = m, group = m.wgsl.GROUP;
   let bytes = 0;
@@ -278,10 +283,11 @@ async function upload(m) {
 
 // the pipelines of a layer's small steps and the buffers of a block's activations
 async function prepare(m) {
-  const { plan, wgsl } = m, B = plan.batch;
+  const { plan, wgsl } = m, B = plan.batch, gated = Boolean(plan.matrices.w3);
   const qDim = plan.heads * plan.headSize, kvDim = plan.kvHeads * plan.headSize, widest = Math.max(plan.dim, qDim, plan.hidden);
-  [m.norm, m.headNorm, m.add, m.rope, m.swiglu, m.quantize] = await within(Promise.all([wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
-    wgsl.SWIGLU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code))), "the small steps' shaders");
+  // T154: LayerNorm and GELU where the model has them (GPT-2, GPT-NeoX), else RMSNorm and SwiGLU
+  [m.norm, m.headNorm, m.add, m.rope, m.activation, m.quantize] = await within(Promise.all([plan.layerNorm ? wgsl.LAYER_NORM : wgsl.RMSNORM,
+    wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE, gated ? wgsl.SWIGLU : wgsl.GELU, wgsl.QUANTIZE].map((code) => pipelineOf(m, code))), "the small steps' shaders");
   // a block's tokens, each array dense: token t's row at t times its width
   m.x = buffer(m, B * plan.dim * 4, STORAGE | COPY_DST);
   m.xb = buffer(m, B * Math.max(plan.dim, qDim) * 4, STORAGE | COPY_DST);
@@ -289,7 +295,10 @@ async function prepare(m) {
   m.k = buffer(m, B * kvDim * 4);
   m.v = buffer(m, B * kvDim * 4);
   m.gate = buffer(m, B * plan.hidden * 4, STORAGE | COPY_DST);
-  m.up = buffer(m, B * plan.hidden * 4);
+  m.up = gated ? buffer(m, B * plan.hidden * 4) : null;
+  // T154: GPT-NeoX's parallel residual: the FFN's norm of the layer's input, which xb cannot hold (the attention
+  // writes there first)
+  m.ffnInput = plan.parallel ? buffer(m, B * plan.dim * 4) : m.xb;
   // the packed shaders' input: the activations of a matrix quantized, 8 bits a value and a float32 scale a group
   m.xq = buffer(m, B * widest);
   m.xs = buffer(m, B * (widest / wgsl.GROUP) * 4);
@@ -300,13 +309,15 @@ async function prepare(m) {
   m.rows = new Float32Array(B * plan.dim);
   m.turns = new Float32Array(B * plan.headSize);
   m.ropeShape = uniform(m, new Uint32Array([plan.heads, plan.kvHeads, plan.headSize, plan.turned]));
-  m.swigluGroup = bind(m, m.swiglu, [m.gate, m.up, uniform(m, new Uint32Array([plan.hidden, 0, 0, 0])), m.step]);
+  const hidden = uniform(m, new Uint32Array([plan.hidden, 0, 0, 0]));
+  m.activationGroup = bind(m, m.activation, gated ? [m.gate, m.up, hidden, m.step] : [m.gate, hidden, m.step]);
   // QUANTIZE of the inputs the matrices read: xb (the norm's, dim wide; the attention's, heads × headSize wide, which
   // is not dim where the heads are of another size, T153) and gate (SwiGLU's)
   const quantizing = (from, n) => ({ group: bind(m, m.quantize, [from, m.xq, m.xs, uniform(m, new Uint32Array([n, n, 0, 0])), m.step]),
     x: Math.ceil(n / wgsl.GROUP / 64) });
   m.quantizeXb = quantizing(m.xb, plan.dim);
   m.quantizeAttention = quantizing(m.xb, qDim);
+  m.quantizeFfn = plan.parallel ? quantizing(m.ffnInput, plan.dim) : m.quantizeXb;
   m.quantizeGate = quantizing(m.gate, plan.hidden);
 }
 
@@ -528,7 +539,8 @@ async function timeForms(m, forms) {
   try {
     device.queue.writeBuffer(m.step, 0, new Uint32Array([plan.batch, 0, 0, 0]));
     const products = [["wq", m.xb, m.q, false, m.quantizeXb], ["wk", m.xb, m.k], ["wv", m.xb, m.v], ["wo", m.xb, m.x, true, m.quantizeAttention],
-      ["w1", m.xb, m.gate, false, m.quantizeXb], ["w3", m.xb, m.up], ["w2", m.gate, m.x, true, m.quantizeGate]];
+      ["w1", m.ffnInput, m.gate, false, m.quantizeFfn], ["w3", m.ffnInput, m.up], ["w2", m.gate, m.x, true, m.quantizeGate]]
+      .filter(([name]) => m.matrices[name]);
     for (const form of forms) {
       layer.push(await validated(m, () => products.map(([name, from, to, add, quantize]) => {
         const { rows, n, layers } = m.matrices[name];
@@ -569,7 +581,8 @@ async function timeForms(m, forms) {
 }
 
 // every layer's bind groups but those of the cache, with the form chosen. T153: a bias (Qwen2's) added to q, k and
-// v, or (Qwen3's) the norm of every head of q and of k, where the model has them
+// v, or (Qwen3's) the norm of every head of q and of k, where the model has them. T154: LayerNorm with its bias, and a
+// bias after o, w1 and w2 (GPT-2's, GPT-NeoX's)
 function bindLayers(m) {
   const { plan } = m, form = m.form, V = m.vectors;
   const product = (name, l, from, to, add = false) => {
@@ -584,6 +597,9 @@ function bindLayers(m) {
     const normShape = uniform(m, norm);
     const added = (to, name) => V[name] && { group: bind(m, m.add, [to, V[name], uniform(m, new Uint32Array([plan.vectors[name].size, l * plan.vectors[name].size, 0, 0])), m.step]),
       x: Math.ceil(plan.vectors[name].size / 64) };
+    // T154: LayerNorm reads its bias from the same place in its own buffer
+    const normed = (weight, bias, out) => bind(m, m.norm, plan.layerNorm ? [m.x, V[weight], V[bias], out, normShape, m.step]
+      : [m.x, V[weight], out, normShape, m.step]);
     const headNorm = (of, name, heads) => {
       if (!V[name]) return null;
       const shape = new ArrayBuffer(16);
@@ -592,14 +608,15 @@ function bindLayers(m) {
       return { group: bind(m, m.headNorm, [of, V[name], uniform(m, shape), m.step]), heads };
     };
     m.layers.push({
-      attentionNorm: bind(m, m.norm, [m.x, V.attention, m.xb, normShape, m.step]),
+      attentionNorm: normed("attention", "attentionBias", m.xb),
       q: product("wq", l, m.xb, m.q), k: product("wk", l, m.xb, m.k), v: product("wv", l, m.xb, m.v),
       biases: [added(m.q, "bq"), added(m.k, "bk"), added(m.v, "bv")].filter(Boolean),
       headNorms: [headNorm(m.q, "qNorm", plan.heads), headNorm(m.k, "kNorm", plan.kvHeads)].filter(Boolean),
-      o: product("wo", l, m.xb, m.x, true),
-      ffnNorm: bind(m, m.norm, [m.x, V.ffn, m.xb, normShape, m.step]),
-      gate: product("w1", l, m.xb, m.gate), up: product("w3", l, m.xb, m.up),
-      down: product("w2", l, m.gate, m.x, true),
+      o: product("wo", l, m.xb, m.x, true), oBias: added(m.x, "bo"),
+      ffnNorm: normed("ffn", "ffnBias", m.ffnInput),
+      gate: product("w1", l, m.ffnInput, m.gate), gateBias: added(m.gate, "b1"),
+      up: m.matrices.w3 ? product("w3", l, m.ffnInput, m.up) : null,
+      down: product("w2", l, m.gate, m.x, true), downBias: added(m.x, "b2"),
     });
   }
 }
@@ -693,12 +710,13 @@ async function prompt({ serial, count, pos }) {
 async function block(m, count, pos, wanted, timing = false) {
   const { device, plan } = m, B = plan.batch, half = plan.headSize / 2, kvDim = plan.kvHeads * plan.headSize;
   // the rows forward.js embedded (dense), and the angles of their positions (the tables forward.js has)
-  if (timing) {
-    m.rows.fill(0);
+  const F = new Float32Array(m.memory.buffer);
+  if (timing) m.rows.fill(0);
+  else m.rows.set(F.subarray(plan.rows / 4, plan.rows / 4 + count * plan.dim));
+  // (T154: GPT-2 turns nothing and has no tables)
+  if (timing || !plan.turned) {
     m.turns.fill(0);
   } else {
-    const F = new Float32Array(m.memory.buffer);
-    m.rows.set(F.subarray(plan.rows / 4, plan.rows / 4 + count * plan.dim));
     for (let t = 0; t < count; t++) {
       const cos = plan.cos / 4 + (pos + t) * half, sin = plan.sin / 4 + (pos + t) * half;
       m.turns.set(F.subarray(cos, cos + half), t * plan.headSize);
@@ -716,6 +734,8 @@ async function block(m, count, pos, wanted, timing = false) {
   // a packed form reads its input quantized: once for the matrices that read the same one
   const quantize = (q) => form.packed && dispatch(pass, m.quantize, q.group, q.x, count);
   const flash = m.attention;
+  // a bias added to a matrix's output (T153: Qwen2's q, k and v; T154: GPT-2's and GPT-NeoX's every matrix's)
+  const biased = (bias) => bias && dispatch(pass, m.add, bias.group, bias.x, count);
   for (let l = 0; l < plan.layers; l++) {
     const layer = m.layers[l];
     dispatch(pass, m.norm, layer.attentionNorm, 1, count);
@@ -724,20 +744,25 @@ async function block(m, count, pos, wanted, timing = false) {
     multiplied(layer.k);
     multiplied(layer.v);
     // T153: as the CPU has it (forward.js), the biases, then the norms of the heads, then RoPE
-    for (const bias of layer.biases) dispatch(pass, m.add, bias.group, bias.x, count);
+    layer.biases.forEach(biased);
     for (const norm of layer.headNorms) dispatch(pass, m.headNorm, norm.group, norm.heads, count);
     dispatch(pass, m.rope, m.cache.rope[l], count);
     if (l === plan.layers - 1) break;  // the keys and values are all a prompt's token leaves
+    // T154: GPT-NeoX's parallel residual: the FFN's norm of the layer's input, before o adds to it
+    if (plan.parallel) dispatch(pass, m.norm, layer.ffnNorm, 1, count);
     dispatch(pass, flash.pipeline, m.cache.attention[l], plan.heads * Math.ceil(count / m.wgsl.FLASH_Q_TILE));
     quantize(m.quantizeAttention);
     multiplied(layer.o);
-    dispatch(pass, m.norm, layer.ffnNorm, 1, count);
-    quantize(m.quantizeXb);
+    biased(layer.oBias);
+    if (!plan.parallel) dispatch(pass, m.norm, layer.ffnNorm, 1, count);
+    quantize(m.quantizeFfn);
     multiplied(layer.gate);
-    multiplied(layer.up);
-    dispatch(pass, m.swiglu, m.swigluGroup, Math.ceil(plan.hidden / 64), count);
+    if (layer.up) multiplied(layer.up);
+    biased(layer.gateBias);
+    dispatch(pass, m.activation, m.activationGroup, Math.ceil(plan.hidden / 64), count);
     quantize(m.quantizeGate);
     multiplied(layer.down);
+    biased(layer.downBias);
   }
   pass.end();
   // the block's keys of every layer, then its values, [layers][B][kvDim] each in float16, as plan.staging lays them out

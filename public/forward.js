@@ -832,20 +832,24 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     else startGpu();
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
-  // (T153: with Qwen2's biases, Qwen3's norms of the heads and heads of another size than dim / heads as well)
+  // (T153: with Qwen2's biases, Qwen3's norms of the heads and heads of another size than dim / heads as well; T154:
+  // GPT-2's and GPT-NeoX's as well, whose FFN has no gate: w3 is null)
+  // (a function, not a const: gpuUnfit runs before this line, AGENTS.md)
+  function gpuMatrices() {
+    return Object.fromEntries(Object.entries({ wq, wk, wv, wo, w1, w2, w3 }).filter(([, m]) => m));
+  }
   function gpuUnfit() {
     if (!sharedMemory) return "the page is not cross-origin isolated";
     if (wide) return "a 64-bit memory: not on the GPU yet";
-    if (arch !== "llama") return `${arch === "gpt2" ? "GPT-2" : "GPT-NeoX"} is not on the GPU yet`;
     if (headSize % 4) return "heads of a size that is no multiple of 4 are not on the GPU";
-    if (![wq, wk, wv, wo, w1, w2, w3].every((m) => m?.int8 && !m.six && m.group === 32)) {
+    if (!Object.values(gpuMatrices()).every((m) => m.int8 && !m.six && m.group === 32)) {
       return `${T.wq?.kind === "int6" ? "int6" : "float32"} weights are not on the GPU yet`;
     }
     // T148: the layers twice, in this memory and on the GPU (T156 will keep one): a device with too little memory
     // for both keeps the CPU's alone (a phone or an Apple shares its memory between the two)
     // (T153, the review: with the GPU's own keys and values, float16, as the prompt may fill the whole context: Qwen3
     // 0.6B's are 0.47 GB at 4096 positions, 95% of its layers')
-    const onGpu = [wq, wk, wv, wo, w1, w2, w3].reduce((bytes, m) => bytes + layers * m.rows * m.n * (1 + 4 / 32), 0) +
+    const onGpu = Object.values(gpuMatrices()).reduce((bytes, m) => bytes + layers * m.rows * m.n * (1 + 4 / 32), 0) +
       Object.values(gpuVectors()).reduce((bytes, { size }) => bytes + layers * size * 4, 0) + 2 * layers * seqLen * kvDim * 2;
     if (gpuRoom !== undefined && onGpu > gpuRoom) {
       return `the layers on the GPU as well (${Math.round(onGpu / 1e6)} MB) would not leave this device enough memory`;
@@ -853,15 +857,19 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     return null;
   }
   // the vectors of every layer the GPU reads (gpu.js's plan.vectors): the norms' weights; T153: Qwen2's biases of q,
-  // k and v, Qwen3's norms of a head of q and of k. Each one's address here and its floats a layer
+  // k and v, Qwen3's norms of a head of q and of k; T154: GPT-2's and GPT-NeoX's biases of the two LayerNorms, of q,
+  // k and v and of o, w1 and w2. Each one's address here and its floats a layer
   function gpuVectors() {
     return { attention: { at: attW, size: dim }, ffn: { at: ffnW, size: dim },
+      ...(layerNorm ? { attentionBias: { at: attB, size: dim }, ffnBias: { at: ffnB, size: dim } } : {}),
       ...(bq ? { bq: { at: bq, size: qDim }, bk: { at: bk, size: kvDim }, bv: { at: bv, size: kvDim } } : {}),
-      ...(qNorm ? { qNorm: { at: qNorm, size: headSize }, kNorm: { at: kNorm, size: headSize } } : {}) };
+      ...(qNorm ? { qNorm: { at: qNorm, size: headSize }, kNorm: { at: kNorm, size: headSize } } : {}),
+      ...(bo ? { bo: { at: bo, size: dim }, b1: { at: b1, size: hidden }, b2: { at: b2, size: dim } } : {}) };
   }
   function startGpu() {
-    const turned = plan.rotary > 0 && plan.rotary < headSize ? plan.rotary : headSize;
-    const matrices = Object.fromEntries(Object.entries({ wq, wk, wv, wo, w1, w2, w3 }).map(([name, m]) =>
+    // the values of a head RoPE turns: all of them, GPT-NeoX's first rotary (T154), none of GPT-2's
+    const turned = gpt2 ? 0 : plan.rotary > 0 && plan.rotary < headSize ? plan.rotary : headSize;
+    const matrices = Object.fromEntries(Object.entries(gpuMatrices()).map(([name, m]) =>
       [name, { rows: m.rows, n: m.n, layers: Array.from({ length: layers }, (_, l) => m.layer(l).slice(0, 2)) }]));
     let quiet;
     const listen = () => {
@@ -891,8 +899,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     };
     gpuWorker.onerror = (event) => stopGpu(`the GPU's worker did not start (${event.message ?? "an error"})`);
     listen();
+    // T154: LayerNorm's epsilon is the CPU's layernorm kernel's and NumPy's, 1e-5 (GPT-2's and GPT-NeoX's
+    // layer_norm_epsilon); parallel: GPT-NeoX's parallel residual
     gpuWorker.postMessage({ type: "start", memory, plan: { dim, hidden, layers, heads, kvHeads, headSize, turned, seqLen,
-      kvStart: plan.kv_start, eps, batch: GPU_BLOCK, matrices, vectors: gpuVectors(), rows: gpuRows,
+      kvStart: plan.kv_start, eps: layerNorm ? 1e-5 : eps, layerNorm, parallel: Boolean(parallel), batch: GPU_BLOCK, matrices,
+      vectors: gpuVectors(), rows: gpuRows,
       cos: cosTable, sin: sinTable, staging, force: gpuForce, remembered: gpuRemembered,
       words: { done: GPU_DONE, failed: GPU_FAILED, beat: GPU_BEAT, wanted: GPU_WANTED } } });
   }

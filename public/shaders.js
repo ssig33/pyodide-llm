@@ -768,7 +768,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // the same for every row, mul_src_ne1 1); else out is another buffer (xb, the layer's norms).
 //
 // The row of a norm, its weight broadcast over the rows and the in-place form adapted from llama.cpp,
-// ggml/src/ggml-webgpu/wgsl-shaders/rms_norm_mul.wgsl and binary.wgsl (OP_ADD, INPLACE; ADD below)
+// ggml/src/ggml-webgpu/wgsl-shaders/rms_norm_mul.wgsl and binary.wgsl (OP_ADD, INPLACE; ADD below), and (T154)
+// row_norm.wgsl (NORM: LAYER_NORM below) and unary.wgsl (GELU: GELU below)
 // (https://github.com/ggml-org/llama.cpp, commit 2145525a, 2026-09-26), under the MIT License:
 //
 // Copyright (c) 2023-2026 The ggml authors
@@ -811,6 +812,51 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(num_workgroups) rows: vec3u, 
 export const RMSNORM = rmsNorm(false);
 export const HEAD_NORM = rmsNorm(true);
 
+// T154: LayerNorm (GPT-2's and GPT-NeoX's), out = weight * ((x - mean) / sqrt(variance + eps)) + bias, as the CPU's
+// layernorm kernel computes it: llama.cpp's row_norm.wgsl with NORM (the notice above: the sum of the row, its mean,
+// then the sum of the squares about the mean, a reduction of the workgroup each), in the frame of RMSNORM above: one
+// workgroup a row, the tokens the dispatch's y. Changed: the weight's MUL and the bias's ADD, which llama.cpp runs as
+// two dispatches of binary.wgsl after the NORM, are the last line of this one (as rms_norm_mul.wgsl folds the MUL into
+// RMS_NORM, and the CPU's kernel does all three at once); both are this layer's, from float at.
+export const LAYER_NORM = /* wgsl */ `
+struct Norm { size: u32, at: u32, eps: f32, unused: u32 }
+${STEP}
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> norm: Norm;
+@group(0) @binding(5) var<uniform> step: Step;
+var<workgroup> partial: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) id: vec3u, @builtin(num_workgroups) rows: vec3u, @builtin(local_invocation_index) t: u32) {
+  if (id.y >= step.tokens) { return; }
+  let row = (id.y * rows.x + id.x) * norm.size;
+  var sum = 0.0;
+  for (var i = t; i < norm.size; i += 64u) { sum += x[row + i]; }
+  partial[t] = sum;
+  workgroupBarrier();
+  for (var half = 32u; half > 0u; half >>= 1u) {
+    if (t < half) { partial[t] += partial[t + half]; }
+    workgroupBarrier();
+  }
+  let mean = partial[0] / f32(norm.size);
+  var squares = 0.0;
+  for (var i = t; i < norm.size; i += 64u) {
+    let d = x[row + i] - mean;
+    squares += d * d;
+  }
+  workgroupBarrier();
+  partial[t] = squares;
+  workgroupBarrier();
+  for (var half = 32u; half > 0u; half >>= 1u) {
+    if (t < half) { partial[t] += partial[t + half]; }
+    workgroupBarrier();
+  }
+  let s = 1.0 / sqrt(partial[0] / f32(norm.size) + norm.eps);
+  for (var i = t; i < norm.size; i += 64u) { out[row + i] = weight[norm.at + i] * (s * (x[row + i] - mean)) + bias[norm.at + i]; }
+}`;
+
 // T153: a bias added to every token of a matrix's output (Qwen2's q, k and v), llama.cpp's binary.wgsl with OP_ADD and
 // INPLACE (the notice above): y += bias, the bias (this layer's, from float at) the same for every token (b_ne1 1).
 // Changed: the token is the dispatch's y and the element its x (as SWIGLU here), where llama.cpp numbers every element
@@ -830,7 +876,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 // RoPE on q and k, and the keys and values of every token into this layer's cache at its position (step.pos + the
 // token): one workgroup per token. Pairs of neighbours turn (llama2.c's order), the first turned of every head (all
-// of it but for GPT-NeoX); angles holds, per token, the cos of its headSize / 2 angles and then their sin. The cache
+// of it but for GPT-NeoX, T154: whose converter puts the pairs of its rotary part in this order; none of it for GPT-2,
+// whose positions are learned and added to the rows by the CPU: its keys go into the cache as they are); angles holds, per token, the cos of its headSize / 2 angles and then their sin. The cache
 // holds float16 (T147: as the CPU's cache does, T110, and as llama.cpp's flash attention reads its K and V), a pair of
 // neighbours to a u32 (pack2x16float: no shader-f16 needed), the pair RoPE turns together.
 export const ROPE = /* wgsl */ `
@@ -1199,6 +1246,25 @@ fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u3
   let at = id.y * size.n + i;
   let v = gate[at];
   gate[at] = v / (1.0 + exp(-v)) * up[at];
+}`;
+
+// T154: GELU (GPT-2's gelu_new and GPT-NeoX's, the tanh approximation), gate = gelu(gate) for every token (the dispatch's
+// y), in place: llama.cpp's unary.wgsl with GELU (the notice above: its formula, the argument of tanh clamped as it
+// has it). Changed: the element is the dispatch's x and the token its y (as SWIGLU); the bias of the projection before
+// it is ADD's, as llama.cpp adds it (the CPU's gelu kernel adds it itself: the same sum, v + b, rounded once)
+export const GELU = /* wgsl */ `
+struct Size { n: u32, unused0: u32, unused1: u32, unused2: u32 }
+${STEP}
+@group(0) @binding(0) var<storage, read_write> gate: array<f32>;
+@group(0) @binding(1) var<uniform> size: Size;
+@group(0) @binding(2) var<uniform> step: Step;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) id: vec3u, @builtin(local_invocation_index) t: u32) {
+  let i = id.x * 64u + t;
+  if (id.y >= step.tokens || i >= size.n) { return; }
+  let at = id.y * size.n + i;
+  let v = gate[at];
+  gate[at] = 0.5 * v * (1.0 + tanh(clamp(0.7978845608028654 * (v + 0.044715 * v * v * v), -9.010913, 9.010913)));
 }`;
 
 // ---- T168: the device's ceilings, for the GPU section of /benchmark/ to say what share of them the prompt's shaders

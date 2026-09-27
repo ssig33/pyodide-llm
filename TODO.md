@@ -409,8 +409,28 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - **確かめていないもの**: 持ち主の端末での速さ（bias と head の norm で層あたり 3〜2 ディスパッチ増える。プロンプトの 64 トークンのブロックでは行列積に比べて小さい見込み、未計測）。GPT-2・NeoX（T154）・6 ビット（T155）は CPU のまま。
 - **走らせてほしい CI**: `models.yml` の `query=gpuTest=on` で Qwen2.5 0.5B Instruct・Qwen3 0.6B（すぐ答える形）・TinySwallow 1.5B・DeepSeek-R1 Distill Qwen 1.5B（Chromium の SwiftShader。「prompts on WebGPU」で答えること）、`gpu-prompt.yml` を `-f models="synthetic synthetic-qwen2 synthetic-qwen3"`（ブラウザのジョブの既定は `synthetic` だけ。Dawn のジョブの既定は 6 つ全部）。
 
-### T154 [追加] GPT-2・NeoX を GPU で — 状態: 未着手（規模 中）
+### T154 [追加] GPT-2・NeoX を GPU で — 状態: **レビュー待ち**（2026-09-27、Opus medium、ブランチ `t154-gpt2-neox`。CI の確かめと持ち主の端末の数字は未。規模 中）
 - LayerNorm・GELU・学習済みの位置の表・全結合の bias・並列残差・一部の回転。一覧の rinna の 3 つ、GPT-2、Pythia の 5 つ。
+- **取った元ネタと理由**（`.tmp/t154/ref/` に llama.cpp の `row_norm.wgsl`・`unary.wgsl`・`binary.wgsl`・`rope.wgsl`・`ggml-webgpu.cpp`、commit 2145525a、MIT。写した行の上の著作権の行と許諾文の全文は T153 の RMSNORM の上のものに 2 つのファイルを足した）:
+  1. **LayerNorm は `row_norm.wgsl` の NORM**（`shaders.js` の `LAYER_NORM`）: 行の和 → 平均、平均の周りの 2 乗の和 → 分散、どちらもワークグループの reduction（2 回目の前の `workgroupBarrier` も元ネタどおり）。枠は RMSNORM と同じ（1 ワークグループ 1 行、トークンを y）。**変えた所**: llama.cpp の WebGPU は NORM の後に重みの MUL と bias の ADD を binary の 2 ディスパッチで走らせる（`ggml-webgpu.cpp` が畳むのは `rms_norm_mul` と gdn だけ）が、`rms_norm_mul.wgsl` が MUL を RMS_NORM に畳むのと同じ形で、重みと bias を最後の行に畳んだ（1 ディスパッチ。CPU の layernorm カーネルと同じ式 w·(s·(x − 平均)) + b）。**レビューで見てほしい点**: NORM + MUL + ADD を 1 つにした所は元ネタに同じ形が無い（rms_norm_mul の MUL の畳み方の延長）。
+  2. **GELU は `unary.wgsl` の GELU**（`GELU`、gate の置き場でその場で）: 0.5·v·(1 + tanh(clamp(0.79788·(v + 0.044715·v³), ±9.010913)))。**変えた所**: 要素をディスパッチの x、トークンを y（SWIGLU と同じ）。前の bias（b1）は llama.cpp どおり ADD の別のディスパッチ（CPU の gelu カーネルは中で足すが、v + b の丸めは同じ 1 回）。
+  3. **bias は T153 の ADD**（`binary.wgsl` の OP_ADD・INPLACE）: q・k・v（T153 のまま）、o の後の bo、w1 の後の b1、w2 の後の b2。層あたり 6 ディスパッチ。
+  4. **RoPE**: NeoX の一部の回転は T135 の ROPE がもう `turned` で持っていた（`rope.wgsl` の n_dims < ne0 の素通しと同じ考え。変換器が回す部分の対を llama2.c の並びにしている）。GPT-2 は回す本数 0（K と V をキャッシュに書くだけ、角の表も読まない）。llama.cpp の NEOX の形（対が半分離れる `rope_neox`）は取っていない: うちの変換器が対を隣に並べ替えるので、CPU と同じ隣の対のまま。
+  5. **学習済みの位置の表**: GPU では何もしない。CPU の `embed()` が埋め込みの行に位置の行を足してから GPU の置き場に書く（T135 から、`promptOnGpu` の `embed(tokens, pos0, gpuRows, D)`）。
+  6. **並列残差**（NeoX の `use_parallel_residual`、Pythia は真・rinna は偽）: FFN の norm を、o が層の入力に足す前に別の置き場（`xn`、DP4A の量子化も `xn` から）へ。llama.cpp の `llm_build_gptneox` も 2 つの norm を層の入力（inpL）から取る。直列のモデルは今までどおり o と bo の後に xb へ。
+  7. **FFN は 2 本**（w3 が無い）: w1 → b1 → GELU → w2（x に足す）→ b2。`forward.js` は w3 の無いモデルの行列を GPU に渡さず、`gpu.js` の形の計測・置き場・バインドは w3 のあるときだけ。
+  8. **外れ値の列（T92 の `add_columns`）は要らない**: 抜くのは分類器の入力（最終 LayerNorm の出力）のチャネルで、分類器とその前の最終 norm は CPU（プロンプトの最後のトークンは CPU が通す）。GPU が書き戻す K と V には関わらない。
+  9. **eps**: LayerNorm は CPU のカーネルと NumPy と同じ 1e-5（GPT-2・Pythia の `layer_norm_epsilon`）を uniform で。
+- **forward.js**: GPU に回さない理由から「GPT-2 / GPT-NeoX is not on the GPU yet」を外した。GPU に渡す `vectors` に LayerNorm の 2 つの bias と bo・b1・b2、plan に `layerNorm`・`parallel`。`gpuMatrices()` は関数の宣言（`gpuUnfit()` がその行より前に走る: 初めは const で ReferenceError になった、AGENTS.md の落とし穴のとおり）。
+- **正しさ**（a1-free の Dawn + lavapipe、1 回、`tests/gpu-check.mjs synthetic-gpt2 synthetic-neox --engine dawn`、150 トークン、全部の形と subgroups の無い attention。作り物は 3 層・dim 64・4 head・K と V も 4 head。NeoX は `rotary` 4（head 16 の 4 分の 1、Pythia の 0.25）と並列残差）: 全部通った。
+  | モデル | E16 | TF.js（float32） | llama.cpp f16（32×32・64×64・f32 の attention） | DP4A | CPU の forward.js |
+  |---|---:|---:|---:|---:|---:|
+  | synthetic-gpt2 | 1.39e-3 | 1.0 E16（1 層目 4.5e-4） | 2.0 E16（1 層目 6.1e-4） | 23.5 E16: 線（CPU の誤差の 0.75 倍）の 0.89 | 35.3 E16 |
+  | synthetic-neox | 7.88e-4 | 1.0 E16（1 層目 4.7e-4） | 1.8 E16（1 層目 6.9e-4） | 31.1 E16: 線の 0.89 | 46.4 E16 |
+  logits は CPU の 0.68〜0.92 倍、最尤トークンはどれも CPU と同じ。DP4A は線（CPU の誤差の 0.75 倍、T147 からの弱さ、T187）の 0.89 で、Qwen2.5 の 0.98 と同じく線に近い（8 ビットの活性値の分: T187 で目盛りを替える）。
+- **わざと壊すと落ちるか**（持ち主の指示で WebGPU の試験は CI で。手元の Dawn は上の 1 回だけ）: 6 つのブランチ（1 つに 1 つの壊し方、`t154-gpt2-neox` の上の 1 コミット、push していない）: `t154-break-mean`（LAYER_NORM の平均を 0 に）、`t154-break-gelu`（GELU の 0.7978845608028654 を 0.75 に）、`t154-break-positions`（GPU に渡す行の位置の表を 1 つ先の位置に: `promptOnGpu` の `embed` を pos0 + 1）、`t154-break-serial`（並列残差を直列に: plan の `parallel` を偽に）、`t154-break-rotary`（NeoX を head 全体で回す）、`t154-break-bias`（w2 の後の b2 を足さない）。見込み: どれも壊した所を使うモデルの全部の形で K と V が線を越える（平均・GELU・b2 は両方、位置は GPT-2 だけ、直列と回す本数は NeoX だけ。平均・位置・回す本数は 1 層目から、GELU・直列・b2 は 2 層目から）。結果は未（CI）。
+- **走らせる CI**（本会話）: (1) `node tests/ci.mjs run gpu-prompt.yml "models=synthetic synthetic-qwen2 synthetic-qwen3 synthetic-gpt2 synthetic-neox" "real=hf-gpt2 hf-pythia-160m hf-japanese-gpt2-small hf-japanese-gpt-neox-small" --ref t154-gpt2-neox --minutes 130`（Dawn の行を読む: 各形の全層の差と何 E16 か、1 層目、logits の CPU 比、最尤トークン。GPT-2 124M は T92 の外れ値の門を越えるモデル。SwiftShader のジョブは実物が遅いので、同じ run に `forms=TF.js` を付けるか、models= だけの別の run に）。(2) 壊した 6 つ: それぞれ `node tests/ci.mjs run gpu-prompt.yml "models=synthetic-gpt2 synthetic-neox" forms=TF.js --ref t154-break-<名前> --minutes 60`（Dawn のジョブが FAILED になり、壊した所を使うモデルだけが落ちること）。(3) 本線に入れた後: `models.yml` の `query=gpuTest=on` で hf-gpt2・hf-pythia-160m・hf-japanese-gpt2-small・hf-japanese-gpt-neox-small が「prompt … tokens on WebGPU」で答えるか（Chromium の SwiftShader）。
+- **確かめていないもの**: 実物（CI）、持ち主の端末の速さ（層あたりのディスパッチは LayerNorm 2・bias 6・GELU 1 で、Llama の RMSNorm 2・SwiGLU 1 より 6 多い。64 トークンのブロックでは行列積に比べて小さい見込み、未計測）、rinna japanese-gpt-1b（head 128: SwiftShader では flash attention のコンパイルが遅い、T153 の落とし穴）と Pythia 1B・1.4B（GPU に 2 重に持つ大きさ、T148 の `deviceMemory` の判定）。
 
 ### T155 [追加] 6 ビットの重みと 64 ビットのメモリ（大きいモデル）を GPU で — 状態: 未着手（規模 中）
 - 6 ビット（Safari の既定と、`deviceMemory` の小さい端末）はシェーダで広げる。64 ビットのメモリのモデルは、重みを GPU へ塊で送る（1 つのバッファの上限、T94 の記録）。
