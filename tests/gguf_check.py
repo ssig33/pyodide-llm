@@ -206,6 +206,9 @@ NAMES = {
                  "ffn_norm": "post_attention_layernorm", "ffn_up": "mlp.dense_h_to_4h", "ffn_down": "mlp.dense_4h_to_h"}),
 }
 NAMES["qwen2"] = NAMES["llama"]
+# T203: a Qwen3's are a Llama's and the norms of each head of q and k
+NAMES["qwen3"] = (NAMES["llama"][0], NAMES["llama"][1],
+                  {**NAMES["llama"][2], "attn_q_norm": "self_attn.q_norm", "attn_k_norm": "self_attn.k_norm"})
 
 
 def hugging_face_name(name, arch="llama"):

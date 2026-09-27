@@ -1376,7 +1376,7 @@ def unsplit(w, heads):
 
 # ------------------------------------------------------------------------------------------------- GGUF (T74)
 # A GGUF file holds what config.json, tokenizer.json and model.safetensors hold, in one. Only what a Q8_0 or F16
-# Llama, Qwen2, GPT-2 or GPT-NeoX needs is read; tests/gguf_check.py is the separate reference this is held to.
+# Llama, Qwen2, Qwen3, GPT-2 or GPT-NeoX needs is read; tests/gguf_check.py is the separate reference this is held to.
 class Incomplete(Exception):
     """The GGUF header goes on past the bytes given: fetch more and try again."""
 
@@ -1395,6 +1395,10 @@ GGUF_NAMES = {"token_embd.weight": "model.embed_tokens.weight", "output_norm.wei
 GGUF_ARCHITECTURES = {
     "llama": (GGUF_NAMES, "model.layers.{}.", GGUF_LAYER),
     "qwen2": (GGUF_NAMES, "model.layers.{}.", GGUF_LAYER),
+    # T203 (T136's fourth stage): a Qwen3 is a Qwen2 without the biases that normalizes each head of q and k (T124).
+    # llama.cpp leaves q, k and the two norms in Hugging Face's order, as a Qwen2's; the head's size is key_length
+    "qwen3": (GGUF_NAMES, "model.layers.{}.", {**GGUF_LAYER, "attn_q_norm": "self_attn.q_norm",
+                                                 "attn_k_norm": "self_attn.k_norm"}),
     "gpt2": ({"token_embd.weight": "wte.weight", "position_embd.weight": "wpe.weight", "output_norm.weight": "ln_f.weight",
               "output_norm.bias": "ln_f.bias", "output.weight": "lm_head.weight"}, "h.{}.",
              {"attn_norm": "ln_1", "attn_qkv": "attn.c_attn", "attn_output": "attn.c_proj", "ffn_norm": "ln_2",
@@ -1466,7 +1470,7 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
     rope_scaling as it streams past (gguf_weights, T136), instead of refusing it."""
     arch = metadata.get("general.architecture")
     if arch not in GGUF_ARCHITECTURES:
-        raise ValueError(f"This GGUF holds a {arch}: only Llama, Qwen2, GPT-2 and GPT-NeoX ones are supported.")
+        raise ValueError(f"This GGUF holds a {arch}: only Llama, Qwen2, Qwen3, GPT-2 and GPT-NeoX ones are supported.")
     key = lambda name, default=None: metadata.get(f"{arch}.{name}", default)
     common = {"vocab_size": tensors["token_embd.weight"]["shape"][0] if "token_embd.weight" in tensors else None,
               "bos_token_id": metadata.get("tokenizer.ggml.bos_token_id", 1),
