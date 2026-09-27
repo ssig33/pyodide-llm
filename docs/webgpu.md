@@ -42,8 +42,8 @@ CPU (faster here than WebGPU)", or "prompts on the CPU (reason)".
 - The adapter is a fallback that runs on the CPU (SwiftShader, lavapipe): it would never be faster, and compiling
   the shaders took 2 to 4 minutes.
 - The page is not cross-origin isolated (no shared memory between the workers).
-- The model needs 64-bit memory, or is not a plain Llama-shaped model in int8 (Qwen2's biases, Qwen3's norms,
-  GPT-2, GPT-NeoX and 6-bit weights are later tasks).
+- The model needs 64-bit memory, or is not a Llama-shaped model in int8 (Qwen2's biases and Qwen3's norms of the
+  heads run on the GPU; GPT-2, GPT-NeoX and 6-bit weights are later tasks).
 - The weights would not fit twice: today they are kept in WebAssembly memory for the CPU and again on the GPU. On
   phones and Apple devices both are the same memory. If the total is more than half of `navigator.deviceMemory`,
   the model stays on the CPU. Chromium reports at most 8, which is read as "8 GB or more"; a browser that does not
@@ -93,7 +93,7 @@ say only that the shaders are right, not how fast a GPU is.
 In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
 GPU with the CPU's random numbers, is in the benchmark: a seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
-activations to 7 or 8 bits)); then Qwen2 and Qwen3, GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
+activations to 7 or 8 bits)); then GPT-2 and GPT-NeoX, 6-bit weights and 64-bit memory; and keeping the weights once
 instead of twice. The tasks are in [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself
