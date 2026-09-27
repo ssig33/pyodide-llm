@@ -347,7 +347,7 @@ def other_gguf(tensors, config):
         else:
             blob, held, type_ = np.ascontiguousarray(value, np.float32).tobytes(), value.astype(np.float32), 0
         if name is not None:  # back to the Hugging Face tensor these values stand for
-            if not neox and gguf.endswith(".weight") and gguf.split(".")[2] in CONV1D:
+            if not neox and gguf.startswith("blk.") and gguf.endswith(".weight") and gguf.split(".")[2] in CONV1D:
                 held = held.T
             if neox and ".attn_qkv." in gguf:
                 held = held.reshape(3, heads, dim // heads, -1).swapaxes(0, 1).reshape(held.shape)

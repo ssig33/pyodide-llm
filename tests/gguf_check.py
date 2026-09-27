@@ -460,8 +460,9 @@ def config_pairs(config, arch="llama"):
                  ("embedding_length", "hidden_size", config.get("hidden_size"), True),
                  ("feed_forward_length", "intermediate_size", config.get("intermediate_size"), True),
                  ("attention.head_count", "num_attention_heads", heads, True),
+                 # transformers' default where config.json says none
                  ("attention.layer_norm_epsilon", "layer_norm_eps",
-                  config.get("layer_norm_eps", config.get("layer_norm_epsilon")), True),
+                  config.get("layer_norm_eps", config.get("layer_norm_epsilon", 1e-5)), True),
                  ("context_length", "max_position_embeddings", config.get("max_position_embeddings"), False)]
         if arch == "gptneox":
             pairs += [("rope.dimension_count", "rotary_pct (as values)", rotary_dim(config), True),

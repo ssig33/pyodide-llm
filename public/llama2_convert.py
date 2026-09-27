@@ -1586,8 +1586,9 @@ def gguf_agrees(own, config):
         pairs.append(("size of a head", own["head_dim"], head_size(config)))
     if own.get("rms_norm_eps") is not None and config.get("rms_norm_eps") is not None:
         pairs.append(("RMSNorm epsilon", f32(own["rms_norm_eps"]), f32(config["rms_norm_eps"])))
-    layer_norm_eps = lambda c: c.get("layer_norm_eps", c.get("layer_norm_epsilon"))
-    if layer_norm_eps(own) is not None and layer_norm_eps(config) is not None:
+    if architecture(own) in ("gpt2", "neox"):
+        # transformers' default where config.json says none (the engine's LayerNorm takes 1e-5 whatever it says)
+        layer_norm_eps = lambda c: c.get("layer_norm_eps", c.get("layer_norm_epsilon", 1e-5))
         pairs.append(("LayerNorm epsilon", f32(layer_norm_eps(own)), f32(layer_norm_eps(config))))
     if architecture(own) == "neox" and architecture(config) == "neox":
         pairs += [("number of rotated values of a head", rotary_dim(own), rotary_dim(config)),
