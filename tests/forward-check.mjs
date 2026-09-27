@@ -188,6 +188,44 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   }
 }
 
+// T197's review: the ends of the relaxed path's integers, which the check above (weights of int6, from -128 to 124)
+// does not reach: rows of -128 and 127 against activations of 127 and 1 (quantize_x's ends with its bias of 64), in
+// matmul_q8r and in the tile, with int8_sums' corrections. The scales are powers of 2, so every group's dot(w, q - 64)
+// times them and their sum over the 5 groups are exact in float32 (at most 5 × 32 × 128 × 63 < 2^24): the kernels
+// must give the float64 sums exactly, whatever the order of their adds.
+{
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const env = { env: { memory } };
+  const k = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_plain.wasm`)), env).exports;
+  const relaxed = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_relaxed_plain.wasm`)), env).exports;
+  const I = new Int8Array(memory.buffer), F = new Float32Array(memory.buffer);
+  const rows = 8, groups = 5, n = groups * 32, frame = 1024, frameScales = 512, outFrame = 64;
+  const w = 1024, ws = w + rows * n, wc = ws + rows * groups * 4, frames = 4096, tiles = frames + 4 * frame, singles = tiles + 4 * outFrame;
+  let seed = 11;
+  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8;
+  const weight = [(j) => -128, (j) => 127, (j) => (j & 1 ? 127 : -128), (j) => (j & 31) < 16 ? -128 : 127];
+  for (let i = 0; i < rows; i++) for (let j = 0; j < n; j++) I[w + i * n + j] = i < 4 ? weight[i](j) : (next() & 255) - 128;
+  const activation = [(j) => 127, (j) => 1, (j) => (j & 1 ? 1 : 127), (j) => 1 + (next() % 127)];
+  for (let t = 0; t < 4; t++) {
+    for (let j = 0; j < n; j++) I[frames + t * frame + j] = activation[t](j);
+    for (let g = 0; g < groups; g++) F[(frames + t * frame + frameScales) / 4 + g] = 2 ** -(2 + t);
+  }
+  F.fill(2 ** -7, ws / 4, ws / 4 + rows * groups);
+  k.int8_sums(wc, w, rows * groups);
+  relaxed.matmul_q8r_tile(tiles, frames, frames + frameScales, w, ws, wc, n, 0, rows, 4, outFrame, frame);
+  for (let t = 0; t < 4; t++) relaxed.matmul_q8r(singles + t * outFrame, frames + t * frame, frames + t * frame + frameScales, w, ws, wc, n, 0, rows);
+  for (let t = 0; t < 4; t++) {
+    for (let i = 0; i < rows; i++) {
+      let want = 0;
+      for (let j = 0; j < n; j++) want += I[w + i * n + j] * (I[frames + t * frame + j] - 64) * 2 ** -7 * 2 ** -(2 + t);
+      for (const [name, at] of [["matmul_q8r", singles], ["matmul_q8r_tile", tiles]]) {
+        const got = F[(at + t * outFrame) / 4 + i];
+        if (got !== want) throw new Error(`${name} at the ends of int8: row ${i}, token ${t}: ${got} against ${want}`);
+      }
+    }
+  }
+}
+
 // T101: jobs.js says which arguments of each kernel are addresses (BigInt on a 64-bit memory): the same as the
 // usize parameters of the kernels' source, every exported one
 {
