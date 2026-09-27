@@ -280,7 +280,9 @@ class Tokenizer:
                 # Llama 3: a piece the vocabulary has is that one token, whatever the merges would make of it
                 tokens.append(self.text_index[word])
                 continue
-            symbols = list(word)
+            # a byte the vocabulary lacks (SmolLM2 has no piece for 21 of them: 0x04, 0xF1, ...) is left out, and its
+            # neighbours may then merge, as Hugging Face's BPE does without byte_fallback or an unk_token (T215)
+            symbols = [char for char in word if char in self.text_index]
             while len(symbols) > 1:
                 best_score, best_id, best_idx = self.UNMATCHABLE, -1, -1
                 for i in range(len(symbols) - 1):

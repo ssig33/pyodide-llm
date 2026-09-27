@@ -157,6 +157,50 @@ def test_pretokenizers_split_every_character_as_the_real_ones_do(name):
     assert not wrong, f"{name}: {len(wrong)} code points split otherwise than the real one: {shown}"
 
 
+# T215: SmolLM2's vocabulary has no piece for 21 bytes (0x04, 0x06, 0x13, 0x14, 0x16, 0x1D, 0xC0, 0xC1, 0xF1, 0xF2,
+# 0xF5 to 0xFF). Hugging Face's BPE, without byte_fallback or an unk_token, leaves such a byte out and merges its
+# neighbours as if it were not there; the engine stopped on a KeyError. These are some of SmolLM2's, and 'z', which the
+# corpus has: every piece and merge with one of them goes.
+LACKING = "\x04\x1d\xc0\xf1z"
+
+
+def lacking(pattern, digits, ignore_merges=False):
+    """The trained vocabulary without the pieces of LACKING's bytes, as a real tokenizer and a tokenizer.json."""
+    from llama2_numpy import BYTE_CHARS
+    gone = set(LACKING.encode("utf-8").decode("latin-1").translate(BYTE_CHARS))
+    _, spec = trained(pattern, digits)
+    model = spec["model"]
+    kept = [text for text, _ in sorted(model["vocab"].items(), key=lambda item: item[1]) if not gone & set(text)]
+    specials = len(spec["added_tokens"])  # the trainer puts the special tokens first
+    assert [token["id"] for token in spec["added_tokens"]] == list(range(specials))
+    model["vocab"] = {text: id for id, text in enumerate(kept)}
+    merges = [merge if isinstance(merge, list) else merge.split(" ") for merge in model["merges"]]
+    model["merges"] = [merge for merge in merges if not gone & set("".join(merge))]
+    model["ignore_merges"] = ignore_merges
+    assert not model.get("byte_fallback") and model.get("unk_token") is None
+    return tokenizers.Tokenizer.from_str(json.dumps(spec)), spec
+
+
+@pytest.mark.parametrize("name, pattern, digits, ignore_merges", [
+    ("gpt2", None, False, False), ("gpt2", None, False, True), ("gpt2-digits", None, True, False),
+    ("qwen", QWEN_PATTERN, False, False)])
+def test_leaves_out_the_bytes_the_vocabulary_lacks(name, pattern, digits, ignore_merges):
+    real, spec = lacking(pattern, digits, ignore_merges)
+    options = tokenizer_json_options(spec)
+    vocab_size = real.get_vocab_size()
+    mine = Tokenizer(tokenizer_bin(list(tokenizer_json_pieces(spec)), vocab_size), vocab_size,
+                     kind="bytebpe", pretokenizer=options["pretokenizer"], ignore_merges=options["ignore_merges"])
+    # each lacking character alone, between the letters of a word (whose neighbours then merge), at the ends of words
+    # and runs of them; U+40000 is 0xF1 0x80 0x80 0x80 (the vocabulary has 0x80), U+0400 is 0xD0 0x80 (it has both)
+    texts = [char for char in LACKING] + ["\U00040000", "\u0400"]
+    texts += [f"{a}{char}{b}" for char in LACKING + "\U00040000" for a, b in
+              (("Th", "e quick"), ("the", " end"), (" ", "dog"), ("1", "23"), ("it", "'s"), ("\n", "\n"), ("", ""))]
+    texts += [LACKING * 3, "lazy dog, lazzy, zz z", "The" + LACKING + "quick", "a\x04\x04b\x1d\x1dc"]
+    texts += [text[:k] + LACKING[k % len(LACKING)] + text[k:] for text in TEXTS for k in range(0, len(text) + 1, 3)]
+    wrong = [text for text in texts if mine.encode(text) != real.encode(text, add_special_tokens=False).ids]
+    assert not wrong, f"{len(wrong)} of {len(texts)} texts differ, as {wrong[0]!r}"
+
+
 def test_refuses_what_the_engine_cannot_split():
     with pytest.raises(ValueError, match="does not know"):
         tokenizer_json_options({"model": {"type": "BPE"}, "pre_tokenizer": {"type": "Whitespace"}})
