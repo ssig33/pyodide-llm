@@ -630,7 +630,7 @@ function weightsBuffer(size, header, options, keep) {
     // T205: a browser that does not say (Safari, Firefox) keeps a generation's steps (the classifier and the embedding
     // on the GPU as well) on the CPU: nor does it put a model on the GPU alone, whose steps are there
     const memoryUnsaid = self.navigator?.deviceMemory === undefined;
-    const onGpu = gpuOnlyWeightsFor(size, header, options, after, deviceMemory, memoryUnsaid);
+    const onGpu = gpuOnlyWeightsFor(size, header, options, after, deviceMemory);
     if (onGpu.mode === "gpu") return gpuOnlyBuffer(size, header, options, onGpu, keep);
     const gpuRoom = onGpu.gpuRoom;
     const wide = forceWide || forwardModule.needsWide(size, after);
@@ -673,14 +673,19 @@ function weightsBuffer(size, header, options, keep) {
   };
 }
 
+// T156: what a model on the GPU alone needs of this page and device, whatever the model (gpuOnlyUnfit has the rest): a
+// memory the device says (T205), the GPU's worker (not the benchmark's rounds), a shared memory and the 64-bit kernels,
+// the int8 kernels, an adapter that is no fallback (but for the tests), and no failure of the GPU under this model before
+// (cpuOnly). convert() asks it too before it opens a file to keep a conversion in as it comes (the review of T156)
+const gpuOnlyPossible = () => hasWebGpu && self.navigator?.deviceMemory !== undefined && !benchPage && !benching && sharedWanted() &&
+  Boolean(wideKernels?.shared) && !disabled.includes("int8") && !cpuOnly.has(loadingKey) &&
+  Boolean(gpuAdapter) && (!gpuAdapter.fallback || Boolean(gpuForce.fallback));
 // T156: where a model goes ({ mode: "both" | "gpu" | "cpu", gpuRoom }, forward.js's weightsPlace): the GPU alone only
-// for a Llama of int8 the GPU's steps take (gpuOnlyUnfit), on a page with shared memory and the GPU's worker (not the
-// benchmark's rounds), whose GPU did not fail on it alone before (cpuOnly)
-function gpuOnlyWeightsFor(size, header, options, after, deviceMemory, memoryUnsaid) {
+// for a Llama of int8 the GPU's steps take (gpuOnlyUnfit), where the page and the device may (gpuOnlyPossible)
+function gpuOnlyWeightsFor(size, header, options, after, deviceMemory) {
   const { dtype = "float32" } = options, form = { arch: options.arch, bias: options.bias, qk_norm: options.qk_norm, head_dim: options.head_dim };
   const cpu = size + after, gpu = forwardModule.gpuBytes(header, form);
-  const eligible = hasWebGpu && !memoryUnsaid && !benchPage && !benching && sharedWanted() && Boolean(wideKernels?.shared) && !disabled.includes("int8") && !cpuOnly.has(loadingKey) &&
-    !forwardModule.gpuOnlyUnfit(header, dtype, form, gpuAdapter, gpuForce);
+  const eligible = gpuOnlyPossible() && !forwardModule.gpuOnlyUnfit(header, dtype, form, gpuAdapter, gpuForce);
   if (!eligible) return forwardModule.weightsPlace({ cpu, gpu, deviceMemory });
   const tensors = placesOf(header, dtype, form), stored = size - forwardModule.layerHoles(tensors).reduce((sum, [a, b]) => sum + b - a, 0);
   const gpuOnly = stored + afterCheckpoint(header, stored, { ...options, direct: true }, true);
@@ -1051,8 +1056,8 @@ async function convert(model, signal, id) {
   let first, size, base, conversion, shards;
   // T156: a model that goes on the GPU alone is kept as it comes (nothing holds its weights whole afterwards): a file
   // opened for its int8 conversion where it may (the choice is the sink's, once the header is known), let go otherwise
-  const mayKeep = remote && hasWebGpu && gpuAdapter && (model.conversion?.dtype ?? "int8") === "int8";
-  const keep = mayKeep ? await keptModule.keeper({ ...model, conversion: { ...model.conversion, dtype: "int8" } }).catch(() => undefined) : undefined;
+  const mayKeep = remote && gpuOnlyPossible() && (model.conversion?.dtype ?? "int8") === "int8";
+  let keep = mayKeep ? await keptModule.keeper({ ...model, conversion: { ...model.conversion, dtype: "int8" } }).catch(() => undefined) : undefined;
   const into = checkpointSink(keep), { sink } = into;
   let keptAsItCame = false;  // keep went to keepConverted, which keeps it or lets it go
   // T115: no bits asked for (weightsFor() in src/models.js asks for six only where the device says it has too little
@@ -1271,6 +1276,13 @@ async function convert(model, signal, id) {
       await weightsDrained();  // (T156)
       llama = into.weights.llama(proxies[1], { kernels, disable: disabled, ...engineOptions, ...model.options });
       loadSeconds.construct = since(constructStarted);
+      // (the review of T156: a model not on the GPU alone is kept from its memory, as before (keep()): the file opened
+      // for it as it came goes first. Its open handle refused keep()'s, and its drop() in the finally below removed what
+      // keep() wrote: every conversion of a browser with a GPU adapter was kept no more, run 36344754761)
+      if (keep && !into.weights.direct) {
+        await keep.drop();
+        keep = undefined;
+      }
       if (remote) {
         postMessage({ type: "status", load: id, text: `${model.name}: keeping the converted model...` });
         keptAsItCame = Boolean(into.weights.direct && keep);
