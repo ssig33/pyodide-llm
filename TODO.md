@@ -540,6 +540,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
   - should 4: 完了条件を 2.3 ms に（上の式。持ち主の判断）。
   - should 5: `tests/bench-check.mjs` が層の検査ごとに 1 行（`check a layer, …: ok, stream …, cache …; qkv: scales …, n of m values off by 1; …; against the norms apart: scales n ulp, n values off by 1, stream …, bit for bit`）と `tokens on the GPU` の層の名前を出す（`preview.yml` のログで読む）。
   - **確かめ（直した後、lavapipe の幅 4、`.tmp/t175/mutate.py`）**: 壊していない写しは 8 つとも ok（`sameAsNormsApart` はビット単位で同じ、0 ulp）。packed を無いことにした写しは llama.cpp の 6 行（norm を別にした行を含む）と T150 の層のトークンが ok。RMSNORM と NORM_QUANTIZE の両方で平均を n−1 で割ると DP4A の 3 つの形が落ちる（norm の場所のスケールの線。流れは 1.9e-7 で合ったまま、llama.cpp の土台の形は通る: 上の should 1 の抜け）。NORM_QUANTIZE だけで n−1 にすると DP4A の融合が落ちる（norms apart とスケール 227300 ulp、±1 の違い 437、流れ 1.2e-2）。`node tests/bench.mjs`、build。
+  - **CI**: ブランチの `preview.yml`（36309492272、SwiftShader、3.6 分）で節が全部 ok。ログの行: DP4A の 3 つの形は流れ 2.2e-7、量子化のスケールの差 qkv 1.1e-7・o 8.3e-7・ffn 4.0e-7・down 4.9e-7、±1 の違い 0。融合と norm を別にした形は 0 ulp・±1 の違い 0・ビット単位で同じ。tokens on the GPU は DP4A の融合で 12 トークン ok。llama.cpp の 4 つは流れ 3.3e-7〜6.1e-7。
   - should 6: `generate` と生成の検査は、同じ Worker の `checkLayer` で「DP4A, fused (T175)」が ok のときだけ DP4A の層を使い、それ以外（検査が走っていない、WRONG、packed が無い）は T150 の融合（`tokenForm()`）。
 - **T152 への申し送り**: (l) 生成は `tokenForm()` の層で。量子化のベクトルは 1 組で足りる（各量子化は次の量子化の前に読まれる）。(m) 分類器の前にも `NORM_QUANTIZE`。(n) T151 の申し送り (a) の 1 トークンの attention（flashTile の Q_TILE の 3/4 が空き）はそのまま。
 
