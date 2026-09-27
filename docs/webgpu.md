@@ -113,7 +113,9 @@ say only that the shaders are right, not how fast a GPU is.
 
 In order: keeping the weights once instead of twice. A seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
-activations to 7 or 8 bits), and whose random numbers are drawn 4 at a time on the GPU. The tasks are in
+activations to 7 or 8 bits). Either side takes the same random number for the same token; but every 8 answers, the
+first tokens of one go to the side not chosen, so that answer may differ from an earlier one with the same seed. The
+tasks are in
 [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself

@@ -1033,6 +1033,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
           tokensReason = data.tokensWhy;
           tokenStatus = `tokens on the CPU (${tokensReason})`;
           console.info(`gpu: tokens on the CPU (${tokensReason})`);
+        } else if (tokensReason) {
+          // (T152's review: a model whose steps were not asked of the GPU says why too, in the console)
+          console.info(`gpu: tokens on the CPU (${tokensReason})`);
         }
         settleGpu?.(gpuForce.always ? "prompts on WebGPU" : "prompts on WebGPU where it is faster than the CPU");
       } else if (data.type === "unusable") {
@@ -1316,16 +1319,17 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
      * the next (the penalty over the last of history, whose length is length; temperature, topp; randoms: a number for
      * each step, the CPU's generator's, none where greedy; stops: the stop tokens). Returns the ids sampled (a stop
      * token last where one came), whose keys and values are in the cache then as the CPU would have written them; or
-     * null where the GPU did not take them (the CPU takes the step instead: nothing of it was written) */
+     * undefined where the GPU did not take them (the CPU takes the step instead: nothing of it was written). Not null:
+     * Pyodide makes JavaScript's null jsnull, which is not None (T152's review), and undefined None */
     generateMany(token, pos, history, length, count, temperature, topp, penalty, randoms, stops) {
       const list = (x) => (x?.toJs ? x.toJs() : [...(x ?? [])]);
-      if (!gpuSteps() || count < 1 || count > GPU_TOKENS) return null;
+      if (!gpuSteps() || count < 1 || count > GPU_TOKENS) return undefined;
       const stopList = list(stops);
       if (stopList.length > STOPS_MOST) {
         tokensOn = false;
         tokensReason = `more than ${STOPS_MOST} stop tokens`;
         tokenStatus = `tokens on the CPU (${tokensReason})`;
-        return null;
+        return undefined;
       }
       const began = performance.now();
       if (pos + count - 1 >= capacity) grow(pos + count - 1);
@@ -1336,17 +1340,17 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         cache: { keys, values, capacity, row: KV }, settings: { temperature, topp, penalty, stops: stopList }, randoms: list(randoms) });
       if (!waitUntil(GPU_DONE, (seen) => seen === gpuSerial, GPU_BEAT)) {
         stopGpu(`the GPU's worker stopped answering for ${stalledMs / 1000} s`);
-        return null;
+        return undefined;
       }
       if (Atomics.load(ctl, GPU_FAILED)) {
         stopGpu("the GPU failed on a token");  // the GPU's worker said why in the console
-        return null;
+        return undefined;
       }
       views();
       const words = new Int32Array(memory.buffer, gpuIds, 1 + count), sampled = words[0];
       if (!(sampled >= 1 && sampled <= count)) {
         stopGpu(`the GPU sampled ${sampled} of ${count} tokens`);
-        return null;
+        return undefined;
       }
       gpuEnd = pos + sampled;
       gpuSampled += sampled;
