@@ -22,8 +22,9 @@ jobs:
           - { small: hf-qwen2.5-0.5b-instruct, large: hf-qwen2.5-1.5b-instruct, language: en }
           - { small: hf-qwen2.5-0.5b-instruct, large: hf-qwen2.5-1.5b-instruct, language: ja }
           - { small: hf-smollm2-135m-instruct, large: hf-smollm2-360m-instruct, language: en }
-          - { small: hf-pythia-70m, large: hf-pythia-410m, language: en }
-          - { small: hf-pythia-70m, large: hf-pythia-1b, language: en }
+          # T136's third stage: the list takes the Pythias' weights from GGUFs too; the originals it is
+          - { small: 'hf:EleutherAI/pythia-70m-deduped@e93a9faa9c77e5d09219f6c868bfc7a1bd65593c', large: 'hf:EleutherAI/pythia-410m@9879c9b5f8bea9051dcb0e68dff21493d67e9d4f', language: en }
+          - { small: 'hf:EleutherAI/pythia-70m-deduped@e93a9faa9c77e5d09219f6c868bfc7a1bd65593c', large: 'hf:EleutherAI/pythia-1b@f73d7dcc545c8bd326d8559c8ef84ffe92fea6b2', language: en }
     steps:
       - name: Checkout
         uses: actions/checkout@v7
