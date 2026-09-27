@@ -81,10 +81,13 @@ const COUNT = 150, KV_START = 8;
 // few E16 away, whatever the CPU's forward.js does (a line of a quarter of the CPU's error loosened the made-up models'
 // lines 1.3 to 10 times, and a GPU that used layer 0's biases in every layer passed: T153's review). So every layer of
 // a float32 or f16 form is held to the shader's line or K × E16, whichever is larger, and the first layer to the
-// shader's line alone; K: see TODO.md's T153 for the numbers they come from. The packed shaders stay on their ratio to
-// the CPU's (their 8-bit activations are some 20 to 50 E16 away: E16 is not their measure; T147's weakness, TODO.md)
+// shader's line alone. K (CI's Dawn on lavapipe, run 36308518805, 149 tokens): the float32 shaders are 0.9 to 1.6 E16
+// away (Qwen3 0.6B the most), llama.cpp's f16 0.9 to 3.2 and 5.5 (Qwen3 0.6B with the f16 attention), while a GPU that
+// reads layer 0's biases in every layer (synthetic-qwen2) is 13.9 E16 away on float32 and 14.4 on f16: K is 4 and 8.
+// The packed shaders stay on their ratio to the CPU's (their 8-bit activations are 19 to 47 E16 away: E16 is not
+// their measure; T147's weakness, TODO.md)
 const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2, PACKED_LINE = 0.75;
-const K = { float32: 4, f16: 12 };
+const K = { float32: 4, f16: 8 };
 // The logits of the prompt's last token, the largest difference from NumPy's over the largest of NumPy's: the CPU's
 // own run 1.6e-2 to 5.6e-2, the one on the GPU's keys and values 0.75 to 1.04 times that (closer: its keys and values
 // are NumPy's but for the float16); broken on purpose 0.27 to 1.13, 4.8 times the CPU's and more. The line: no more
