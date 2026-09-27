@@ -11,13 +11,17 @@ on:
         description: 'more shell commands to run after the tests (optional), e.g. node tests/profile.mjs --from 4000'
         required: false
         default: ''
+      runner:
+        description: 'the runner (optional), e.g. ubuntu-24.04-arm for arm64 (T166: a kernel measured where it matters)'
+        required: false
+        default: 'ubuntu-latest'
 
 permissions:
   contents: read
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - name: Checkout

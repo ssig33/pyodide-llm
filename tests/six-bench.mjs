@@ -1,0 +1,131 @@
+// T166: the int6 matrix products (matmul_q6r with relaxed SIMD, matmul_q6 without) with the widening of main's
+// kernels/six.ts, this tree's, and the candidate forms below, in one process, taking turns (AGENTS.md: the old and the
+// new side by side), with matmul_q8r (int8) for the ratio T98 wrote down (0.45). Every form's output must be main's
+// to the bit. Compiles each form with AssemblyScript into .tmp/six-bench/ (needs `npm ci`; `make kernels` not).
+//
+//   node tests/six-bench.mjs [--rounds 3] [--turns 7]
+//
+// Two sizes: 8192 x 8192 (the weights far past the caches: 48 MiB of int6) and 256 x 1024 (in the caches, called
+// over and over). GB/s counts the bytes a row reads: 24 a group of int6 (32 of int8), and its float32 scale (and the
+// correction, relaxed).
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..") + "/";
+const args = process.argv.slice(2);
+const option = (name, value) => (args.includes(name) ? Number(args[args.indexOf(name) + 1]) : value);
+const rounds = option("--rounds", 3), turns = option("--turns", 7);
+const work = root + ".tmp/six-bench/";
+
+// The candidates (T166). "and-or": no bitselect (the form of llama.cpp's Q6_K on arm64, vandq + vshlq + vorrq; x86
+// makes a bitselect three instructions). "two-mul": the first half's top put at bits 6-7 by a second multiply, not
+// a shift (on Neoverse N1 the shifts take one pipe and the multiplies the other).
+const header = "// @ts-ignore: decorator\n@inline export function";
+const candidates = {
+  "and-or": `
+${header} sixTops(p: usize): v128 { return i16x8.mul(v128.load64_splat(p + 16), i16x8(4, 4, 4, 4, 1, 1, 1, 1)); }
+${header} sixFirst(low: v128, t: v128): v128 {
+  return v128.or(v128.and(i16x8.shl(t, 4), i8x16.splat(-64)), v128.and(i16x8.shl(low, 2), i8x16.splat(60)));
+}
+${header} sixSecond(low: v128, t: v128): v128 {
+  return v128.or(v128.and(t, i8x16.splat(-64)), v128.and(i16x8.shr_u(low, 2), i8x16.splat(60)));
+}`,
+  "two-mul": `
+${header} sixTops(p: usize): v128 { return v128.load64_splat(p + 16); }
+${header} sixFirst(low: v128, h: v128): v128 {
+  return v128.bitselect(i16x8.mul(h, i16x8(64, 64, 64, 64, 16, 16, 16, 16)), i8x16.shl(low, 2), i8x16.splat(-64));
+}
+${header} sixSecond(low: v128, h: v128): v128 {
+  return v128.bitselect(i16x8.mul(h, i16x8(4, 4, 4, 4, 1, 1, 1, 1)), v128.and(i16x8.shr_u(low, 2), i8x16.splat(60)), i8x16.splat(-64));
+}`,
+};
+
+// main's kernels (CI checks out one commit: fetch main's)
+try { execFileSync("git", ["fetch", "--depth=1", "origin", "+main:refs/remotes/origin/main"], { cwd: root, stdio: "inherit" }); } catch {}
+const forms = { main: {}, tree: {} };
+for (const file of ["kernel.ts", "kernel_relaxed.ts", "six.ts"]) {
+  forms.main[file] = execFileSync("git", ["show", `origin/main:kernels/${file}`], { cwd: root, encoding: "utf8" });
+  forms.tree[file] = fs.readFileSync(`${root}kernels/${file}`, "utf8");
+}
+for (const [name, six] of Object.entries(candidates)) forms[name] = { ...forms.tree, "six.ts": six };
+
+const asc = ["asc", "-O3", "--noAssert", "--runtime", "stub", "--importMemory", "--noExportMemory", "--initialMemory", "1"];
+const memory = new WebAssembly.Memory({ initial: 1, maximum: 4096 });
+const kernels = {};
+for (const [name, files] of Object.entries(forms)) {
+  const dir = `${work}${name}/`;
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [file, text] of Object.entries(files)) fs.writeFileSync(dir + file, text);
+  execFileSync("npx", [...asc, dir + "kernel.ts", "-o", dir + "plain.wasm", "--enable", "simd"], { cwd: root, stdio: "inherit" });
+  execFileSync("npx", [...asc, dir + "kernel_relaxed.ts", "-o", dir + "relaxed.wasm", "--enable", "simd,relaxed-simd"], { cwd: root, stdio: "inherit" });
+  const instance = (file) => new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(dir + file)), { env: { memory } }).exports;
+  kernels[name] = { plain: instance("plain.wasm"), relaxed: instance("relaxed.wasm") };
+}
+
+const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+for (const [rows, n, calls] of [[8192, 8192, 1], [256, 1024, 200]]) {
+  const ng = n / 32;
+  let top = 65536;
+  const take = (bytes) => { const at = top; top += Math.ceil(bytes / 64) * 64; return at; };
+  const w6 = take(rows * ng * 24), w8 = take(rows * n), ws = take(rows * ng * 4), wc6 = take(rows * ng * 4), wc8 = take(rows * ng * 4);
+  const x = take(n), xs = take(ng * 4), out = take(rows * 4), expected = take(rows * 4);
+  if (top > memory.buffer.byteLength) memory.grow(Math.ceil((top - memory.buffer.byteLength) / 65536));
+  const U = new Uint8Array(memory.buffer), I = new Int8Array(memory.buffer), F = new Float32Array(memory.buffer);
+  let seed = 11;
+  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8;
+  for (let i = 0; i < rows * ng * 24; i++) U[w6 + i] = next() & 255;
+  for (let i = 0; i < rows * ng; i++) F[ws / 4 + i] = Math.fround(1e-3 * (1 + (next() % 1000)));
+  for (let g = 0; g < ng; g++) F[xs / 4 + g] = Math.fround(1e-2 * (1 + (next() % 1000)));
+  for (let j = 0; j < n; j++) I[x + j] = next() % 128;
+  const { plain, relaxed } = kernels.main;
+  plain.six_sums(wc6, w6, ws, rows * ng);
+  for (let g = 0; g < rows * ng; g++) {  // the int8 values of main's widening, for matmul_q8r
+    for (let j = 0; j < 32; j++) {
+      const at = w6 + g * 24, low = j < 16 ? U[at + j] & 15 : U[at + j - 16] >> 4, t = (U[at + 16 + (j % 8)] >> (2 * ((j / 8) | 0))) & 3;
+      I[w8 + g * 32 + j] = (((low | (t << 4)) << 2) << 24) >> 24;
+    }
+  }
+  plain.int8_sums(wc8, w8, ws, rows * ng);
+  const runs = {
+    q6r: (k) => k.relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, n, 0, rows),
+    q6: (k) => k.plain.matmul_q6(out, x, xs, w6, ws, n, 0, rows),
+  };
+  const bytes = { q6r: rows * ng * 32, q6: rows * ng * 28, q8r: rows * ng * 40 };
+  // each form's output against main's, to the bit
+  for (const [kernel, run] of Object.entries(runs)) {
+    run(kernels.main);
+    F.copyWithin(expected / 4, out / 4, out / 4 + rows);
+    for (const [name, k] of Object.entries(kernels)) {
+      F.fill(0, out / 4, out / 4 + rows);
+      run(k);
+      for (let i = 0; i < rows; i++) if (F[out / 4 + i] !== F[expected / 4 + i]) throw new Error(`${name}'s ${kernel} differs from main's at row ${i}`);
+    }
+  }
+  relaxed.matmul_q8r(expected, x, xs, w8, ws, wc8, n, 0, rows);
+  relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, n, 0, rows);
+  for (let i = 0; i < rows; i++) if (F[out / 4 + i] !== F[expected / 4 + i]) throw new Error(`matmul_q6r differs from matmul_q8r at row ${i}`);
+  console.log(`${rows} x ${n}: every form's output is main's to the bit (and matmul_q6r is matmul_q8r's on the widened values)`);
+  runs.q8r = (k) => k.relaxed.matmul_q8r(out, x, xs, w8, ws, wc8, n, 0, rows);
+  const time = (run, k) => { const t0 = performance.now(); for (let c = 0; c < calls; c++) run(k); return (performance.now() - t0) / calls; };
+  for (let r = 0; r < rounds; r++) {
+    const ms = {};
+    for (let t = 0; t < turns; t++) {
+      for (const [name, k] of Object.entries(kernels)) {
+        for (const kernel of ["q6r", "q6"]) (ms[`${kernel} ${name}`] ??= []).push(time(runs[kernel], k));
+      }
+      (ms["q8r tree"] ??= []).push(time(runs.q8r, kernels.tree));
+    }
+    const line = [];
+    for (const kernel of ["q6r", "q6"]) {
+      const base = median(ms[`${kernel} main`]);
+      for (const name of Object.keys(kernels)) {
+        const m = median(ms[`${kernel} ${name}`]);
+        line.push(`${kernel} ${name} ${(bytes[kernel] / m / 1e6).toFixed(2)} GB/s ${(base / m).toFixed(2)}x`);
+      }
+    }
+    const q8r = median(ms["q8r tree"]);
+    line.push(`q8r ${(bytes.q8r / q8r / 1e6).toFixed(2)} GB/s; q6r against q8r (the time of a row): main ${(q8r / median(ms["q6r main"])).toFixed(2)}, tree ${(q8r / median(ms["q6r tree"])).toFixed(2)}`);
+    console.log(`${rows} x ${n}, round ${r + 1}: ${line.join(" | ")}`);
+  }
+}

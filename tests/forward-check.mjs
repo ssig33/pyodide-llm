@@ -107,6 +107,20 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
     const expected = reference(weight);
     for (let i = 0; i < rows; i++) if (F[out / 4 + i] !== expected[i]) throw new Error(`${name} differs at row ${i}: ${F[out / 4 + i]} against ${expected[i]}`);
   }
+  // T166: matmul_q6r (relaxed SIMD) to the bit against matmul_q8r on the int8 values six() takes apart here (the two
+  // add their products in the same order), the activations 0..127 as quantize_x(bias = 64) gives them, and the
+  // corrections from six_sums and int8_sums
+  const relaxed = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_relaxed_plain.wasm`)), { env: { memory } }).exports;
+  const w8 = out + rows * 4, wc6 = w8 + rows * n, wc8 = wc6 + rows * ng * 4, out8 = wc8 + rows * ng * 4;
+  for (let i = 0; i < rows; i++) for (let j = 0; j < n; j++) I[w8 + i * n + j] = six(i, j);
+  for (let j = 0; j < n; j++) I[x + j] = next() % 128;
+  k.six_sums(wc6, w6, ws, rows * ng);
+  k.int8_sums(wc8, w8, ws, rows * ng);
+  relaxed.matmul_q6r(out, x, xs, w6, ws, wc6, n, 0, rows);
+  relaxed.matmul_q8r(out8, x, xs, w8, ws, wc8, n, 0, rows);
+  for (let i = 0; i < rows; i++) {
+    if (F[out / 4 + i] !== F[out8 / 4 + i]) throw new Error(`matmul_q6r differs at row ${i}: ${F[out / 4 + i]} against matmul_q8r's ${F[out8 / 4 + i]}`);
+  }
 }
 
 // T101: jobs.js says which arguments of each kernel are addresses (BigInt on a 64-bit memory): the same as the
