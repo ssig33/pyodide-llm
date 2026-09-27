@@ -1,12 +1,28 @@
 name: Tests
 
-# T188: the tests the deploy runs, and the threads' check, on any branch (--ref), without deploying: the development
-# machine (an ARM box of 2 cores, shared) runs none of them any more (the owner, 2026-09-27: "いったん、テスト CI
-# だけにしねぇか？"). `extra` runs more commands after them, for a branch's own measurements (the same process takes
-# the old and the new, as AGENTS.md says).
+# T188: the tests the deploy runs, and more, on any branch (--ref), without deploying: the development machine (an ARM
+# box of 2 cores, shared) runs none of them any more (the owner, 2026-09-27: "いったん、テスト CI だけにしねぇか？").
+# `extra` runs more commands after them, for a branch's own measurements (the same process takes the old and the new,
+# as AGENTS.md says).
+#
+# T193 (the owner, 2026-09-27: "たまーにフルテストする感じでコミットたくさんあるときは軽くしたい"): by default the light
+# suite, the very steps the deploy runs (tests/suite.sh light: pytest, the page's modules, smoke; then the build).
+# full=true, and the nightly schedule on main, run the full one (tests/suite.sh full: and forward-check shared, --plain
+# and --wide, gpu-default-check, threads-check). An empty full= is the default, light (a dispatch fills an empty input
+# with its default: T192).
+#
+#   node tests/ci.mjs run tests.yml [full=true] [extra="node tests/profile.mjs"] [runner=ubuntu-24.04-arm] --ref <branch>
 on:
+  schedule:
+    # every night at 03:17 in Japan (18:17 UTC; off the hour, when GitHub's schedules crowd), the full suite on main
+    - cron: '17 18 * * *'
   workflow_dispatch:
     inputs:
+      full:
+        description: 'T193: the full suite (forward-check, gpu-default-check, threads-check too), not only the light one the deploy runs'
+        type: boolean
+        required: false
+        default: false
       extra:
         description: 'more shell commands to run after the tests (optional), e.g. node tests/profile.mjs --from 4000'
         required: false
@@ -21,6 +37,7 @@ permissions:
 
 jobs:
   tests:
+    name: tests (${{ (github.event_name == 'schedule' || inputs.full == true || inputs.full == 'true') && 'full' || 'light' }})
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
@@ -44,32 +61,13 @@ jobs:
           npm ci
           make models kernels
 
-      - name: Unit tests of the engine
-        run: python -m pytest tests -q
-
-      - name: Unit tests of the page's modules
+      - name: Tests (tests/suite.sh)
+        env:
+          SUITE: ${{ (github.event_name == 'schedule' || inputs.full == true || inputs.full == 'true') && 'full' || 'light' }}
+          WHY: ${{ github.event_name }}
         run: |
-          node tests/bench.mjs
-          node tests/page-memory.mjs
-          node tests/summary-check.mjs
-          node tests/models-check.mjs
-          node tests/ladder-check.mjs
-          node tests/kept-check.mjs
-          node tests/coi-js-check.mjs
-          node tests/gpu-choice-check.mjs
-          node tests/worker-sink-check.mjs
-
-      - name: Smoke test with the latest Pyodide
-        run: |
-          npm install --no-save pyodide@latest
-          node tests/smoke.mjs
-          node tests/forward-check.mjs --rounds 1 --positions 128
-          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --plain
-          node tests/gpu-default-check.mjs
-          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --wide
-
-      - name: The software threads
-        run: node tests/threads-check.mjs
+          echo "suite: $SUITE, by $WHY, $(node -p 'require("os").cpus()[0].model')"
+          bash tests/suite.sh "$SUITE"
 
       - name: Build the site
         run: npm run build

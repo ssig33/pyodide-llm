@@ -6,6 +6,8 @@
 //
 //   node tests/ci.mjs run <workflow file> [input=value ...] [+ <workflow file> [input=value ...] ...]
 //   node tests/ci.mjs wait <run id> [<run id> ...]
+//   node tests/ci.mjs nightly                      T193: the latest nightly (scheduled) runs of the full suites,
+//                                                  tests.yml and gpu-prompt.yml, waited for or read by their IDs
 //   node tests/ci.mjs deploy [--sha <commit>]      the deploy of a commit (HEAD); if a newer push cancelled it while
 //                                                  it waited for its turn, the newer deploy (which has the commit too)
 //   options: [--minutes 60 (deploy: 20)] [--grep <regex> | --grep none] [--ref main]
@@ -106,10 +108,16 @@ const LINES = {
   "bench.yml": "^### (chromium|firefox|webkit|chrome|msedge)$|^sections:|^model path:|WRONG|^failed:",
   "browsers.yml": "ready in|FAILED|timed out",
   "preview.yml": "^sections:|^model path:|FAILED|timed out",
+  // T193: which suite ran, and the seconds of each of its parts (tests/suite.sh)
+  "tests.yml": "^suite: |^--- .*: \\d+ s$",
+  "deploy.yml": "^suite: |^--- .*: \\d+ s$",
   // T183: gpu-check's lines of each model and run, its tables by layer (against NumPy's and E16), each run's line and
   // ratio, and the seconds of each step
-  "gpu-prompt.yml": "^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\| (layer|all|\\d)|^\\|---|^ *- |^seconds of |FAILED",
+  "gpu-prompt.yml": "^suite: |^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\| (layer|all|\\d)|^\\|---|^ *- |^seconds of |FAILED",
 };
+
+// T193: the workflows whose full suites run every night
+const NIGHTLY = ["tests.yml", "gpu-prompt.yml"];
 
 async function start([workflow, ...pairs]) {
   const fields = ["-f", `ref=${ref}`];
@@ -218,6 +226,17 @@ try {
     for (const spec of specs.filter((s) => s.length)) targets.push({ id: await start(spec) });
   } else if (command === "wait" && rest.length && rest.every((word) => /^\d+$/.test(word))) {
     targets.push(...rest.map((word) => ({ id: Number(word) })));
+  } else if (command === "nightly") {
+    // T193: the full suites run every night on main; the latest scheduled run of each, then by its ID as always
+    for (const workflow of NIGHTLY) {
+      const { workflow_runs: runs } = await api(`repos/{owner}/{repo}/actions/workflows/${workflow}/runs?event=schedule&per_page=1`);
+      if (!runs.length) say(`no nightly run of ${workflow} yet`);
+      else {
+        say(`the nightly ${workflow} of ${runs[0].created_at}: run ${runs[0].id} ${runs[0].html_url}`);
+        targets.push({ id: runs[0].id });
+      }
+    }
+    if (!targets.length) process.exit(3);
   } else if (command === "deploy") {
     const id = await deployOf(sha);
     if (!id) {
@@ -226,7 +245,7 @@ try {
     }
     targets.push({ id, deploy: true });
   } else {
-    console.error("usage: node tests/ci.mjs run <workflow> [input=value ...] [+ ...] | wait <run id> ... | deploy [--sha <commit>]" +
+    console.error("usage: node tests/ci.mjs run <workflow> [input=value ...] [+ ...] | wait <run id> ... | nightly | deploy [--sha <commit>]" +
       "  [--minutes N] [--grep <regex> | none] [--ref main]");
     process.exit(3);
   }

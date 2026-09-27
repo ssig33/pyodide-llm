@@ -2,7 +2,7 @@
 // a real browser, as WebGPU is nowhere else: Playwright's Chromium, whose WebGPU without a GPU is SwiftShader (the CPU
 // in the GPU's place: its speed means nothing, its numbers are right or not).
 //
-//   node tests/gpu-check.mjs [model id | synthetic ...] [--engine chromium|chrome|msedge] [--forms <part,part>]
+//   node tests/gpu-check.mjs [model id | synthetic | made-up ...] [--engine chromium|chrome|msedge] [--forms <part,part>]
 //   node tests/gpu-check.mjs ... --engine dawn --webgpu <the npm package webgpu's directory>
 //
 // T147: --engine dawn runs the same in Node on Dawn (the npm package webgpu, not a dependency of this project: install
@@ -68,8 +68,6 @@ const engine = option("--engine", "chromium");
 // T147: --forms <part,part>: only the matrices' shaders whose names hold one of these (all of them by default)
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
-const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "synthetic-gpt2", "synthetic-neox", "synthetic-neox-256",
-  "synthetic-6bit", "synthetic-wide", "stories15M", "tiny-lm", "llm-jp-3-150m"];
 // T153: the made-up models of another form (see above). Three layers: a layer's vectors are read at l × their size,
 // which a second layer alone would not tell from 0 + size
 const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias: true }, { bias: true, rms_norm_eps: 1e-6 }],
@@ -80,6 +78,10 @@ const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias
   // T155: [form, options, the run's: the GPU's pieces, a 64-bit memory]
   "synthetic-6bit": [{ dim: 128, hidden: 320, layers: 3, six: true }, { dtype: "int6" }, { force: { pieceBytes: 20480 } }],
   "synthetic-wide": [{ dim: 128, hidden: 320, layers: 3 }, {}, { force: { pieceBytes: 20480 }, wide: true }] };
+// the models to check: by default every made-up one and the site's three; "made-up" stands for every made-up one (T193:
+// gpu-prompt.yml's suites name them so, and a made-up model added above joins them)
+const ids = (args.length ? args : ["made-up", "stories15M", "tiny-lm", "llm-jp-3-150m"])
+  .flatMap((id) => (id === "made-up" ? Object.keys(SYNTHETIC) : [id]));
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on

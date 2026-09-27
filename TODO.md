@@ -888,12 +888,12 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 
 ### T194 [計測] `/benchmark/` の実行中に画面を消さない — 状態: 未着手（2026-09-27、T190 のレビューの「あれば良い」から。規模 小）
 - スマホで数分かかる計測は、画面が消えるとブラウザが裏に回して遅くなるか止まる。走っている間は Screen Wake Lock（`navigator.wakeLock.request("screen")`）を頼み、無いブラウザや断られたときは何もしない。ページが見えなくなった秒を数え、報告の頭に「hidden for N s」と書く（0 なら書かない）。T173 の Page memory の節は隠れたら止まるので、その扱いは今のまま。
-
-### T193 [運用] CI はふだん軽く、ときどき全部 — 状態: 未着手（2026-09-27、持ち主「たまーにフルテストする感じでコミットたくさんあるときは軽くしたいけどなぁ」。規模 小）
+### T193 [運用] CI はふだん軽く、ときどき全部 — 状態: 進行中（ブランチ `t193-light-ci`。2026-09-27、持ち主「たまーにフルテストする感じでコミットたくさんあるときは軽くしたいけどなぁ」。規模 小）
 - 見たもの（GitHub の記録、成功した回の中央値）: デプロイ 3.2 分（9/26）→ 5.4 分（9/27 午後）、gpu-prompt.yml 3.5 → 10.7 分、tests.yml 4.8 分。
 - 作るもの: (1) デプロイの前の試験を軽い組にする（壊れたページを出さないのに要るものだけ: pytest・ページの単体・smoke・build）。forward-check・gpu-default-check・threads-check などの重いものは tests.yml へ。(2) tests.yml と gpu-prompt.yml に 1 日 1 回の schedule で全部の組（今の全部）。(3) gpu-prompt.yml の既定は速い組（作り物だけ）にして、`full=true` の入力で今の全部の組。(4) 全部の組が落ちたら分かる形（run の失敗が GitHub の通知に出る。`tests/ci.mjs` でも読める）。
 - 決まり: 本線に push したコミットがデプロイで確かめられないものは、次の全部の組で確かめる。WebGPU と速さの判断は今までどおり、その変更のブランチで全部の組を回す（T183）。
 - 完了条件: 軽い組のデプロイが 9/26 の 3 分台に戻り、全部の組が 1 日 1 回走る。
+- **実装（2026-09-27、Opus medium、ブランチ `t193-light-ci`）**: (1) `tests/suite.sh light|full` にデプロイと tests.yml の試験を 1 か所に（light: pytest・ページの単体 9 つ（page-memory.mjs もデプロイに入った）・最新 Pyodide の smoke。full: それに forward-check の共有・`--plain`・`--wide`、gpu-default-check、threads-check）。deploy.yml は `light` だけ、tests.yml は既定 `light`・`full=true` と毎晩で `full`。**deploy.yml は main でしか走らない**ので、ブランチの確かめは tests.yml の軽い組（同じ `suite.sh light`、build も同じ）で見る。deploy の concurrency は `cancel-in-progress: false` のまま。(2) schedule は tests.yml が日本の 03:17（`17 18 * * *` UTC）、gpu-prompt.yml が 03:47（時ちょうどは GitHub の schedule が混む）。(3) gpu-prompt.yml の入力 `full`（boolean、既定 false）: 軽い組は Chromium だけで `synthetic`、Dawn で作り物の全部。全部の組は Chromium・Chrome・Edge で作り物の全部、Dawn で作り物の全部とサイトの 3 つ（今までの Dawn の既定）。`models=`・`real=` はどちらの組でもモデルを決め、`full` はブラウザだけを決める。gpu-check に `made-up`（作り物の全部、`SYNTHETIC` の鍵から）を足した。(4) 各ジョブの頭に `suite: <組>, by <event>…` の 1 行、suite.sh は部分ごとに `--- <名前>: N s`。`tests/ci.mjs` の既定の `--grep` に tests.yml・deploy.yml の行と gpu-prompt.yml の `suite:` を足し、`node tests/ci.mjs nightly` で最新の毎晩の run を ID で待つか読む。**空の `full=`**: dispatch は空の入力を既定（false）で埋めるので軽い組になる（T192 の落とし穴。空を「全部」の印にしていない）。式は `inputs.full == true || inputs.full == 'true'`（boolean の入力と、API の文字列の両方）。
 
 ### T191 [性能] GPU のサンプリングを複数のワークグループで — 状態: 未着手（T152 の数字を見てから）
 - 見たもの（Mali Valhall、Llama 3.2 1B の幅の 2 層の作り物）: 1 トークンの仕事 11.03 ms のうち、SAMPLE だけで 5.893 ms（語彙 128256、床の上 3695 語）、平らな logits で 6.104 ms。SAMPLE は 1 つのワークグループの 1 ディスパッチ（T151）で、1B の本物の 1 トークン（重み 1.39 GB を 38.7 GB/s で約 36 ms）でも 1 割を超える。

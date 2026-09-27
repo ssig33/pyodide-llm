@@ -2,7 +2,7 @@
 # on a software adapter (SwiftShader: the runners have no GPU): tests/gpu-check.mjs on the models this workflow builds
 # (the site's int8 models and a made-up one with grouped-query attention). It shows that the numbers are right; the
 # speeds that count are the owner's devices'. The page refuses a fallback adapter such as SwiftShader (T148): the
-# page itself on it with the tests' flag, models.yml with query "gpuTest=on". By hand only.
+# page itself on it with the tests' flag, models.yml with query "gpuTest=on". By hand, and every night (T193, below).
 # T147: SwiftShader compiles a tiled shader in 10 to 90 s and has no shader-f16, so the browsers take the made-up model
 # only (every shader, 150 tokens), and Dawn in Node on Mesa's lavapipe (shader-f16 and subgroups) takes every model
 # (about 5 minutes on the development machine).
@@ -18,13 +18,29 @@
 #
 #   gh workflow run gpu-prompt.yml [-f models="synthetic tiny-lm"] [-f real="hf-qwen3-0.6b"] [-f forms="TF.js"] [--ref <branch>]
 #   node tests/ci.mjs run gpu-prompt.yml real=hf-qwen2.5-0.5b-instruct --ref <branch>
+#
+# T193 (the owner, 2026-09-27: "たまーにフルテストする感じでコミットたくさんあるときは軽くしたい"): two suites of what
+# runs when models= and real= are not given. Light, the default: Chromium only with the made-up model "synthetic", and
+# Dawn with every made-up model. Full (full=true, and the nightly schedule on main): Chromium, Chrome and Edge with
+# every made-up model, and Dawn with every made-up model and the site's three. models= and real= choose the models in
+# either; full= still chooses the browsers. An empty full= is the default, light (T192).
+#
+#   node tests/ci.mjs run gpu-prompt.yml full=true --ref <branch>
 name: The prompt on the GPU
 
 on:
+  schedule:
+    # every night at 03:47 in Japan (18:47 UTC), half an hour after tests.yml's, the full suite on main
+    - cron: '47 18 * * *'
   workflow_dispatch:
     inputs:
+      full:
+        description: 'T193: the full suite (Chrome and Edge too, every made-up model in the browsers, the site models on Dawn), not the light one'
+        type: boolean
+        required: false
+        default: false
       models:
-        description: 'model ids of this directory, or synthetic, separated by spaces (default: synthetic in the browsers, every model on Dawn; none with real=)'
+        description: 'model ids of this directory, synthetic, or made-up (every made-up model), separated by spaces (default: the suite; none with real=)'
         required: false
       real:
         description: 'T183: ids of Hugging Face models of src/models.js, fetched and converted to int8 here (e.g. hf-qwen2.5-0.5b-instruct hf-qwen3-0.6b)'
@@ -32,6 +48,10 @@ on:
       forms:
         description: "T147: only the matrices' shaders whose names hold one of these, separated by commas (gpu-check --forms)"
         required: false
+
+# T193: light or full, for both jobs (the browsers' matrix below says the same by itself: a matrix cannot read env)
+env:
+  SUITE: ${{ (github.event_name == 'schedule' || inputs.full == true || inputs.full == 'true') && 'full' || 'light' }}
 
 jobs:
   gpu:
@@ -42,9 +62,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # the models are built as the deployment builds them, on Linux; Chrome and Edge are the runner's own
+        # the models are built as the deployment builds them, on Linux; Chrome and Edge are the runner's own, in the full
+        # suite only (T193)
         os: [ubuntu-latest]
-        engine: [chromium, chrome, msedge]
+        engine: ${{ fromJSON((github.event_name == 'schedule' || inputs.full == true || inputs.full == 'true') && '["chromium","chrome","msedge"]' || '["chromium"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -85,7 +106,10 @@ jobs:
           echo "## ${{ matrix.os }} ${{ matrix.engine }}" >> "$GITHUB_STEP_SUMMARY"
           ids="$MODELS"
           for id in $REAL; do ids="$ids .tmp/real/$id.json"; done
-          node tests/gpu-check.mjs ${ids:-synthetic} ${FORMS:+--forms "$FORMS"} --engine ${{ matrix.engine }} 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
+          # T193: the suite's models when none are given: "synthetic" alone (light) or every made-up one (full)
+          [ "$SUITE" = full ] && suite=made-up || suite=synthetic
+          echo "suite: $SUITE, by ${{ github.event_name }}: ${ids:-$suite}"
+          node tests/gpu-check.mjs ${ids:-$suite} ${FORMS:+--forms "$FORMS"} --engine ${{ matrix.engine }} 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${PIPESTATUS[0]}"
 
   dawn:
@@ -137,5 +161,9 @@ jobs:
           echo "## ubuntu-latest dawn ($VK_ICD_FILENAMES)" >> "$GITHUB_STEP_SUMMARY"
           ids="$MODELS"
           for id in $REAL; do ids="$ids .tmp/real/$id.json"; done
-          node tests/gpu-check.mjs $ids ${FORMS:+--forms "$FORMS"} --engine dawn --webgpu .tmp/dawn/node_modules/webgpu 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
+          # T193: the suite's models when none are given: every made-up one (light), and the site's three too (full:
+          # gpu-check's default)
+          [ "$SUITE" = full ] && suite="" || suite=made-up
+          echo "suite: $SUITE, by ${{ github.event_name }}: ${ids:-${suite:-made-up and the site models}}"
+          node tests/gpu-check.mjs ${ids:-$suite} ${FORMS:+--forms "$FORMS"} --engine dawn --webgpu .tmp/dawn/node_modules/webgpu 2>&1 | grep -v "^async function _createPyodideModule" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${PIPESTATUS[0]}"

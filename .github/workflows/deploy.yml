@@ -11,6 +11,7 @@ permissions:
   pages: write
   id-token: write
 
+# a deploy is not cancelled halfway (Pages); GitHub folds the queue to the newest waiting one (T193)
 concurrency:
   group: "pages"
   cancel-in-progress: false
@@ -42,33 +43,13 @@ jobs:
           npm ci
           make models kernels
 
-      - name: Unit tests of the engine
-        run: python -m pytest tests -q
-
-      # Node alone: the benchmark's table (T45) and the table CI writes (T82)
-      - name: Unit tests of the page's modules
+      # T193: the light suite only (what keeps a broken page off the site: pytest, the page's modules, smoke). The heavier
+      # checks run in tests.yml, every night (its schedule) and on a branch with full=true: a commit on main that this
+      # suite cannot tell apart is checked by the next full suite.
+      - name: Tests (the light suite)
         run: |
-          node tests/bench.mjs
-          node tests/summary-check.mjs
-          node tests/models-check.mjs
-          node tests/ladder-check.mjs
-          node tests/kept-check.mjs
-          node tests/coi-js-check.mjs
-          node tests/gpu-choice-check.mjs
-          node tests/worker-sink-check.mjs
-
-      - name: Smoke test with the latest Pyodide
-        run: |
-          # the page resolves the latest Pyodide release when it is opened, so test against that one
-          npm install --no-save pyodide@latest
-          node tests/smoke.mjs
-          # T93: the forward pass of public/forward.js against NumPy's, on the site's models (the line is for 128 positions)
-          node tests/forward-check.mjs --rounds 1 --positions 128
-          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --plain
-          # T148: the default choice of the GPU or the CPU for a prompt's blocks, with a made-up GPU's worker
-          node tests/gpu-default-check.mjs
-          # T101: the 64-bit memory and its kernels (the review: nothing ran them before a change went out)
-          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --wide
+          echo "suite: light, by ${{ github.event_name }}"
+          bash tests/suite.sh light
 
       - name: Build the site
         run: npm run build
