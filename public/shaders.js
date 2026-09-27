@@ -660,11 +660,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // (word i of the output takes low from word i and top from word 4 + i % 2), each output word is two masked shifts
 // of two input words: the nibbles of four values to bits 2-5 at once (0x0f0f0f0f, or the high nibbles as word >> 4),
 // and their pairs to bits 6-7 at once (top << (6 - pair's bit), masked to 0xc0c0c0c0: what a shift carries across a
-// byte lands under the mask). Masks and shifts by constants only, as kernels/six.ts. A thread a group: it reads 6
-// words and writes 8, the 64 threads of a workgroup reading 1536 bytes in a row and writing 2048, every line of the
-// cache used whole; the traffic is the 56 bytes a group either way, and the widening runs once as a model is put on
-// the GPU (Llama 3.2 1B's layers: 0.82 GB read, 1.09 GB written). Splitting a group over two threads would read
-// the top words twice for 4 fewer stores a thread: not taken.
+// byte lands under the mask). Masks and shifts by constants only, as kernels/six.ts. The packing is this project's,
+// but the form is llama.cpp's for Q6_K, whose six bits lie as nibbles and pairs of bits too: four values a 32-bit
+// word, masks by the byte (0x0F0F0F0F, 0x30303030, 0xC0C0C0C0) and shifts (https://github.com/ggml-org/llama.cpp,
+// commit 95887577, MIT: ggml-cuda/vecdotq.cuh's vec_dot_q6_K_q8_1_impl_mmvq and ggml-metal/kernels/dequantize.h's
+// dequantize_q6_K; no line copied: Q6_K's values are unsigned with 32 taken off, where pack6's are their int8's). A
+// thread a group: it reads 6 words and writes 8, the 64 threads of a workgroup reading 1536 bytes in a row and writing
+// 2048, every line of the cache used whole; the traffic is the 56 bytes a group either way, and the widening runs once
+// as a model is put on the GPU (Llama 3.2 1B's layers: 0.73 GB read and 0.97 GB written by it; their scales, 0.12 GB,
+// go up as an int8 model's do). Splitting a group over two threads would read the top words twice for 4 fewer stores
+// a thread: not taken.
 export const WIDEN_SIX_WORKGROUP = 64;
 export const WIDEN_SIX = /* wgsl */ `
 @group(0) @binding(0) var<storage, read> packed: array<u32>;

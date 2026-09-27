@@ -316,7 +316,6 @@ function piecesOf(m, rows, n) {
 // it); done() lets it go.
 async function widener(m) {
   const { device, wgsl } = m;
-  if (!wgsl.WIDEN_SIX) throw new Error("int6 weights are not on the GPU yet (the shader that widens them is to be written)");
   const pipeline = await within(validated(m, () => pipelineOf(m, wgsl.WIDEN_SIX)), "compiling the widening of int6");
   const owned = [];
   const largest = Math.max(CHECK_GROUPS * 24, ...Object.entries(m.plan.matrices).filter(([, matrix]) => matrix.six)

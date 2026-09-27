@@ -45,8 +45,10 @@ CPU (faster here than WebGPU)", or "prompts on the CPU (reason)".
 - The model's weights are float32 (not int8 or 6-bit). Qwen2's biases, Qwen3's per-head norms of q and k, and
   GPT-2 and GPT-NeoX (LayerNorm, GELU, the biases, learned positions, partial RoPE, the parallel residual) run on
   the GPU as well. A model in 64-bit memory (over 4 GB) goes as one in 32-bit memory, and a matrix larger than a
-  buffer the device binds goes in pieces of rows. 6-bit weights are to be widened to int8 on the GPU as they are
-  uploaded; until the shader for that is in, a 6-bit model stays on the CPU.
+  buffer the device binds goes in pieces of rows. 6-bit weights are widened to int8 on the GPU as they are
+  uploaded, so they take as much GPU memory as int8. The page chooses 6 bits only where memory is short (a device
+  that reports less than 8 GB, or Safari for a model past 4 GB), and there the rule below keeps the model on the
+  CPU: today a 6-bit model reaches the GPU in practice only when it is asked for (`?bits=6`).
 - The weights would not fit twice: today they are kept in WebAssembly memory for the CPU and again on the GPU. On
   phones and Apple devices both are the same memory. If the total is more than half of `navigator.deviceMemory`,
   the model stays on the CPU. Chromium reports at most 8, which is read as "8 GB or more"; a browser that does not
@@ -69,6 +71,7 @@ The shapes are taken from public implementations, and each file keeps their noti
 | One token's matrix × vector (benchmark only) | llama.cpp's `mul_mat_vec`, ONNX Runtime's MatMulNBits (MIT) |
 | One token's layer in 5 dispatches instead of 14 (benchmark only) | built on llama.cpp's `mul_mat_vec` |
 | One token's layer on packed int8 dot products, the vector quantized before each matrix (benchmark only) | ONNX Runtime's DP4A MatMulNBits for small M (MIT), with the fused writes of the line above. The norm and its quantizing in one dispatch take their form from vLLM's `rms_norm_per_block_quant` (Apache-2.0; no lines copied). |
+| 6-bit weights widened to int8 as they are uploaded | ours (the packing is this project's); four values a 32-bit word by byte masks and shifts, the form of llama.cpp's Q6_K in CUDA and Metal (MIT; no lines copied) |
 | The device's ceilings (benchmark only) | the loops of clpeak (GPL-3.0): the shapes only, no lines copied |
 | Sampling on the GPU and several tokens a submission (benchmark only): the repetition penalty, softmax, top-p and the draw, the next token's row of the embedding | the penalty of MLC LLM (Apache-2.0); llama.cpp's `argmax`, `soft_max`, `cumsum` and `get_rows` (MIT); top-p without sorting from MLC LLM's `top_p_pivot` (Apache-2.0). Carrying the state from one token to the next, and the draw by the same pivots, are ours. |
 
@@ -100,8 +103,8 @@ say only that the shaders are right, not how fast a GPU is.
 In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
 GPU with the CPU's random numbers, is in the benchmark: a seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
-activations to 7 or 8 bits)); then the shader that widens 6-bit weights; and keeping the weights once
-instead of twice. The tasks are in [TODO.md](../TODO.md) (T151 to T157, in Japanese).
+activations to 7 or 8 bits)); then keeping the weights once instead of twice. The tasks are in
+[TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself
 
