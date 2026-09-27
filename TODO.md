@@ -101,7 +101,7 @@
 - 案: (a) 共有を断られたら共有でないメモリとして測り直し、32 ビットに入らなければ 64 ビットにする（Safari では分かる文で止める）、(b) 共有でないメモリでも入らないときだけ KV を float16 にする（1 本では attention が遅い、T110: 位置 4000 で 38 → 21 tok/s）、(c) KV をその場で伸ばして峰を下げる（古い塊と新しい塊の和でなく、差の分だけ取って後ろから詰め直す。Qwen2.5-3B の共有なしが 4.029 → 3.888 GiB で 32 ビットに入る）。
 - 完了条件: forward-check に「共有を頼んで断られた」経路の試験。`models.yml` の `long` で 3B 級が文脈の終わりまで書く。
 
-### T145 [運用] 2026-09-26 の 4 回目のレビューの残り（道具・試験・画面の文）— 状態: 未着手（2026-09-26、レビューから。規模 小。T144 と同じ形の寄せ集め）
+### T145 [運用] 2026-09-26 の 4 回目のレビューの残り（道具・試験・画面の文）— 状態: レビュー待ち（(1)〜(8) と前からある小さいもの、2026-09-27、Opus medium、ブランチ `t145-tools`。(9) は持ち主の文面待ち。(1) の線は gguf.yml の 28 の GGUF の結果待ち）（2026-09-26、レビューから。規模 小。T144 と同じ形の寄せ集め）
 - 道具（T136 の段 ②）:
   - (1) `gguf_check.py` の線を締める。本物の GGUF は参照とビット単位で同じ（sarashina の 2 つと llm-jp-3 980M で誤差 0、int8 の 99.999% 以上が同じ、F32 の誤差 0）なので、「F32 は 1e-3 以下、Q8_0 は近い参照に 1e-3 以下」を足す（基底と指示の組では、いちばん近いテンソルでも 8.3e-3）。27 の GGUF を gguf.yml で確かめる。覆す条件: どれかが落ちたら今の線のまま。
   - (2) 参照で通った行の id・語片・ノルムを、表と JSON に出す。
@@ -119,6 +119,16 @@
   - `.venv` の sentencepiece は 0.2.1、`requirements-reference.txt` は 0.2.2。
   - `stock-firefox.mjs` の `driver.quit()` を 15 秒で見切る。
 - 完了条件: 上の道具と試験が、わざと壊したときに落ちる。
+- **実装（2026-09-27、Opus medium）**。手元では編集と `node --check`・`py_compile` だけ（持ち主の指示）。試験は CI の `tests.yml`（`extra=` でわざと壊す 8 通りと、語彙つきの GGUF の道具）と `gguf.yml`。
+  - (1) `gguf_check.py` の `TIGHT = 1e-3`: どのテンソルも、普通の作り方の GGUF が持つもの（`references()`: F32 は原本の値、Q8_0 は原本・原本の llama.cpp の Q8_0・float16 にした原本の Q8_0）のいちばん近いものとの相対誤差（`squares()` を塊ごとに足して `nearest()`）が 1e-3 以下。越えたテンソルは 1 つの不一致で、表の列と JSON の `nearest`・`past_tight` に出る。**試験の GGUF の書き手（`test_gguf.q8_0_blocks`）を llama.cpp の丸めにビット単位で合わせた**（それまでは float16 の d の逆数で割って rint: 変えた行の原本と llama.cpp の Q8_0 が 1 刻みずれ、見積もりで 2e-3 離れて線を越える）。`test_gguf.py` の比べは GGUF の値そのものどうしなので変わらない。**覆す条件はレビューのとおり**: gguf.yml の 28（段 ① の 8、T74 の SmolLM2 135M、段 ② の 19）のどれかが `past_tight` を出したら、線を今の 0.02 と行の 0.05 に戻す（数字は未計測: CI の run の後に書く）。
+  - (2) Q8_0 の参照でだけ通った行（`row_check()` の 6 つ目）を、id・語片（原本の語彙、無ければ GGUF の）・原本との誤差・近い Q8_0 との誤差・ノルム / 中央値の表と JSON の `rounded_detail`（テンソルごとに 64 行まで）に。
+  - (3) gguf.yml は matrix と入力を env で渡す。候補の形は名前の文字（英数字と `._-`）だけの正規表現に。入力 `listed` で一覧の GGUF を全部（`-f only= -f listed=true` で 28）。段 ① の matrix に T74 の SmolLM2 135M を足した（原本は format_check の `ORIGINALS` の版）。
+  - (4) test_gguf_check の `model()` に `shared`・`n_kv_heads`: 分類器の行の入れ替えを行で捕まえる、GQA の k を自分の head で回して読む（まるごとと head 1 つの塊）、Q8_0 の参照でだけ通る行が語片つきで出る、0.4% ずれたテンソル（F32 の norm と Q8_0 の行列）が 0.02 の下でも `TIGHT` で落ちる。
+  - (5) `format_check.py` の `KNOWN`（Rakuten 2.0 mini の頭の空白、llm-jp-4 の `<|channel|>final<|message|>`、SmolLM2 135M の手書きの ChatML の既定のシステム文、Swallow-MS の 2 つのプロンプト）はそれぞれ自分の違いだけを外し、ほかの違いと、要らなくなった既知の違いは exit 1。書式の無い項目は `none` の 1 行。**参照の venv と HF が要るので CI では走らない**: 次のレビューの回に手元で 1 回（`KNOWN` の Rakuten の「最初の語片だけ ▁ の違い」と Swallow-MS の 2 つのプロンプトは記録から書いたもので、本物で確かめていない）。
+  - (6) `hf_fetch.py` は語彙つきの GGUF で原本の config.json・トークナイザ・tokenizer_config.json をその原本のフォルダに取り、GGUF をそこにリンクしてフォルダを出す。`perplexity_prepare.py` と `profile-convert.mjs` はそのフォルダを `gguf_weights()` で組む（ページと同じ）。int4.yml と draft.yml の原本の名指しはそのまま。
+  - (7)(8) `tests/worker-sink-check.mjs`（tests.yml と deploy.yml）: worker.js を vm で動かし、変換器の sink を `checkpointSink()`（convert() の外に出した）から開いて、`FORM` の 4 つの鍵が同じ値で `footprint()` に届くこと、`footprint()` の既定の arch・head_dim が `FORM` と同じこと（ソースの既定と、既定と明示の結果が同じこと）。
+  - 前からある小さいもの: 変換が `sink.open()` の後で失敗しても（取得の失敗、GGUF や全部のトークナイザの断り）Python のバッファを手放す（`into.release()`、1 回だけ）。`Stream.size` の属性は誰も読んでいなかったので消した（メソッドが見える）。`.venv` の sentencepiece を 0.2.2 に（`--no-cache-dir`、dev-setup.md）。`stock-firefox.mjs` の `driver.quit()` を 15 秒で見切る。
+  - (9) の文面の案（持ち主の承認待ち、画面は触っていない）: 「Open a model from this device: a llama2.c checkpoint and its tokenizer.bin, or the files of a Hugging Face model (.safetensors, config.json, and tokenizer.json, tokenizer.model or spiece.model), and optionally settings as .json. Nothing is uploaded.」
 
 ### T134 [計測] 総合的なベンチマーク: CPU の計測と GPU の計測を 1 つに — 状態: **`/benchmark/` は公開済み（2026-09-26）。GPU の項目に足す計測（T135 の前）も公開済み（T140 の前に画面を確かめて本線へ、0affb08・ce4ae46）。レビュー済み（must-fix 3 つを直した、2026-09-26）。持ち主の 3 台の数字待ち。should 1・2・4 の直しもレビュー済み（must-fix 1 つを直した、2026-09-26 の 4 回目）**（2026-09-26、持ち主の指示「gpu test じゃなくて、総合的な benchmark を作って、それに gpu test をふくませるのがよくないか？」「T94 復活させて WebGPU でのパフォーマンス向上を目指そう」。**T128 の後**（Opus の提案。持ち主が変えてよい）。規模 中）
 - 根拠: いまの計測は 2 つに分かれている。`?bench=1`（T45・T76: そのページのモデルでカーネルなど 4 段を外して測る、Markdown と Issue の報告 T91）と `/gpu-test/`（T94 の第 0 段: アダプタ、int8 の行列 × ベクトルの GB/s、1 トークンぶんの仕事）。GPU の計測はバッチ 1 の生成だけで、**GPU を生かす形を測っていない**（T94 の完了の記録）。

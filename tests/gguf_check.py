@@ -12,7 +12,9 @@
 #       them). For Q8_0, also how many int8 values equal what llama2_convert.quantize() makes of the original.
 #       The embedding and the classifier also row by row (T136 stage 2), and Llama 3's rope_freqs.weight against
 #       the engine's rope_frequencies() of the original's rope_scaling. The metadata against config.json (after
-#       normalize()), and the vocabulary against tokenizer.json and tokenizer.model. --original-vocabulary (stage 2:
+#       normalize()), and the vocabulary against tokenizer.json and tokenizer.model. T145: every tensor also against
+#       the nearest of what a GGUF made the usual ways holds (TIGHT), and the rows that pass only against a Q8_0 of
+#       the original are listed with their id, piece and norm. --original-vocabulary (stage 2:
 #       the page takes the vocabulary from the original) shows a difference in the GGUF's vocabulary without
 #       counting it. The last line is the summary as JSON.
 #   python3 tests/gguf_check.py logits <out A> <out B> <text file> [tokens = 300]
@@ -301,6 +303,35 @@ def q8_0_of(original):
     return np.where(scale > 0, np.sign(scaled) * np.floor(np.abs(scaled) + 0.5) * scale, 0).reshape(original.shape)
 
 
+# T145: a GGUF made from the original holds its values as they are where it keeps them (F32: 0 off) and llama.cpp's
+# Q8_0 of them where it quantizes (sarashina2.2's two and llm-jp-3 980M: 0 off, int8 99.999% the same; the review of
+# T136's second stage). So each tensor is also held to TIGHT against the nearest of those, where the whole tensor's
+# 0.02 lets 4% of noise or a scale of 1.05 through. The base and the instruct model of one family are 8.3e-3 apart at
+# their nearest tensor. Should one of the list's GGUFs be past it, the line goes back to what it was (the review).
+TIGHT = 1e-3
+
+
+def references(original, q8_0):
+    """What a GGUF made from original the usual ways holds: the values (an F32 or F16 tensor, near enough for F16),
+    and for a Q8_0 one llama.cpp's Q8_0 of them, or of them made float16 first (mradermacher's RakutenAI 7B chat)."""
+    if not q8_0:
+        return [original]
+    return [original, q8_0_of(original), q8_0_of(original.astype(np.float16).astype(np.float32))]
+
+
+def squares(values, original, q8_0):
+    """[(the difference squared, the reference squared)] against each of references(), summed in float64, to be
+    summed further over the blocks of a large tensor."""
+    wide = values.astype(np.float64)
+    return [(float(((wide - reference) ** 2).sum()), float((reference.astype(np.float64) ** 2).sum()))
+            for reference in references(original, q8_0)]
+
+
+def nearest(sums):
+    """The relative error against the nearest reference, of squares()."""
+    return min(math.sqrt(difference / max(norm, 1e-300)) for difference, norm in sums)
+
+
 def row_parts(values, original, q8_0):
     """Per row (in float64: a row of 1e-37 squares to nothing in float32): the norm of the difference and of the
     original, and for a Q8_0 tensor the same against q8_0_of(original) and q8_0_of(the original made float16):
@@ -316,7 +347,8 @@ def row_parts(values, original, q8_0):
 
 def row_check(parts):
     """(how many rows are past ROW_LINE, the worst error, its row, up to 16 of the rows past the line as [row, error,
-    the row's norm over the median], and how many rows are past it against the original but not against its Q8_0).
+    the row's norm over the median], how many rows are past it against the original but not against its Q8_0, and up
+    to 64 of those as [row, error against the original, against the nearest Q8_0, the row's norm over the median]).
     A row's error is against the original, or against llama.cpp's Q8_0 of it where that is nearer (row_parts()): a
     row of values so small that the float16 scale rounds them is the format's rounding, while a row of another
     token is far from all of them. A norm under 1e-3 of the median counts as that (Qwen2.5 7B's unused rows,
@@ -329,20 +361,23 @@ def row_check(parts):
     for difference, norm in zip(parts[2::2], parts[3::2]):
         each = np.fmin(each, difference / np.maximum(norm, floor))  # a reference of NaN (float16 overflow) is no reference
     bad = np.flatnonzero(each > ROW_LINE)
+    rounded = np.flatnonzero((against > ROW_LINE) & (each <= ROW_LINE))
     return (len(bad), float(each.max()), int(each.argmax()),
             [[int(i), round(float(each[i]), 4), float(f"{norms[i] / median:.3g}")] for i in bad[:16]],
-            int(((against > ROW_LINE) & (each <= ROW_LINE)).sum()))
+            len(rounded),
+            [[int(i), round(float(against[i]), 4), round(float(each[i]), 4), float(f"{norms[i] / median:.3g}")]
+             for i in rounded[:64]])
 
 
 def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
-    """relative error and int8 equality of a large matrix, a block of rows at a time; by_row: also the error of
-    each row (row_check()). head_rows: q or k, whose heads of head_rows rows the GGUF may hold turned: the
+    """relative error, the error against the nearest reference (squares()) and int8 equality of a large matrix, a
+    block of rows at a time; by_row: also the error of each row (row_check()). head_rows: q or k, whose heads of head_rows rows the GGUF may hold turned: the
     blocks are whole heads, and the order is the one of the first block (the order found is returned too)."""
     rows = max(1, BLOCK // math.prod(shape[1:]))
     if head_rows:
         rows = max(head_rows, rows // head_rows * head_rows)
     difference = total = same = count = 0.0
-    parts = []
+    parts, sums = [], None
     order = ""
     for first in range(0, shape[0], rows):
         last = min(first + rows, shape[0])
@@ -356,6 +391,8 @@ def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
                 original = turn
         difference += float(((values - original) ** 2).sum())
         total += float((original ** 2).sum())
+        block = squares(values, original, raw is not None)
+        sums = block if sums is None else [(a + c, b + d) for (a, b), (c, d) in zip(sums, block)]
         if by_row:
             parts.append(row_parts(values, original, raw is not None))
         if raw is not None:
@@ -365,7 +402,8 @@ def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
     rowwise = None
     if by_row:
         rowwise = row_check([np.concatenate(column) for column in zip(*parts)])
-    return math.sqrt(difference / max(total, 1e-30)), f"{same / count * 100:.2f}%" if count else "", rowwise, order
+    return (math.sqrt(difference / max(total, 1e-30)), nearest(sums), f"{same / count * 100:.2f}%" if count else "",
+            rowwise, order)
 
 
 def config_pairs(config):
@@ -438,7 +476,8 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
         print(f"| {what} | {ours} | {theirs}{'' if ours == theirs else ' **differs**'} |")
 
     vocab_diffs = {}
-    for name, pieces in original_vocabularies(directory).items():
+    originals = original_vocabularies(directory)
+    for name, pieces in originals.items():
         vocab_diffs[name] = compare_vocabulary(metadata, pieces, name, config.get("vocab_size"))
         if original_vocabulary:
             print("(not counted: the page takes the vocabulary from the original)")
@@ -446,9 +485,10 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             mismatched += vocab_diffs[name] > 0
 
     heads, kv_heads = config["num_attention_heads"], config.get("num_key_value_heads", config["num_attention_heads"])
-    print("\n| tensor | type | shape | relative error | order | int8 equal to quantize() | rows past "
-          f"{ROW_LINE} (worst) |\n|---|---|---|---:|---|---:|---|")
+    print(f"\n| tensor | type | shape | relative error | nearest reference (line {TIGHT}) | order | int8 equal to quantize() "
+          f"| rows past {ROW_LINE} (worst) |\n|---|---|---|---:|---:|---|---:|---|")
     worst, orders, rope_difference, bad_rows, row_detail, rounded_rows = 0.0, set(), None, {}, {}, {}
+    near_worst, past_tight, rounded_detail = 0.0, {}, {}
     for name, info in infos.items():
         if name == "rope_freqs.weight":
             values, _ = tensor(info, data, base)
@@ -457,11 +497,11 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             counted = rope_difference > 1e-5
             mismatched += counted
             print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | {rope_difference:.2e} against "
-                  f"rope_frequencies() of rope_scaling = {config.get('rope_scaling')}{' **differs**' if counted else ''} | | | |")
+                  f"rope_frequencies() of rope_scaling = {config.get('rope_scaling')}{' **differs**' if counted else ''} | | | | |")
             continue
         target = hugging_face_name(name)
         if target is None or target not in hf:
-            print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | | no {target} in safetensors | | |")
+            print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | | | no {target} in safetensors | | |")
             mismatched += 1
             continue
         shape = tuple(hf.shape(target))
@@ -475,7 +515,7 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             head_rows = 0
             if name.endswith(("attn_q.weight", "attn_k.weight")):
                 head_rows = shape[0] // (heads if "attn_q" in name else kv_heads)
-            error, equal, rowwise, order = large(info, data, base, hf, target, shape, quantize, by_row, head_rows)
+            error, near, equal, rowwise, order = large(info, data, base, hf, target, shape, quantize, by_row, head_rows)
             if order:
                 orders.add(order)
         else:
@@ -490,6 +530,7 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
                 if turn < as_is:
                     original = turned(original, n)
             error = relative(values, original) if values.shape == original.shape else float("nan")
+            near = nearest(squares(values, original, raw is not None)) if values.shape == original.shape else float("nan")
             equal = ""
             if raw is not None and values.shape == original.shape:
                 ours, _ = quantize(original.reshape(-1, original.shape[-1]))
@@ -497,20 +538,42 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             if by_row and values.shape == original.shape:
                 rowwise = row_check(row_parts(values, original, raw is not None))
         worst = max(worst, error) if not math.isnan(error) else math.inf
+        near_worst = max(near_worst, near) if not math.isnan(near) else math.inf
+        near_note = f"{near:.2e}"
+        if not near <= TIGHT:
+            past_tight[name] = near
+            mismatched += 1
+            near_note += " **past**"
         rows_note = ""
         if rowwise is not None:
             bad_rows[name] = rowwise[0]
             row_detail[name] = rowwise[3]
             rounded_rows[name] = rowwise[4]
+            rounded_detail[name] = rowwise[5]
             mismatched += rowwise[0]
             rows_note = (f"{rowwise[0]} ({rowwise[1]:.4f} at row {rowwise[2]}){' **differs**' if rowwise[0] else ''}"
                          + (f"; {rowwise[4]} more only as Q8_0's float16 scale rounds them" if rowwise[4] else ""))
-        print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | {error:.5f} | {order} | {equal} | {rows_note} |")
+        print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | {error:.5f} | {near_note} | {order} | {equal} | {rows_note} |")
+    if any(rounded_detail.values()):
+        # T145: what passes only against a Q8_0 of the original, to be read: an unused piece of a small norm, or not.
+        # The pieces are the original's (what the page reads, T136's second stage), or else the GGUF's
+        pieces = next(iter(originals.values()), None) or metadata.get("tokenizer.ggml.tokens", [])
+        print("\n| tensor | row (id) | piece | error against the original | against the nearest Q8_0 | norm / median |"
+              "\n|---|---:|---|---:|---:|---:|")
+        for name, rows in rounded_detail.items():
+            for detail in rows:
+                detail.insert(1, pieces[detail[0]] if detail[0] < len(pieces) else None)  # [row, piece, ...]
+                row, piece, against, near, norm = detail
+                print(f"| {name} | {row} | {json.dumps(piece, ensure_ascii=False)} | {against:.4f} | {near:.4f} | {norm} |")
+            if rounded_rows[name] > len(rows):
+                print(f"| {name} | and {rounded_rows[name] - len(rows)} more | | | | |")
     ok = mismatched == 0 and worst < 0.02
-    print(f"\nworst relative error {worst:.5f}; q and k are stored {' and '.join(sorted(orders)) or '(none)'}; "
-          f"{mismatched} mismatches")
-    print(json.dumps({"worst": worst, "mismatches": mismatched, "rows": bad_rows, "bad_rows": row_detail, "rounded_rows": rounded_rows, "orders": sorted(orders),
-                      "rope_freqs_diff": rope_difference, "vocab_diffs": vocab_diffs, "ok": ok}))
+    print(f"\nworst relative error {worst:.5f}; against the nearest reference {near_worst:.2e} ({len(past_tight)} "
+          f"past {TIGHT}); q and k are stored {' and '.join(sorted(orders)) or '(none)'}; {mismatched} mismatches")
+    print(json.dumps({"worst": worst, "nearest": near_worst, "past_tight": past_tight, "mismatches": mismatched,
+                      "rows": bad_rows, "bad_rows": row_detail, "rounded_rows": rounded_rows,
+                      "rounded_detail": rounded_detail, "orders": sorted(orders), "rope_freqs_diff": rope_difference,
+                      "vocab_diffs": vocab_diffs, "ok": ok}, ensure_ascii=False))
     return ok
 
 

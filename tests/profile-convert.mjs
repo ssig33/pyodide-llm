@@ -4,6 +4,8 @@
 //
 //   node tests/profile-convert.mjs <directory with config.json, model.safetensors and the tokenizer> [int8|int6|float32] [--numpy]
 //   node tests/profile-convert.mjs <a Q8_0 .gguf file> [int8|int6|float32] [--numpy]
+//   node tests/profile-convert.mjs <directory with config.json, the tokenizer and a Q8_0 .gguf> [...]
+//       (T145: a GGUF with its original's vocabulary and configuration, T136's second stage; tests/hf_fetch.py makes it)
 //
 // int8 quantizes on the SIMD kernels, as the page does (T89: kernel_quantizer); int6 (T98) as the page does too.
 import fs from "node:fs";
@@ -17,7 +19,8 @@ const bfloat16 = process.argv.includes("--numpy") ? undefined : py.pyimport("lla
 // T136: and of GGUF's Q8_0
 const q8_0 = process.argv.includes("--numpy") ? undefined : py.pyimport("llama2_numpy").kernel_q8_0("simdkernel.so");
 const gguf = dir.endsWith(".gguf");
-const weights = gguf ? dir : `${dir}/model.safetensors`;
+const withVocabulary = !gguf && fs.readdirSync(dir).filter((name) => name.endsWith(".gguf")).sort()[0];
+const weights = gguf ? dir : withVocabulary ? `${dir}/${withVocabulary}` : `${dir}/model.safetensors`;
 const fd = fs.openSync(weights, "r"), size = fs.fstatSync(fd).size;
 const range = (b, e) => { const x = new Uint8Array(e - b); fs.readSync(fd, x, 0, e - b, b); return x; };
 let conversion, first;
@@ -26,11 +29,20 @@ if (gguf) {
   conversion = convert.Conversion.from_gguf.callKwargs(range(0, 16 << 20), { dtype, quantize_rows: quantizeRows, bfloat16, q8_0 });
   first = conversion.base;
 } else {
-  const headerBytes = Number(new DataView(range(0, 8).buffer).getBigUint64(0, true));
   const tokName = ["tokenizer.json", "spiece.model", "tokenizer.model"].find((n) => fs.existsSync(`${dir}/${n}`));
-  conversion = convert.Conversion.callKwargs(new TextDecoder().decode(range(8, 8 + headerBytes)), 8 + headerBytes,
-    fs.readFileSync(`${dir}/config.json`, "utf8"), new Uint8Array(fs.readFileSync(`${dir}/${tokName}`)), tokName, { dtype, start: 8 + headerBytes, quantize_rows: quantizeRows, bfloat16, q8_0 });
-  first = 8 + headerBytes;
+  const config = fs.readFileSync(`${dir}/config.json`, "utf8");
+  let header;
+  if (withVocabulary) {
+    // the GGUF's header as a safetensors one, as the worker makes it (llama2_convert.gguf_weights)
+    const made = convert.gguf_weights(range(0, Math.min(64 << 20, size)), config);
+    [header, first] = made.toJs();
+    made.destroy();
+  } else {
+    const headerBytes = Number(new DataView(range(0, 8).buffer).getBigUint64(0, true));
+    [header, first] = [new TextDecoder().decode(range(8, 8 + headerBytes)), 8 + headerBytes];
+  }
+  conversion = convert.Conversion.callKwargs(header, first, config, new Uint8Array(fs.readFileSync(`${dir}/${tokName}`)),
+    tokName, { dtype, start: first, quantize_rows: quantizeRows, bfloat16, q8_0 });
 }
 py.globals.set("conversion", conversion);
 py.runPython("import cProfile, pstats, io, time; profiler = cProfile.Profile(); began = time.perf_counter(); profiler.enable()");

@@ -10,6 +10,14 @@
 # shown and not counted (gguf_check.py --original-vocabulary). One job per candidate; the eight above do not run.
 #
 #   gh workflow run gguf.yml -f candidates="hf-tinyllama-1.1b-chat=TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF@<commit>/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
+#
+# T145: every GGUF the list takes, again (the nine above with only empty, and the 19 of stage 2 with listed, each against
+# the original of its vocabulary), for the tighter line of gguf_check.py (a GGUF past it: the old line stays):
+#
+#   gh workflow run gguf.yml -f only= -f listed=true
+#
+# What comes from an input or the matrix reaches the shell through env, never written into run: (T145: a candidate
+# of "$(...)" in its file name would have run).
 name: GGUF against the originals
 
 on:
@@ -21,6 +29,10 @@ on:
       candidates:
         description: 'stage 2: <id>=<repo>@<revision>/<file> of GGUFs not in the list yet, separated by spaces or commas'
         default: ''
+      listed:
+        description: 'stage 2 again: every GGUF of the list that takes the vocabulary of its original (T145)'
+        type: boolean
+        default: false
 
 jobs:
   gguf:
@@ -41,6 +53,8 @@ jobs:
           - { id: hf-smollm2-1.7b-instruct, original: HuggingFaceTB/SmolLM2-1.7B-Instruct@31b70e2e869a7173562077fd711b654946d38674, gguf: bartowski/SmolLM2-1.7B-Instruct-GGUF@1f03464768bfcc0319fc50da8ff5fb20b6417ba2/SmolLM2-1.7B-Instruct-Q8_0.gguf }
           - { id: hf-qwen2.5-3b-instruct, original: Qwen/Qwen2.5-3B-Instruct@aa8e72537993ba99e69dfaafa59ed015b17504d1, gguf: bartowski/Qwen2.5-3B-Instruct-GGUF@f302c64a2269a69fb27b2f9473b362f5bb8e78d8/Qwen2.5-3B-Instruct-Q8_0.gguf }
           - { id: hf-qwen2.5-7b-instruct, original: Qwen/Qwen2.5-7B-Instruct@a09a35458c702b33eeacc393d103063234e8bc28, gguf: bartowski/Qwen2.5-7B-Instruct-GGUF@8911e8a47f92bac19d6f5c64a2e2095bd2f7d031/Qwen2.5-7B-Instruct-Q8_0.gguf }
+          # T74's, before stage 1 (the original at the revision tests/format_check.py's ORIGINALS names)
+          - { id: hf-smollm2-135m-instruct, original: HuggingFaceTB/SmolLM2-135M-Instruct@12fd25f77366fa6b3b4b768ec3050bf629380bac, gguf: bartowski/SmolLM2-135M-Instruct-GGUF@09816acd5d99df7be770d85ea30822623dab342c/SmolLM2-135M-Instruct-Q8_0.gguf }
     steps:
       - name: Checkout
         if: inputs.only == '' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
@@ -51,10 +65,14 @@ jobs:
       - name: Fetch the original and the GGUF, and check
         if: inputs.only == '' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
         shell: bash
+        env:
+          ID: ${{ matrix.id }}
+          ORIGINAL: ${{ matrix.original }}
+          GGUF: ${{ matrix.gguf }}
         run: |
           python3 -m pip install --quiet numpy
           sudo mkdir -p /mnt/gguf && sudo chown "$USER" /mnt/gguf
-          python3 - "${{ matrix.original }}" "${{ matrix.gguf }}" /mnt/gguf <<'EOF'
+          python3 - "$ORIGINAL" "$GGUF" /mnt/gguf <<'EOF'
           import json, os, sys, urllib.error, urllib.request
           (repo, rev), (grepo, grest), out = sys.argv[1].split("@"), sys.argv[2].split("@"), sys.argv[3]
           grev, gfile = grest.split("/", 1)
@@ -75,16 +93,18 @@ jobs:
           get(f"https://huggingface.co/{grepo}/resolve/{grev}/{gfile}", "model.gguf")
           print(sorted(os.listdir(out)))
           EOF
-          echo "### ${{ matrix.id }}: ${{ matrix.gguf }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### $ID: $GGUF" >> "$GITHUB_STEP_SUMMARY"
           status=0
           python3 tests/gguf_check.py tensors /mnt/gguf/model.gguf /mnt/gguf > check.md || status=$?
           { echo; tail -n 1 check.md; echo; grep -v '^| blk\.' check.md; } >> "$GITHUB_STEP_SUMMARY"
+          grep -v '^| blk\.' check.md | head -n -1
+          echo "gguf_check $ID: $(tail -n 1 check.md)"
           echo "gguf_check.py tensors: exit $status" | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status
 
   # stage 2: the candidates, each with its original from src/models.js
   plan:
-    if: inputs.candidates != ''
+    if: inputs.candidates != '' || inputs.listed
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -93,20 +113,31 @@ jobs:
       - id: plan
         env:
           CANDIDATES: ${{ inputs.candidates }}
+          LISTED: ${{ inputs.listed }}
         run: |
           node --input-type=module -e '
             const { MODELS } = await import("./src/models.js");
+            // names of Hugging Face (letters, digits, "-", "_", "."): nothing a shell would read as more
+            const NAME = "[A-Za-z0-9][A-Za-z0-9._-]*";
+            const form = new RegExp(`^${NAME}/${NAME}@[0-9a-f]{40}/(${NAME}/)*${NAME}\\.gguf$`);
             const jobs = process.env.CANDIDATES.split(/[\s,]+/).filter(Boolean).map((pair) => {
               const [id, gguf] = pair.split("=");
               const entry = MODELS.find((model) => model.id === id);
               if (!entry?.hf) throw new Error(`${id}: no item from Hugging Face by that id in src/models.js`);
-              if (!/^[^@\/]+\/[^@\/]+@[0-9a-f]{40}\/.+\.gguf$/.test(gguf ?? "")) throw new Error(`${pair}: not <id>=<repo>@<revision>/<file>`);
+              if (!form.test(gguf ?? "")) throw new Error(`${pair}: not <id>=<repo>@<revision>/<file>`);
               // an item that takes a GGUF already (T136) has its original where its vocabulary comes from; one of
               // stage 1 (a GGUF with its own vocabulary) has no original revision in the list
               const source = entry.hf.vocabulary ?? entry.hf;
               if (source.weights?.endsWith(".gguf")) throw new Error(`${id}: takes a GGUF of its own vocabulary, and the list has no revision of its original`);
               return { id, original: `${source.repo}@${source.revision}`, gguf };
             });
+            // T145: the list itself, each GGUF against the original its vocabulary comes from
+            if (process.env.LISTED === "true") {
+              for (const { id, hf } of MODELS.filter((model) => model.hf?.vocabulary && model.hf.weights?.endsWith(".gguf"))) {
+                if (jobs.some((job) => job.id === id)) continue;
+                jobs.push({ id, original: `${hf.vocabulary.repo}@${hf.vocabulary.revision}`, gguf: `${hf.repo}@${hf.revision}/${hf.weights}` });
+              }
+            }
             console.log(`matrix=${JSON.stringify(jobs)}`);
           ' >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
@@ -131,10 +162,14 @@ jobs:
 
       - name: Fetch the original and the GGUF, and check
         shell: bash
+        env:
+          ID: ${{ matrix.id }}
+          ORIGINAL: ${{ matrix.original }}
+          GGUF: ${{ matrix.gguf }}
         run: |
           python3 -m pip install --quiet numpy
           sudo mkdir -p /mnt/gguf && sudo chown "$USER" /mnt/gguf
-          python3 - "${{ matrix.original }}" "${{ matrix.gguf }}" /mnt/gguf <<'EOF'
+          python3 - "$ORIGINAL" "$GGUF" /mnt/gguf <<'EOF'
           import json, os, sys, urllib.error, urllib.request
           (repo, rev), (grepo, grest), out = sys.argv[1].split("@"), sys.argv[2].split("@"), sys.argv[3]
           grev, gfile = grest.split("/", 1)
@@ -160,11 +195,11 @@ jobs:
           print(sorted(os.listdir(out)))
           EOF
           df -h /mnt
-          echo "### ${{ matrix.id }}: ${{ matrix.gguf }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### $ID: $GGUF" >> "$GITHUB_STEP_SUMMARY"
           status=0
           python3 tests/gguf_check.py tensors /mnt/gguf/model.gguf /mnt/gguf --original-vocabulary > check.md || status=$?
           { echo; tail -n 2 check.md; echo; grep -v '^| blk\.' check.md; } >> "$GITHUB_STEP_SUMMARY"
           grep -v '^| blk\.' check.md | head -n -1
-          echo "gguf_check ${{ matrix.id }}: $(tail -n 1 check.md)"
+          echo "gguf_check $ID: $(tail -n 1 check.md)"
           echo "gguf_check.py tensors: exit $status" | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status

@@ -7,7 +7,8 @@
 #   python3 tests/format_check.py <directory for the downloads> [model id ...]
 #
 # Needs the reference tools, which the page never uses: a venv with tests/requirements-reference.txt (docs/notes/dev-setup.md).
-# The first BOS may differ (the page always starts with it, T131). What a card always passes besides the prompt
+# The first BOS may differ (the page always starts with it, T131). The other differences known are in KNOWN, each
+# taking out only its own difference, and anything else makes the exit status 1 (T145). What a card always passes besides the prompt
 # (Swallow-MS's and llm-jp's system message) is in SYSTEM. Models with a sentencepiece tokenizer.model are compared
 # through transformers' slow tokenizer, which is not the real one for every model: for those of SENTENCEPIECE the
 # reference is the real template's text through the real sentencepiece instead.
@@ -42,6 +43,23 @@ SYSTEM = {"hf-swallow-ms-7b-instruct": "あなたは誠実で優秀な日本人�
 # although they have a tokenizer.json): the real sentencepiece reads the real template's text instead (T144)
 SENTENCEPIECE = {"hf-sarashina2.2-0.5b-instruct", "hf-sarashina2.2-1b-instruct", "hf-sarashina2.2-3b-instruct",
                  "hf-cat-translate-0.8b", "hf-cat-translate-1.4b"}
+# T145: the differences known, each with what it takes out of the comparison (the rest still counts, so a new break
+# in these models shows: two of them were 0/9 whatever else went wrong). One that no prompt needs any more is an error
+# too, to be taken out of here.
+KNOWN = {
+    # the real tokenizer.json puts no dummy space before the first piece ("A"), the page does ("▁A"): T131, refused
+    "hf-rakutenai-2.0-mini-instruct": {"why": "no dummy space before the first piece (T131)", "first_piece": True},
+    # the page asks for the answer's channel at the end of the format (T132): the real text with it is the page's
+    "hf-llm-jp-4-8b-instruct": {"why": "the page ends with <|channel|>final<|message|> (T132)",
+                                "text": lambda text: text + "<|channel|>final<|message|>"},
+    # the list's own ChatML has no system turn; the real template writes its default one
+    "hf-smollm2-135m-instruct": {"why": "the list's ChatML, without the default system turn",
+                                 "text": lambda text: re.sub(r"^<\|im_start\|>system\n.*?<\|im_end\|>\n", "", text, flags=re.S)},
+    # tokenizer.model's NFKC where the real tokenizer.json has none (the page follows the former), and the template
+    # strips the whole turn, which trims only the end of what was typed (T138)
+    "hf-swallow-ms-7b-instruct": {"why": "NFKC of tokenizer.model, and the turn stripped as a whole (T138)",
+                                  "prompts": {"  leading and trailing spaces  ", "ＡＢＣ１２３ｶﾀｶﾅ①"}},
+}
 # The reference of a GGUF that has its own vocabulary: the original at the revision the list had before the GGUF
 # (T136's first stage; T144). A GGUF with the original's vocabulary (hf.vocabulary, T136's second stage) says its own.
 ORIGINALS = {"Qwen/Qwen2.5-0.5B-Instruct": "7ae557604adf67be50417f59c2c2f167def9a775",
@@ -186,7 +204,7 @@ def main():
 
     directory, only = Path(sys.argv[1]), sys.argv[2:]
     accepted = set(inspect.signature(llama2_numpy.Tokenizer.__init__).parameters) - {"self", "data", "vocab_size", "kind"}
-    failed = []
+    failed, stale = [], []
     for entry in entries():
         if only and entry["id"] not in only:
             continue
@@ -195,35 +213,57 @@ def main():
         options = {**made.options, **entry.get("options", {})}
         template = entry.get("template") or made.options.get("template")
         if not template:
-            continue  # no format: what was typed is continued as it is
+            print(f"none {entry['id']}: no format (what was typed is continued as it is)", flush=True)
+            continue
         tokenizer = llama2_numpy.Tokenizer(made.tokenizer, abs(made.stream.header[5]), kind=options["tokenizer_kind"],
                                            **{key: value for key, value in options.items() if key in accepted})
         reference = AutoTokenizer.from_pretrained(folder)
         thinking = {"enable_thinking": False} if "(no thinking)" in entry["name"] else {}
-        same, diffs = 0, []
+        known = KNOWN.get(entry["id"], {})
+        same, explained, diffs = 0, 0, []
         for prompt in PROMPTS:
             page = [options["bos"]] + tokenizer.encode(filled(template, prompt), tuple(options.get("specials", ())))
             messages = ([{"role": "system", "content": SYSTEM[entry["id"]]}] if entry["id"] in SYSTEM else []) \
                 + [{"role": "user", "content": prompt}]
+            text = reference.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **thinking)
             if entry["id"] in SENTENCEPIECE:
-                text = reference.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **thinking)
-                real = sentencepiece_ids(folder / "tokenizer.model", text)
+                encoded = lambda text: sentencepiece_ids(folder / "tokenizer.model", text)
+                real = encoded(text)
             else:
+                # a text of KNOWN's as apply_chat_template(tokenize=True) encodes the text it renders
+                encoded = lambda text: list(reference(text, add_special_tokens=False)["input_ids"])
                 real = reference.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, **thinking)
                 real = list(real["input_ids"] if hasattr(real, "keys") else real)
-            if page == real or page[1:] == real:
+            matches = lambda real: page == real or page[1:] == real
+            if matches(real):
                 same += 1
+            elif "text" in known and matches(encoded(known["text"](text))) or prompt in known.get("prompts", ()):
+                explained += 1
+            elif known.get("first_piece") and first_piece(reference.convert_ids_to_tokens(page[1:]),
+                                                          reference.convert_ids_to_tokens(real)):
+                explained += 1
             else:
                 diffs.append(f"{prompt!r}\n    page {reference.convert_ids_to_tokens(page)[:60]}"
                              f"\n    real {reference.convert_ids_to_tokens(real)[:60]}")
         where = "the list" if entry.get("template") else "the converter"
-        print(f"{'ok  ' if not diffs else 'DIFF'} {entry['id']}: {same}/{len(PROMPTS)} (format of {where})", flush=True)
+        verdict = "DIFF" if diffs else "known" if explained else "ok  "
+        note = f", {explained} as known: {known['why']}" if explained else ""
+        print(f"{verdict} {entry['id']}: {same}/{len(PROMPTS)}{note} (format of {where})", flush=True)
         for diff in diffs[:3]:
             print("  ", diff)
         if diffs:
             failed.append(entry["id"])
+        if known and not explained:
+            print(f"STALE {entry['id']}: the difference known ({known['why']}) is gone: take it out of KNOWN")
+            stale.append(entry["id"])
     if failed:
-        print(f"{len(failed)} differ: {' '.join(failed)} (some are known: see AGENTS.md, T131 and T138)")
+        print(f"{len(failed)} differ beyond what KNOWN says: {' '.join(failed)}")
+    sys.exit(1 if failed or stale else 0)
+
+
+def first_piece(page, real):
+    """The same pieces but the first, which the page writes with the dummy space the real one leaves out."""
+    return len(page) == len(real) > 0 and page[1:] == real[1:] and page[0] == "▁" + real[0]
 
 
 if __name__ == "__main__":

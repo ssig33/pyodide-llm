@@ -22,11 +22,17 @@ LAYER = {"input_layernorm": "attn_norm", "post_attention_layernorm": "ffn_norm",
 
 
 def q8_0_blocks(values):
-    """llama.cpp's Q8_0: per 32 values a float16 scale (largest / 127) and the int8 values."""
+    """llama.cpp's Q8_0 (ggml-quants.c's quantize_row_q8_0_ref): per 32 values d = largest / 127 in float32, the
+    values times 1 / d rounded half away from zero, and d kept as float16; a d under float16's smallest half step
+    is kept as 0, and its values read back 0. T145: as llama.cpp rounds, to the bit (it rounded by the float16 d
+    before), so that tests/gguf_check.py's nearest reference is 0 off for a GGUF of the original's values."""
     groups = values.reshape(-1, 32).astype(np.float32)
-    scales = (np.abs(groups).max(axis=1) / 127.0).astype(np.float16)
-    inverse = np.divide(1.0, scales.astype(np.float32), out=np.zeros(len(scales), np.float32), where=scales > 0)
-    ints = np.clip(np.rint(groups * inverse[:, None]), -127, 127).astype(np.int8)
+    d = np.abs(groups).max(axis=1) / np.float32(127)
+    scales = d.astype(np.float16)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        inverse = np.divide(np.float32(1), d, out=np.zeros_like(d), where=d > 0)
+        scaled = groups * inverse[:, None]
+        ints = np.where(scales[:, None] > 0, np.sign(scaled) * np.floor(np.abs(scaled) + 0.5), 0).astype(np.int8)
     return np.concatenate([scales.view(np.uint8).reshape(-1, 2), ints.view(np.uint8)], axis=1).tobytes(), \
         (ints.astype(np.float32) * scales.astype(np.float32)[:, None]).reshape(values.shape)
 

@@ -20,11 +20,14 @@ LLAMA3 = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_fr
           "original_max_position_embeddings": 64}
 
 
-def model(tmp_path, vocab_size=320, dim=32, theta=10000.0, extra=None, change=None, original_change=None, **config):
+def model(tmp_path, vocab_size=320, dim=32, theta=10000.0, extra=None, change=None, original_change=None, shared=True,
+          n_kv_heads=4, **config):
     """A GGUF and the directory of its original (config.json and model.safetensors); change(tensors) alters what
-    the GGUF is written from, as a GGUF of other weights would be, and original_change(tensors) the original."""
-    shape, weights = synthetic_weights(dim=dim, hidden_dim=2 * dim, vocab_size=vocab_size, seq_len=128)
-    tensors, published = hugging_face(shape, weights, True)
+    the GGUF is written from, as a GGUF of other weights would be, and original_change(tensors) the original.
+    shared=False: a classifier of its own (output.weight, held row by row); n_kv_heads under 4: GQA (T145)."""
+    shape, weights = synthetic_weights(dim=dim, hidden_dim=2 * dim, vocab_size=vocab_size, seq_len=128,
+                                       n_kv_heads=n_kv_heads, shared=shared)
+    tensors, published = hugging_face(shape, weights, shared)
     published = {**published, "rms_norm_eps": 1e-5, "rope_theta": theta, **config}
     written = {name: tensor.copy() for name, tensor in tensors.items()}
     if change:
@@ -64,7 +67,9 @@ def test_eight_swapped_rows_of_the_embedding_are_caught(tmp_path, capsys, monkey
     assert not gguf_check.check_tensors(*model(tmp_path, vocab_size=100000, change=swap))
     result = summary(capsys)
     assert result["worst"] < 0.02, "the error of the whole tensor alone would have let this through"
-    assert result["rows"]["token_embd.weight"] == 8 and result["mismatches"] == 8
+    # the 8 rows, and the embedding as a whole past TIGHT (T145)
+    assert result["rows"]["token_embd.weight"] == 8 and result["mismatches"] == 9
+    assert list(result["past_tight"]) == ["token_embd.weight"]
 
 
 def test_a_row_of_nearly_nothing_is_not_an_error(tmp_path, capsys):
@@ -169,8 +174,9 @@ def test_rows_only_the_float16_scale_rounds_pass_and_a_swapped_row_does_not():
     original[5] *= 2.5e-3  # largest value about 2e-4: d about 1.6e-6, in float16's steps of 6e-8
     original[6] *= 5e-4
     gguf = llama_cpp_q8_0(original)
-    count, _, _, _, rounded = gguf_check.row_check(gguf_check.row_parts(gguf, original, True))
-    assert count == 0 and rounded >= 1
+    checked = gguf_check.row_check(gguf_check.row_parts(gguf, original, True))
+    assert checked[0] == 0 and checked[4] >= 1
+    assert {row for row, *_ in checked[5]} <= {5, 6} and len(checked[5]) == checked[4], "T145: the rows are listed"
     assert gguf_check.row_check(gguf_check.row_parts(gguf, original, False))[0] >= 1, \
         "against the original alone the rounded rows read as other weights"
     gguf[[10, 20]] = gguf[[20, 10]]
@@ -203,3 +209,73 @@ def test_a_row_whose_q8_0_reference_overflows_is_still_compared():
     assert gguf_check.row_check(gguf_check.row_parts(gguf, original, True))[0] == 0
     gguf[8] = gguf[40]
     assert gguf_check.row_check(gguf_check.row_parts(gguf, original, True))[0] == 1
+
+
+# ------------------------------------------------------------------------------------------- T145
+@pytest.mark.parametrize("tensor", ["model.layers.1.post_attention_layernorm.weight", "model.layers.0.mlp.up_proj.weight"])
+def test_a_tensor_a_little_off_is_past_the_tight_line(tmp_path, capsys, tensor):
+    """The review of T136's second stage: the whole tensor's 0.02 lets a scale of 1.05 or 4% of noise through, while
+    a GGUF made from the original is 0 off its nearest reference (TIGHT). Here 0.4%: an F32 norm, and a Q8_0 matrix."""
+    def scale(tensors):
+        tensors[tensor] = tensors[tensor] * np.float32(1.004)
+
+    assert not gguf_check.check_tensors(*model(tmp_path, change=scale))
+    result = summary(capsys)
+    assert result["worst"] < 0.02, "the line of the whole tensor would have let this through"
+    assert len(result["past_tight"]) == 1 and result["mismatches"] == 1, result["past_tight"]
+    assert 1e-3 < next(iter(result["past_tight"].values())) < 0.02
+
+
+def test_the_same_weights_are_0_off_their_nearest_reference(tmp_path, capsys):
+    assert gguf_check.check_tensors(*model(tmp_path))
+    result = summary(capsys)
+    assert result["nearest"] < 1e-6 and result["past_tight"] == {}
+
+
+def test_a_classifier_of_its_own_is_held_row_by_row(tmp_path, capsys):
+    assert gguf_check.check_tensors(*model(tmp_path, shared=False))
+    result = summary(capsys)
+    assert result["rows"] == {"token_embd.weight": 0, "output.weight": 0} and result["mismatches"] == 0
+
+    def swap(tensors):
+        classifier = tensors["lm_head.weight"]
+        classifier[[3, 200]] = classifier[[200, 3]]
+
+    other = tmp_path / "other"
+    other.mkdir()
+    assert not gguf_check.check_tensors(*model(other, shared=False, change=swap))
+    result = summary(capsys)
+    assert result["rows"]["output.weight"] == 2 and result["rows"]["token_embd.weight"] == 0
+    assert [row for row, *_ in result["bad_rows"]["output.weight"]] == [3, 200]
+
+
+@pytest.mark.parametrize("block", [gguf_check.BLOCK, 128])  # the whole tensor, and blocks of one head
+def test_gqa_is_read_turned_by_its_own_heads(tmp_path, capsys, monkeypatch, block):
+    """k of a GQA model has fewer heads than q (2 heads of 8 rows here, q 4): turned by q's heads it reads as other
+    weights, and in blocks a block must be whole heads of k."""
+    monkeypatch.setattr(gguf_check, "BLOCK", block)
+    assert gguf_check.check_tensors(*model(tmp_path, n_kv_heads=2))
+    result = summary(capsys)
+    assert result["orders"] == ["turned (llama2.c order)"] and result["mismatches"] == 0 and result["nearest"] < 1e-6
+
+
+def test_rows_that_pass_only_against_a_q8_0_are_listed_with_their_piece(tmp_path, capsys):
+    """T145 (2): the rows the float16 scale of Q8_0 rounds (llm-jp-3 980M's 8, T136) pass, and are listed with their
+    id, piece and norm, to be read."""
+    def small(tensors):
+        # an embedding of 0.01 (with 0.3, no row can be both over 1e-3 of the median and of a d near float16's steps),
+        # and row 5 of a d of 1.5 of float16's smallest step: kept as 2 steps, the row reads back 33% off
+        rng = np.random.default_rng(5)
+        embedding = (rng.standard_normal(tensors["model.embed_tokens.weight"].shape) * 0.01).astype(np.float32)
+        row = np.linspace(0.5, 1.0, embedding.shape[1], dtype=np.float32) * np.float32(127 * 1.5 * 2.0 ** -24)
+        embedding[5] = row * np.where(np.arange(row.size) % 2, -1, 1).astype(np.float32)
+        tensors["model.embed_tokens.weight"] = embedding
+
+    assert gguf_check.check_tensors(*model(tmp_path, change=small, original_change=small))
+    result = summary(capsys)
+    rows = result["rounded_detail"]["token_embd.weight"]
+    assert rows and len(rows) == result["rounded_rows"]["token_embd.weight"]
+    assert [(row, piece) for row, piece, *_ in rows] == [(5, "w5")]
+    _, _, against, near, norm = rows[0]
+    assert against > gguf_check.ROW_LINE and near == 0 and norm < 1e-3
+    assert result["past_tight"] == {} and result["mismatches"] == 0

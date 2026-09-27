@@ -36,11 +36,11 @@ sudo apt install -y git gh curl wget ca-certificates build-essential \
 sudo apt install python3-numpy python3-pytest python3-regex python3-jinja2 python3-sentencepiece python3-protobuf
 ```
 
-`tokenizers`（pytest の本物との突き合わせ。無ければ system の python3 では `tests/test_bytebpe.py`（先頭の `importorskip("tokenizers")`）と `tests/test_llama3.py` の本物と比べる 61 件が走らない。表示は「62 skipped」。T144 までは test_llama3.py が test_bytebpe.py を import していて 185 件が走らず、うち 12 件は tokenizers と関係が無かった（RoPE の表など））と `transformers`（`tests/format_check.py` だけ）は 26.04 の apt に無いので、system の site-packages を見る小さな venv に入れる（apt の numpy・jinja2・sentencepiece・protobuf はそのまま使う。PyTorch は入らない、要らない）。**venv はリポジトリの中の `.venv`**（2026-09-26、持ち主の指示。`.gitignore` にある。pytest には `tests` を渡すので `.venv` の中は集めない）。下の 2 の clone の後、リポジトリの中で:
+`tokenizers`（pytest の本物との突き合わせ。無ければ system の python3 では `tests/test_bytebpe.py`（先頭の `importorskip("tokenizers")`）と `tests/test_llama3.py` の本物と比べる 61 件が走らない。表示は「62 skipped」。T144 までは test_llama3.py が test_bytebpe.py を import していて 185 件が走らず、うち 12 件は tokenizers と関係が無かった（RoPE の表など））と `transformers`（`tests/format_check.py` だけ）は 26.04 の apt に無いので、system の site-packages を見る小さな venv に入れる（apt の numpy・jinja2・protobuf はそのまま使う。sentencepiece は apt の 0.2.1 ではなく、記録（rinna の正規化の表、T126）を取った 0.2.2 を venv に（T145、2026-09-27）。PyTorch は入らない、要らない）。**venv はリポジトリの中の `.venv`**（2026-09-26、持ち主の指示。`.gitignore` にある。pytest には `tests` を渡すので `.venv` の中は集めない）。下の 2 の clone の後、リポジトリの中で:
 
 ```sh
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install tokenizers==0.23.1 transformers==5.16.1
+.venv/bin/pip install --no-cache-dir tokenizers==0.23.1 transformers==5.16.1 sentencepiece==0.2.2
 .venv/bin/python -m pytest tests -q        # 本物の tokenizers との突き合わせも走る（471 件）
 .venv/bin/python tests/format_check.py .tmp/format-check hf-qwen3-0.6b
 ```

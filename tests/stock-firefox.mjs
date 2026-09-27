@@ -43,7 +43,8 @@ try {
   console.log(`status: ${result.status}`);
   console.log(result.text.slice(0, 160).replace(/\n/g, " / "));
 } finally {
-  await driver.quit();
+  // T145: given up on after 15 s, as tests/e2e.mjs gives up on browser.close() (T141): the verdict is known by then
+  await Promise.race([driver.quit(), new Promise((resolve) => setTimeout(resolve, 15000))]).catch(() => {});
 }
 if (failures.length) {
   console.error("FAILED\n- " + failures.join("\n- "));

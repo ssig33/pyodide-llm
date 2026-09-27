@@ -1,6 +1,8 @@
 # hf_fetch.py: the files of a Hugging Face model of src/models.js, at the revision the list pins, for measurements in
 # CI that need the original (T100): the weights, config.json, the tokenizer and tokenizer_config.json. Prints what to
-# hand to tests/perplexity_prepare.py: the directory, or the .gguf file.
+# hand to tests/perplexity_prepare.py: the directory, or the .gguf file. For a GGUF that takes the vocabulary of its
+# original (T136's second stage, hf.vocabulary): the directory of the original's files, with the GGUF linked into it
+# (T145: int4.yml and draft.yml named the originals instead).
 #
 #   python3 tests/hf_fetch.py <model id, or hf:<owner>/<repository>@<revision> (as tests/e2e.mjs takes it)> <directory>
 import json
@@ -21,10 +23,22 @@ else:
     entry = json.loads(subprocess.check_output(["node", "-e", script], cwd=HERE.parent))
 hf = entry["hf"]
 weights = fetch(entry, hf["weights"], directory)
-if not hf["weights"].endswith(".gguf"):
-    for name in [hf["config"], *([hf["tokenizer"]] if isinstance(hf["tokenizer"], str) else hf["tokenizer"][:1]), "tokenizer_config.json"]:
-        try:
-            fetch(entry, name, directory)
-        except OSError:
-            pass  # tokenizer_config.json is optional
-print(weights if hf["weights"].endswith(".gguf") else weights.parent)
+gguf, vocabulary = hf["weights"].endswith(".gguf"), hf.get("vocabulary")
+if gguf and not vocabulary:
+    print(weights)  # T74: the GGUF says its configuration and vocabulary itself
+    sys.exit(0)
+# the configuration and the tokenizer: the model's, or for a GGUF those of the original it takes them from
+source = {"hf": vocabulary} if vocabulary else entry
+folder = directory / source["hf"]["repo"].replace("/", "--") / source["hf"]["revision"]  # where fetch() puts them
+tokenizer = (vocabulary or hf)["tokenizer"]
+for name in ["config.json" if vocabulary else hf["config"],
+             *([tokenizer] if isinstance(tokenizer, str) else tokenizer[:1]), "tokenizer_config.json"]:
+    try:
+        fetch(source, name, directory)
+    except OSError:
+        pass  # tokenizer_config.json is optional
+if vocabulary:
+    link = folder / hf["weights"]
+    if not link.exists():
+        link.symlink_to(weights.resolve())
+print(folder)

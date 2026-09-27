@@ -647,6 +647,37 @@ function weightsBuffer(size, header, options) {
   };
 }
 
+// T93: where the converter writes the checkpoint, piece by piece, straight into where the engine will read it (a
+// Python buffer on the way would stay: Pyodide's memory never shrinks). sink is what the converter calls
+// (llama2_convert.Writer), weights what sink.open() made (weightsBuffer), bytes its size; release() lets go of it once
+// (T145: a conversion that failed after sink.open() left a Python buffer of the model's size behind with
+// ?without=kernels). Out of convert() so that tests/worker-sink-check.mjs can follow sink.open() to footprint().
+function checkpointSink() {
+  const into = {
+    weights: undefined, bytes: 0,
+    release() {
+      into.weights?.destroy();
+      into.weights = undefined;
+    },
+  };
+  into.sink = {
+    // form: what lays out the checkpoint and sizes the forward pass besides the header (llama2_numpy.FORM, T115, T144)
+    open(bytes, header, dtype, form) {
+      into.release();  // an earlier try (another tokenizer) that got this far
+      into.weights = weightsBuffer(bytes, header.toJs(), { dtype, ...form.toJs({ dict_converter: Object.fromEntries }) });
+      header.destroy();
+      form.destroy();
+      into.bytes = bytes;
+    },
+    write(offset, array) {
+      const view = array.getBuffer("u8");
+      into.weights.write(offset, view.data);
+      view.release();
+    },
+  };
+  return into;
+}
+
 // Every await in here may end with the AbortError of signal: a newer load has taken over, and this one must
 // leave nothing behind, least of all a Python buffer as large as its model.
 // A Hugging Face model, from the visitor's disk ({weights, config, tokenizer} are Files) or from huggingface.co
@@ -911,24 +942,7 @@ async function convert(model, signal, id) {
     return res;
   };
   let first, size, base, conversion, shards;
-  // T93: the converter writes the checkpoint here, piece by piece, straight into where the engine will read it.
-  // A Python buffer on the way would stay: Pyodide's memory never shrinks.
-  let weights, weightsSize = 0;
-  const sink = {
-    // form: what lays out the checkpoint and sizes the forward pass besides the header (llama2_numpy.FORM, T115, T144)
-    open(bytes, header, dtype, form) {
-      weights?.destroy();  // an earlier try (another tokenizer) that got this far
-      weights = weightsBuffer(bytes, header.toJs(), { dtype, ...form.toJs({ dict_converter: Object.fromEntries }) });
-      header.destroy();
-      form.destroy();
-      weightsSize = bytes;
-    },
-    write(offset, array) {
-      const view = array.getBuffer("u8");
-      weights.write(offset, view.data);
-      view.release();
-    },
-  };
+  const into = checkpointSink(), { sink } = into;
   // T115: no bits asked for (weightsFor() in src/models.js asks for six only where the device says it has too little
   // memory): int8 where its forward pass fits a 32-bit memory or the browser has a 64-bit one, six bits where neither
   // (T133), once the header is known
@@ -954,6 +968,7 @@ async function convert(model, signal, id) {
         break;
       } catch (error) {
         if (error.type !== "Incomplete" || bytes >= size) {
+          into.release();
           throw error;
         }
       }
@@ -1069,6 +1084,7 @@ async function convert(model, signal, id) {
       }
     }
     if (!conversion) {
+      into.release();
       throw refusal ?? missing;
     }
   }
@@ -1139,19 +1155,20 @@ async function convert(model, signal, id) {
       ({ template } = options);
       const engineOptions = { ...options };
       delete engineOptions.template;
-      llama = weights.llama(proxies[1], { kernels, disable: disabled, ...engineOptions, ...model.options });
+      llama = into.weights.llama(proxies[1], { kernels, disable: disabled, ...engineOptions, ...model.options });
       loadSeconds.construct = since(constructStarted);
       if (remote) {
         postMessage({ type: "status", load: id, text: `${model.name}: keeping the converted model...` });
-        kept = await keepConverted(model, weights, weightsSize, proxies[1], options, signal);
+        kept = await keepConverted(model, into.weights, into.bytes, proxies[1], options, signal);
       }
     } finally {
       proxies.forEach((proxy) => proxy.destroy());
-      weights?.destroy();
     }
     return { fromCache: false, notKept: kept, keptMiss, template };
   } finally {
-    // the engine keeps what it needs of the checkpoint alive, the rest goes with this
+    // the engine keeps what it needs of the checkpoint alive, the rest goes with this; and a feed that failed (the
+    // line, a refusal on the way) leaves no Python buffer of the model's size behind (T145)
+    into.release();
     conversion.destroy();
     quantizeRows?.destroy();
     bfloat16?.destroy();

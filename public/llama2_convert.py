@@ -1285,7 +1285,6 @@ class Stream:
             target = wanted.get(name) or ("check" if info.get("rope_freqs") else None)
             self.steps.append((base + begin, base + end, name, target))
         self.position, self.step, self.pending, self.first = start, 0, bytearray(), 0
-        self.size = max((end for _, end, _, _ in self.steps), default=base)
         self.config = config
 
     def __contains__(self, name):  # what checkpoint_header() asks

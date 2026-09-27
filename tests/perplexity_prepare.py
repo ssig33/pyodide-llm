@@ -4,6 +4,9 @@
 # the options the page would give Llama(). convert_hf.py does not say those options; the page's path does.
 #
 #   python3 tests/perplexity_prepare.py <directory with config.json, model.safetensors and the tokenizer | a .gguf> <out> [int8|float32]
+#
+# A directory with config.json, the tokenizer and a .gguf (tests/hf_fetch.py makes it for T136's second stage): the
+# GGUF's weights with the original's vocabulary and configuration, as the page reads them (llama2_convert.gguf_weights).
 import json
 import struct
 import sys
@@ -12,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "public"))
-from llama2_convert import Conversion, Incomplete  # noqa: E402
+from llama2_convert import Conversion, Incomplete, gguf_weights  # noqa: E402
 
 CHUNK = 8 << 20
 
@@ -45,11 +48,27 @@ if directory.suffix == ".gguf":
     first = conversion.base
 else:
     tokenizer = next(p for p in (directory / n for n in ("tokenizer.json", "spiece.model", "tokenizer.model")) if p.exists())
-    data = np.memmap(directory / "model.safetensors", dtype=np.uint8, mode="r")
-    size = struct.unpack("<Q", bytes(data[:8]))[0]
-    conversion = Conversion(bytes(data[8:8 + size]).decode(), 8 + size, (directory / "config.json").read_text(),
-                            tokenizer.read_bytes(), tokenizer.name, dtype=dtype, sink=sink)
-    first = 0
+    config = (directory / "config.json").read_text()
+    weights = sorted(directory.glob("*.gguf"))
+    if weights:
+        # T136's second stage: the header of the GGUF as a safetensors one, once config.json agrees with it
+        data = np.memmap(weights[0], dtype=np.uint8, mode="r")
+        size = 1 << 20
+        while True:
+            try:
+                header, base = gguf_weights(bytes(data[:size]), config)
+                break
+            except Incomplete:
+                size *= 2
+        conversion = Conversion(header, base, config, tokenizer.read_bytes(), tokenizer.name, dtype=dtype, start=base,
+                                sink=sink)
+        first = base
+    else:
+        data = np.memmap(directory / "model.safetensors", dtype=np.uint8, mode="r")
+        size = struct.unpack("<Q", bytes(data[:8]))[0]
+        conversion = Conversion(bytes(data[8:8 + size]).decode(), 8 + size, config, tokenizer.read_bytes(),
+                                tokenizer.name, dtype=dtype, sink=sink)
+        first = 0
 for start in range(first, len(data), CHUNK):
     conversion.feed(bytes(data[start:start + CHUNK]))
 conversion.finish()
