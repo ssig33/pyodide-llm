@@ -135,12 +135,17 @@ def test_pretokenizers_split_every_character_as_the_real_ones_do(name):
         return theirs != mine
 
     codes = [code for code in range(0x110000) if not 0xD800 <= code < 0xE000]
-    wrong = []
+    wrong, alone = [], []
     for start in range(0, len(codes), 4096):
         chunk = codes[start:start + 4096]
         theirs, mine = ends("".join(around(chr(code)) for code in chunk))
         if theirs != mine:  # which of them
-            wrong += [code for code in chunk if differs(code)]
+            culprits = [code for code in chunk if differs(code)]
+            wrong += culprits
+            # T206's review: a chunk that splits otherwise where no one of its code points does (the places of two
+            # next to each other) fails too, not pass for want of a code point to name
+            alone += [] if culprits else [f"U+{chunk[0]:04X} to U+{chunk[-1]:04X}"]
+    assert not alone, f"{name}: these chunks split otherwise than the real one, no code point of them alone: {alone}"
     # Not the characters Python's Unicode has not assigned yet (Cn): the real tokenizers' Rust can know them (CI's
     # Python 3.14 and Rust's char::is_numeric of Unicode 17: Tolong Siki's digits U+11DE0 to U+11DE9, U+16FF4 to U+16FF6)
     unassigned = [code for code in wrong if unicodedata.category(chr(code)) == "Cn"]
