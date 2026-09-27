@@ -79,8 +79,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
       <section data-section="memory">
         <h2>Page memory</h2>
         <p class="about">How much memory this page can hold before the browser refuses it or ends the tab (an iPhone ends
-          a tab past about 2 to 3 GB, with no error). Not part of Run all: run it on its own. The tab may be reloaded, and
-          the page then says how far it got.</p>
+          a tab past about 2 to 3 GB, with no error). Not part of Run all: run it on its own, after you have reported or
+          copied the other sections' results (a tab that is ended loses them). Keep this page in front until it ends:
+          hiding it (another app, the screen locked) or leaving it stops the run. The tab may be reloaded, and the page
+          then says how far it got.</p>
       </section>
       <div class="report" hidden>
         <h2>Results</h2>
@@ -147,7 +149,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
   import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
     matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
-  import { holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
+  import { forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
 
   declare const __BUILD__: string;
   const BASE = import.meta.env.BASE_URL;
@@ -689,10 +691,27 @@ const BENCH_MODEL = "llm-jp-3-150m";
   })();
   async function pageMemory(): Promise<Result> {
     const w = worker("benchmark/memory.js");
+    // T173's review: a page hidden (another app, the screen locked) or left (a reload, another page) stops the run in
+    // the event itself: the mark is removed (a phone ends a hidden page far sooner, so a tab ended then is no limit,
+    // and a page left is no tab ended) and the memory let go at once. Only a tab that ends with no such event leaves
+    // its mark.
+    let hide: () => void = () => {};
+    const hidden = new Promise<void>((resolve) => (hide = () => resolve()));
+    const stop = () => {
+      forgetMark(tabStorage);
+      w.terminate();
+      hide();
+    };
+    const onVisibility = () => { if (document.visibilityState === "hidden") stop(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    addEventListener("pagehide", stop);
+    if (document.visibilityState === "hidden") stop();
     try {
-      return memoryResult(await holdMemory({ ask: (message: any) => ask(w, message), storage: tabStorage,
+      return memoryResult(await holdMemory({ ask: (message: any) => ask(w, message), storage: tabStorage, hidden,
         limit: memoryLimit(parameters.get("memoryMB")), stage: (s: Stage) => staged("memory", s) })) as Result;
     } finally {
+      document.removeEventListener("visibilitychange", onVisibility);
+      removeEventListener("pagehide", stop);
       w.terminate();
     }
   }
@@ -765,6 +784,9 @@ const BENCH_MODEL = "llm-jp-3-150m";
         stall.stop();
         live.forEach((w) => w.terminate());  // the section's own finally has done it, unless it was stopped
         live.clear();
+        // T173's review: a page-memory run stopped for its silence never reaches its own finally: its mark would
+        // later read as a tab the browser ended
+        if (name === "memory") forgetMark(tabStorage);
       }
       results[name] = result;
       progress.box.hidden = true;

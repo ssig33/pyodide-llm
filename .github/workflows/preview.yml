@@ -74,6 +74,19 @@ jobs:
         shell: bash
         run: node tests/page-memory-check.mjs --dist | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # T173's review: the tab ended by the kernel for its memory, as a phone's jetsam or low-memory killer ends it (no
+      # error in the page): the whole browser in a cgroup of 2 GiB with no swap, the section asked for its 4 GiB. The
+      # page loaded again must say it held less than 2 GiB (the runner's swap stays off for the steps after it).
+      - name: The benchmark's page memory, the tab ended for its memory
+        if: always()
+        shell: bash
+        run: |
+          sudo swapoff -a
+          sudo mkdir -p /sys/fs/cgroup/page-memory
+          echo 2G | sudo tee /sys/fs/cgroup/page-memory/memory.max
+          echo $$ | sudo tee /sys/fs/cgroup/page-memory/cgroup.procs
+          node tests/page-memory-check.mjs --dist --ended 2048 | tee -a "$GITHUB_STEP_SUMMARY"
+
       # a change to the service worker is tried here, on the branch, before it goes out (AGENTS.md)
       - name: Offline (T111)
         if: inputs.offline
