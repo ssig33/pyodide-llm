@@ -27,6 +27,23 @@ const GS: i32 = 32; // int8 quantization group size, as in quantize.py
   return e * reinterpret<f32>(<u32>(<i32>k + 127) << 23);
 }
 
+// fexp() on four numbers at a time, bit for bit, except that below -87 it gives exp(-87) (1.6e-38) where fexp gives 0
+// @ts-ignore: decorator
+@inline function vexp(x: v128): v128 {
+  x = f32x4.min(f32x4.max(x, f32x4.splat(-87.0)), f32x4.splat(88.0));
+  const k = f32x4.nearest(f32x4.mul(x, f32x4.splat(1.44269504088896341)));
+  const r = f32x4.sub(f32x4.sub(x, f32x4.mul(k, f32x4.splat(0.693359375))), f32x4.mul(k, f32x4.splat(-2.12194440e-4)));
+  let p = f32x4.splat(1.9875691500e-4);
+  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(1.3981999507e-3));
+  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(8.3334519073e-3));
+  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(4.1665795894e-2));
+  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(1.6666665459e-1));
+  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(5.0000001201e-1));
+  const e = f32x4.add(f32x4.add(f32x4.mul(p, f32x4.mul(r, r)), r), f32x4.splat(1.0));
+  const scale = i32x4.shl(i32x4.add(i32x4.trunc_sat_f32x4_s(k), i32x4.splat(127)), 23);
+  return f32x4.mul(e, scale);
+}
+
 // W (d,n) @ x (n,) -> xout, rows [r0, r1)
 export function matmul_f32(xout: usize, x: usize, w: usize, n: i32, r0: i32, r1: i32): void {
   const n16 = n & ~15;
@@ -475,10 +492,19 @@ export function layernorm(out: usize, x: usize, w: usize, b: usize, n: i32): voi
   }
 }
 
+// T162: gelu and swiglu four at a time by vexp. Their results are fexp's bit for bit: where vexp and fexp differ (below
+// -87), 1 + exp(x) is 1 either way.
 export function gelu(out: usize, x: usize, b: usize, n: i32): void {
-  // GPT-2's gelu_new, with the bias of the projection added first. 0.5 * (1 + tanh(z)) is 1 / (1 + exp(-2z)),
-  // so the same table-free exp as swiglu does it.
-  for (let j = 0; j < n; j++) {
+  // GPT-2's gelu_new, with the bias of the projection added first. 0.5 * (1 + tanh(z)) is 1 / (1 + exp(-2z)).
+  const one = f32x4.splat(1.0), c = f32x4.splat(0.7978845608028654), cube = f32x4.splat(0.044715), two = f32x4.splat(-2.0);
+  let j = 0;
+  for (; j + 4 <= n; j += 4) {
+    const o = <usize>j << 2;
+    const v = f32x4.add(v128.load(x + o), v128.load(b + o));
+    const inner = f32x4.mul(c, f32x4.add(v, f32x4.mul(f32x4.mul(f32x4.mul(cube, v), v), v)));
+    v128.store(out + o, f32x4.div(v, f32x4.add(one, vexp(f32x4.mul(two, inner)))));
+  }
+  for (; j < n; j++) {
     const o = <usize>j << 2;
     const v = load<f32>(x + o) + load<f32>(b + o);
     const inner = <f32>0.7978845608028654 * (v + <f32>0.044715 * v * v * v);
@@ -487,7 +513,14 @@ export function gelu(out: usize, x: usize, b: usize, n: i32): void {
 }
 
 export function swiglu(out: usize, h1: usize, h3: usize, n: i32): void {
-  for (let j = 0; j < n; j++) {
+  const one = f32x4.splat(1.0);
+  let j = 0;
+  for (; j + 4 <= n; j += 4) {
+    const o = <usize>j << 2;
+    const v = v128.load(h1 + o);
+    v128.store(out + o, f32x4.mul(f32x4.div(v, f32x4.add(one, vexp(f32x4.neg(v)))), v128.load(h3 + o)));
+  }
+  for (; j < n; j++) {
     const o = <usize>j << 2;
     const v = load<f32>(h1 + o);
     store<f32>(out + o, v / (<f32>1.0 + fexp(-v)) * load<f32>(h3 + o));
@@ -542,23 +575,6 @@ export function penalize(logits: usize, tokens: usize, count: i32, penalty: f32)
     const value = load<f32>(address);
     store<f32>(address, value > 0 ? value / penalty : value * penalty);
   }
-}
-
-// fexp() on four numbers at a time, for x <= 0
-// @ts-ignore: decorator
-@inline function vexp(x: v128): v128 {
-  x = f32x4.max(x, f32x4.splat(-87.0));
-  const k = f32x4.nearest(f32x4.mul(x, f32x4.splat(1.44269504088896341)));
-  const r = f32x4.sub(f32x4.sub(x, f32x4.mul(k, f32x4.splat(0.693359375))), f32x4.mul(k, f32x4.splat(-2.12194440e-4)));
-  let p = f32x4.splat(1.9875691500e-4);
-  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(1.3981999507e-3));
-  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(8.3334519073e-3));
-  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(4.1665795894e-2));
-  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(1.6666665459e-1));
-  p = f32x4.add(f32x4.mul(p, r), f32x4.splat(5.0000001201e-1));
-  const e = f32x4.add(f32x4.add(f32x4.mul(p, f32x4.mul(r, r)), r), f32x4.splat(1.0));
-  const scale = i32x4.shl(i32x4.add(i32x4.trunc_sat_f32x4_s(k), i32x4.splat(127)), 23);
-  return f32x4.mul(e, scale);
 }
 
 // The state of sortNucleus(): globals are no static data

@@ -236,6 +236,21 @@ for tensors_of, config_of, arch in ((tensors, gpt2_config, "gpt2"), (neox_tensor
 widen = llama2_numpy.kernel_widener("simdkernel.so")
 patterns = np.arange(65536 + 5, dtype=np.uint32).astype(np.uint16).tobytes()
 assert np.array_equal(widen(patterns).view(np.uint32), llama2_convert.bfloat16(patterns).view(np.uint32)), "widen_bf16 is not bfloat16()"
+# T162: swiglu and gelu four at a time (vexp) are their scalar tails (fexp) to the bit, over both sides of exp's clamps
+# (-87 and 88), large and small numbers, zeros and infinities: each value alone (n = 1) takes the tail
+simd = llama2_numpy.load_kernels("simdkernel.so", without_relaxed=True)
+edges = np.array([0.0, -0.0, 1e-30, -1e-30, 43.4, 43.6, 44.0, -43.6, -44.0, 86.9, 87.0, 87.1, 88.0, 88.1, 89.0, 200.0,
+                  -86.9, -87.0, -87.1, -88.0, -88.1, -89.0, -200.0, 3e38, -3e38, np.inf, -np.inf], dtype=np.float32)
+inputs = np.concatenate([edges, np.linspace(-120, 120, 4001, dtype=np.float32),
+                         (rng.standard_normal(4000) * 4).astype(np.float32)])
+inputs = inputs[:inputs.size & ~3]
+others = rng.standard_normal(inputs.size).astype(np.float32)
+for name, first, other in (("swiglu", inputs, others), ("gelu", others, inputs)):
+    four, single = np.empty_like(inputs), np.empty_like(inputs)
+    simd[name](four.ctypes.data, first.ctypes.data, other.ctypes.data, inputs.size)
+    for j in range(inputs.size):
+        simd[name](single[j:].ctypes.data, first[j:].ctypes.data, other[j:].ctypes.data, 1)
+    assert np.array_equal(four.view(np.uint32), single.view(np.uint32)), f"{name} four at a time is not {name} one at a time"
 # T136: GGUF's Q8_0 widened on the kernels is NumPy's q8_0() to the bit: every float16 scale (NaNs, infinities,
 # subnormals, both zeros) once, with every int8 (-128 and 127 included) across the blocks, in odd numbers of blocks
 q8_0 = llama2_numpy.kernel_q8_0("simdkernel.so")
