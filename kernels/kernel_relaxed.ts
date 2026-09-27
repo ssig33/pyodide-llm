@@ -161,11 +161,24 @@ function tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize
 }
 
 // rows r0..r1 for count tokens: the tiles row by row of four, so that a tile's four weight rows stay in the first
-// cache for every token (T108's blocks of 16 KB are not needed here)
+// cache for every token (T108's blocks of 16 KB are not needed here).
+// T159's review: a quad of rows up to 16 KB is read once in order before its tiles. A tile reads its rows in four
+// lane passes, each every fourth group: every other 64-byte line, 128 bytes apart, and a pass over a row of 2 KB is
+// 16 steps long. From memory (a model's weights, read once a block) the x86 prefetchers did not keep up with passes
+// that short: on the EPYC 9V74 and 9V45 (Zen 4 and 5) the tile took up to 1.6 times as long as the blocks before it,
+// at 4 to 8 tokens (the numbers are in TODO.md's T159). Past 16 KB (rows of the hidden sizes) the passes are long
+// enough, and a read ahead of that size falls out of the first cache before the tile gets to it. The sum is there only
+// so that the reads stay (a load whose value is not used goes away): it is stored where the tile writes next.
 export function matmul_q8r_tile(xout: usize, xq: usize, xs: usize, wq: usize, ws: usize, wc: usize, n: i32, r0: i32, r1: i32, count: i32, os: i32, frame: i32): void {
   const rows4 = r0 + ((r1 - r0) & ~3), count4 = count & ~3;
-  const outStride = <usize>os, frameStride = <usize>frame;
+  const outStride = <usize>os, frameStride = <usize>frame, quad = <usize>n << 2;
   for (let i = r0; i < rows4; i += 4) {
+    if (count4 > 0 && quad <= 16384) {
+      const w = wq + <usize>i * <usize>n;
+      let sum = i32x4.splat(0);
+      for (let p: usize = 0; p < quad; p += 64) sum = i32x4.add(sum, v128.load(w + p));
+      v128.store(xout + (<usize>i << 2), sum);  // rows i..i+3 of the first token, which its tile writes next
+    }
     let t = 0;
     for (; t < count4; t += 4) {
       tile(xout + <usize>t * outStride, xq + <usize>t * frameStride, xs + <usize>t * frameStride, wq, ws, wc, n, i, outStride, frameStride);
