@@ -584,10 +584,14 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
   GPU が測る途中で止まった: 頭が「WebGPU stopped while timed: the GPU failed on a block of the prompt」、止まった後の行の GPU の欄はその理由、比は無し。
 - 確かめ（直しの後、T188 の決まり: 手元は編集と `node --check`）: CI の `tests.yml --ref t184-real-path`（bench.mjs と gpu-default-check）と `preview.yml --ref t184-real-path`（既定の stories260K と、`model=stories15M query=gpuTest=on`）。手元で gpu-default-check を 1 回回した（T188 の前に始めた回）: 新しい 3 つは試験台の読み違い（GPU を止まった後で読んでいた）を直す前に 1 つ落ち、古い「faster from 36 tokens」の時間の検査は機械の混みで 1 つ落ちた（直前の回は通っていた）。直した後は CI で。
 
-### T185 [計測] ベンチの報告を短くして Issue の URL に入れる — 状態: 未着手（2026-09-27、同じ回。規模 小。文面は持ち主）
+### T185 [計測] ベンチの報告を短くして Issue の URL に入れる — 状態: **レビュー待ち**（ブランチ `t185-report-summary`、Opus medium。2026-09-27、同じ回。規模 小。文面は持ち主）
 - 根拠: GPU の節が付くと報告はほぼ必ず URL の上限（T134 の 7,000 字）を越えてクリップボードに回る。T163 のレビューが案を 3 つ出した（上限の表を 1 行の文に、読み出しの行を 2 つに、説明文を報告から外す）。
 - 作るもの: 案を持ち主に見せて選んでもらい、`/benchmark/` の報告を短くする。`parseReport()` と `tests/reports.mjs` が読めるまま。
 - 完了条件: 持ち主の Android の報告（GPU の節つき）が URL に入る。
+- **数えた長さ**（Android の形の作り物、d48d186 の組み立て）: 全文 14,414 字、ログインの URL 28,139 字（上限 7,000、報告が空でも 619）。GPU の節だけで約 2 万（プロンプト 5,487、行列 × ベクトル 3,723、1 層 3,584）。案: (1) 要約をリンクに（約 4,000〜5,000）、(2) 表を縮めて全部（6,970、余り 30）、(3) 説明文だけ外す（19,550、入らない）、(参考) 全文を圧縮（10,300、入らない）。**持ち主が (1) を選んだ**（2026-09-27）。
+- **入れたもの**: 全文が入らないときだけ、URL の本文を「頭の行とラウンドの表 + T184 の表 + `#### Summary` の下に節ごとの 1 行 + 全文を下に貼ってください」に（`src/bench.js` の `shortReport()`・`PASTE`、`reportUrl(markdown, environment, summary)`）。節の 1 行は `deviceSummary`・`cpuSummary`・`gpuSummary`・`storageSummary`・`lineSummary`（表と同じデータから: CPU は最速の本数と読み出しだけの %、プロンプト、上限。GPU はアダプタと検査の数（WRONG の名）、モデルごとの 1 トークンと CPU との比、最も広い形の最速の行列 × ベクトルとバッファの読みの %、最速の層、まとめて出す生成の比、最多トークンの最速のプロンプトと比。代わりのアダプタと失われた装置では比も % も出さない。WRONG の行は最速にしない）。測らなかった節は「GPU: not in this browser: 理由の 1 行目」。全文はページとクリップボードに今のまま。要約も入らないとき（モデルのページ）は今までの `TOO_LONG`。元ネタは無い（シェーダではない）。ページの「long」の文を「the issue gets a summary, and the whole results go to your clipboard」に。
+- **要約の文面（英語の仮、持ち主に見せる）**: `tests/bench.mjs` の `aLines` の 8 行。
+- **確かめ**（T188 の決まり: 手元は編集と `node --check`、astro の script は型を外して `node --check`）: `tests/bench.mjs` に、Android の形の作り物で全文が入らず要約が 7,000 以下、要約の本文と `parseReport()` が全文と同じ行を読む、`reportsTable()` の行、節の 8 行の文、代わりのアダプタと失われた装置で比が出ない、WRONG の形は最速にならない、入る報告は今までどおり全文、要約も長ければ `TOO_LONG`。CI の `tests.yml --ref t185-report-summary` で。
 
 ### T186 [描画] ベンチの小さな直し — 状態: **画面待ち**（ブランチ `t186-bench-small`、Opus medium）（2026-09-27、同じ回。規模 小）
 - スマホ幅で機能の表の「storage the browser grants」の値が右で切れる（T177 の画面で見つけた）。

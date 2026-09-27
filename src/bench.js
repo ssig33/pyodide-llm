@@ -78,6 +78,8 @@ export function reportBody(markdown) {
  * whose login address would pass this goes to the clipboard, and the issue asks for it to be pasted. */
 export const REPORT_LIMIT = 7000;
 export const TOO_LONG = "The results were too long for the link and are on your clipboard: please paste them here.";
+/** T185: the last line of a summary (shortReport()), which the link holds where the whole report is too long */
+export const PASTE = "The whole report is on your clipboard: please paste it below.";
 
 const issueUrl = (body, environment) => `https://github.com/${REPOSITORY}/issues/new?${new URLSearchParams(
   { template: "benchmark.md", title: `Benchmark: ${environment.model ?? "this device"}`, body: reportBody(body) })}`;
@@ -87,13 +89,23 @@ const throughLogin = (url) => `https://github.com/login?return_to=${encodeURICom
 /** Whether the results are too long for the address of a new issue (reportUrl() then leaves them out). */
 export const reportTooLong = (markdown, environment) => throughLogin(issueUrl(markdown, environment)).length > REPORT_LIMIT;
 
-/** The address of a new issue with the template, the title and the body filled in: the page's Markdown, or where it
- * is too long, a line that asks for it from the clipboard. */
-export function reportUrl(markdown, environment) {
-  return issueUrl(reportTooLong(markdown, environment) ? TOO_LONG : markdown, environment);
+/** The address of a new issue with the template, the title and the body filled in: the page's Markdown; where it is
+ * too long, the summary (shortReport(): T185, a GPU's report is about four times the limit), which asks for the whole
+ * from the clipboard; where that is too long as well, or there is none (the model page's), that request alone. */
+export function reportUrl(markdown, environment, summary) {
+  const body = !reportTooLong(markdown, environment) ? markdown
+    : summary && !reportTooLong(summary, environment) ? summary : TOO_LONG;
+  return issueUrl(body, environment);
 }
 /** reportUrl() as GitHub's login gets it (tests/bench.mjs) */
-export const loginUrl = (markdown, environment) => throughLogin(reportUrl(markdown, environment));
+export const loginUrl = (markdown, environment, summary) => throughLogin(reportUrl(markdown, environment, summary));
+
+/** T185: the report the link holds where the whole is too long: the top of the report as it is (the machine's line and
+ * the rounds' table, which parseReport() reads, and T184's table of the model page's path), a line for each section,
+ * and the request to paste the whole below. */
+export function shortReport(head, lines) {
+  return [head, "#### Summary", lines.map((line) => `- ${line}`).join("\n"), PASTE].filter(Boolean).join("\n\n");
+}
 
 const cells = (line) => line.split("|").slice(1, -1).map((cell) => cell.trim());
 
@@ -151,6 +163,14 @@ export function threadCounts(cores) {
   return counts;
 }
 
+/** A CPU ceiling's value, where it was measured and steady (T163) */
+const steadyCeiling = (ceiling, key) => (ceiling && !ceiling.error && !ceiling.none && !ceiling.unsteady && ceiling[key] > 0 ? ceiling[key] : undefined);
+
+// what a CPU row reads a token, GB/s (before T163's review a result had no tokenMegabytes: the checkpoint's bytes),
+// and a prompt's G MAC/s (a multiply-add for each weight of the layers and token)
+const tokenReads = (r, row) => row.GBps * (r.tokenMegabytes ?? r.megabytes) / r.megabytes;
+const promptGMACsOf = (r, row) => (r.layerWeights && row.promptMsPerToken > 0 ? r.layerWeights / (row.promptMsPerToken / 1000) / 1e9 : undefined);
+
 /**
  * The CPU section's Markdown (the lines), from its result r ({backend, shared, megabytes, tokenMegabytes, layerWeights,
  * rows, ceilings}): the forward pass at each count of software threads, and T163's ceilings beside it. A token's share
@@ -162,13 +182,11 @@ export function threadCounts(cores) {
  */
 export function cpuTable(r) {
   const c = r.ceilings ?? {};
-  const steady = (ceiling, key) => (ceiling && !ceiling.error && !ceiling.none && !ceiling.unsteady && ceiling[key] > 0 ? ceiling[key] : undefined);
   const share = (value, whole) => (whole && Number.isFinite(value) ? ` (${number((100 * value) / whole, 0)}%)` : "");
-  const readAt = (threads) => steady((c.read ?? []).find((one) => one.threads === threads), "GBps");
-  const dot = steady(c.dot, "GMACs");
-  // before T163's review a result had no tokenMegabytes: the checkpoint's bytes
-  const read = (row) => row.GBps * (r.tokenMegabytes ?? r.megabytes) / r.megabytes;
-  const promptGMACs = (row) => (r.layerWeights && row.promptMsPerToken > 0 ? r.layerWeights / (row.promptMsPerToken / 1000) / 1e9 : undefined);
+  const readAt = (threads) => steadyCeiling((c.read ?? []).find((one) => one.threads === threads), "GBps");
+  const dot = steadyCeiling(c.dot, "GMACs");
+  const read = (row) => tokenReads(r, row);
+  const promptGMACs = (row) => promptGMACsOf(r, row);
   const ceiling = (one, key, unit) => {
     if (!one) return "not measured";
     if (one.none) return tableCell(one.none === "no relaxed SIMD in this browser" ? "not in this browser" : one.none);
@@ -273,6 +291,11 @@ function tokenWrong(t, check) {
  * No share where the device was lost (its later times are no GPU's, and too fast: past 100%), on a fallback adapter,
  * or where that read was unsteady. A shader the check found WRONG says so and is never the fastest, nor is a row
  * measured again at the end. gpu: { lost }. */
+/** Of a shape's matrix × vector rows, the fastest the check did not find WRONG (not one measured again, nor unsteady) */
+function fastestMatVec(s, check) {
+  const wrong = (row) => Boolean(check && check[row.check] && !check[row.check].ok);
+  return (s.result?.rows ?? []).filter((row) => row.GBps && !row.again && !row.unsteady && !wrong(row)).sort((a, b) => b.GBps - a.GBps)[0];
+}
 const QUANTIZED_A_TOKEN = 16 * 4 + 1;  // Llama 3.2 1B: q, o, gate and down a layer read an input of their own, and the classifier
 export function matVecTable(bandwidths, check, ceilings, gpu = {}) {
   const percent = (part, whole) => `${number((100 * part) / whole)}%`;
@@ -287,7 +310,7 @@ export function matVecTable(bandwidths, check, ceilings, gpu = {}) {
     return `${row.unsteady ? "unsteady: " : ""}${number(row.GBps)} GB/s${reads ? ` (${percent(row.GBps, reads)})` : ""}`;
   };
   const fastest = (s) => {
-    const best = (s.result?.rows ?? []).filter((row) => row.GBps && !row.again && !row.unsteady && !wrong(row)).sort((a, b) => b.GBps - a.GBps)[0];
+    const best = fastestMatVec(s, check);
     return best ? `${shape(s)} ${best.shader}, ${number(best.GBps)} GB/s` : "";
   };
   const quantized = bandwidths.filter((s) => s.result?.quantize?.msEach);
@@ -479,4 +502,106 @@ export function pathTable(paths, name = "") {
       return `| ${what} | ${speed(row.chosen)}${side(row.chosen, row.tokens)} | ${speed(row.cpu)} | ${speed(row.gpu)} | ${ratio} |`;
     })];
   return lines.join("\n");
+}
+
+// ---- T185: a line of the summary for each section (shortReport()), from the data the section's tables are made of.
+// Each says the fastest and the ceilings; the tables with every row are in the whole report.
+
+const yesNo = (value) => (value ? "yes" : "no");
+
+/** The device section's line: what the head's line does not say (the cores and the memory are there) */
+export function deviceSummary(r) {
+  return [`Browser: SIMD ${yesNo(r.simd)}, relaxed SIMD ${yesNo(r.relaxedSimd)}, 64-bit memory ${yesNo(r.memory64)}, ` +
+    `cross-origin isolated ${yesNo(r.crossOriginIsolated && r.sharedMemory)}, WebGPU in a worker ${yesNo(r.webgpu)}, ` +
+    `private file system ${yesNo(r.opfs && r.syncHandle)}`];
+}
+
+/** The CPU section's line: its fastest token and prompt (cpuTable()'s rows), and the ceilings */
+export function cpuSummary(r) {
+  const c = r.ceilings ?? {};
+  const rows = (r.rows ?? []).filter((row) => row.msPerToken > 0);
+  const token = [...rows].sort((a, b) => a.msPerToken - b.msPerToken)[0];
+  const prompt = rows.filter((row) => row.promptMsPerToken > 0).sort((a, b) => a.promptMsPerToken - b.promptMsPerToken)[0];
+  if (!token) return ["CPU: no token measured"];
+  const isolated = r.shared !== false;
+  const readAlone = steadyCeiling((c.read ?? []).find((one) => one.threads === token.threads), "GBps");
+  const parts = [`${number(token.msPerToken)} ms a token with ${threadsOf({ threads: token.threads, isolated })}, ${number(token.GBps)} GB/s` +
+    (readAlone ? ` (${number((100 * tokenReads(r, token)) / readAlone, 0)}% of reading alone)` : "")];
+  if (prompt) parts.push(`a prompt ${number(promptGMACsOf(r, prompt))} G MAC/s with ${prompt.threads}`);
+  const reads = (c.read ?? []).map((one) => steadyCeiling(one, "GBps")).filter(Boolean);
+  const ceilings = [reads.length && `reading alone ${number(Math.max(...reads))} GB/s`,
+    steadyCeiling(c.dot, "GMACs") && `relaxed_dot ${number(c.dot.GMACs)} G MAC/s`,
+    steadyCeiling(c.fma, "GMACs") && `f32 ${number(c.fma.GMACs)} G MAC/s`].filter(Boolean);
+  if (ceilings.length) parts.push(`ceilings: ${ceilings.join(", ")}`);
+  return [`CPU: ${parts.join("; ")}`];
+}
+
+/**
+ * The GPU section's lines, from its steps (as the page's gpuMarkdown() takes them): the adapter and the check; a token
+ * of each model with the CPU beside it (tokenTable()'s estimate) and the fastest matrix × vector of the widest shape;
+ * the fastest layer and the gain of several tokens a submission; the fastest prompt at the most tokens. No ratio where
+ * noRatios() says none or the check found the row WRONG; a step that failed or was not measured has no line (the whole
+ * report says why). baseline: cpuBaseline(); gpu: { lost }.
+ */
+export function gpuSummary(steps, baseline = {}, gpu = {}) {
+  const find = (name) => steps.find((s) => s.name === name);
+  const a = find("the adapter")?.result ?? {};
+  const checkStep = find("the shaders against JavaScript"), check = checkStep?.result;
+  const none = noRatios({ fallback: a.fallback, lost: gpu.lost });
+  const verdicts = Object.entries(check ?? {});
+  const bad = verdicts.filter(([, v]) => v.error || !v.ok).map(([k, v]) => `${k} ${v.error ? "FAILED" : "WRONG"}`);
+  const sizes = a.subgroupSizes ? ` (${a.subgroupSizes[0] === a.subgroupSizes[1] ? a.subgroupSizes[0] : a.subgroupSizes.join(" to ")} wide)` : "";
+  const lines = [`GPU: ${a.adapter ?? "?"}${a.fallback ? " (a fallback adapter: nothing timed)" : ""}; packed int8 dot ${yesNo(a.packed)}, ` +
+    `shader-f16 ${yesNo(a.features?.includes("shader-f16"))}, subgroups ${yesNo(a.features?.includes("subgroups"))}${sizes}; ` +
+    (check ? `the check ${verdicts.length - bad.length} of ${verdicts.length} ok${bad.length ? ` (${bad.join(", ")})` : ""}` : `not checked (${checkStep?.error ?? "not run"})`) +
+    (gpu.lost ? `; the device was lost (${gpu.lost})` : "")];
+  // a token of each model, widened (the table's first row of each): its tok/s and the CPU's estimate beside it
+  const cpu = baseline.token;
+  const tokens = steps.filter((s) => /^a token of [^,]+$/.test(s.name) && s.result?.tokPerSecond > 0).map((s) => {
+    const t = s.result, cpuTok = cpu && t.GB > 0 ? cpu.GBps / t.GB : undefined;
+    const ratio = none || tokenWrong(t, check) || !cpuTok ? "" : ` (${times(t.tokPerSecond / cpuTok)} the CPU)`;
+    return `${s.name.replace(/^a token of /, "")} ${number(t.tokPerSecond)} tok/s${ratio}`;
+  });
+  const widest = steps.filter((s) => s.name.startsWith("bandwidth: ")).at(-1);
+  const best = widest && fastestMatVec(widest, check);
+  const reads = find("the device's ceilings")?.result?.global;
+  const share = best && !gpu.lost && !a.fallback && reads?.GBps > 0 && !reads.unsteady ? ` (${number((100 * best.GBps) / reads.GBps, 0)}% of reading a buffer)` : "";
+  if (tokens.length || best) {
+    lines.push(`GPU, a token: ${[...tokens, best && `the fastest matrix × vector of ${widest.name.replace(/^bandwidth: /, "")} ${best.shader}, ${number(best.GBps)} GB/s${share}`].filter(Boolean).join("; ")}`);
+  }
+  const layer = find("a layer of a token")?.result;
+  const fastestLayer = (layer?.rows ?? []).filter((row) => row.msPerLayer > 0 && !row.unsteady && !(check?.[row.check] && !check[row.check].ok))
+    .sort((x, y) => x.msPerLayer - y.msPerLayer)[0];
+  const generated = find("tokens generated on the GPU")?.result;
+  const one = generated?.rows?.find((row) => row.perSubmission === 1);
+  const most = generated?.rows?.filter((row) => row.perSubmission > 1 && row.msPerToken > 0).sort((x, y) => x.msPerToken - y.msPerToken)[0];
+  const samplingWrong = ["sampling", "tokens on the GPU"].some((key) => check?.[key] && !check[key].ok);
+  const layerParts = [fastestLayer && `the fastest layer ${fastestLayer.form}, ${fastestLayer.dispatches} dispatches, ${number(fastestLayer.msPerLayer, 2)} ms`,
+    one && most && `generated ${number(one.msPerToken, 2)} ms a token one a submission, ${number(most.msPerToken, 2)} with ${most.perSubmission}` +
+      (none || samplingWrong ? "" : ` (${times(one.msPerToken / most.msPerToken)})`)].filter(Boolean);
+  if (layerParts.length) lines.push(`GPU, ${layerParts.join("; ")}`);
+  const prompt = find("a prompt all at once")?.result;
+  const promptTokens = Math.max(0, ...(prompt?.rows ?? []).filter((row) => row.tokens).map((row) => row.tokens));
+  const fastestPrompt = (prompt?.rows ?? []).filter((row) => row.tokens === promptTokens && !row.again && row.msPerToken > 0 && !(check?.[row.shader] && !check[row.shader].ok))
+    .sort((x, y) => x.msPerToken - y.msPerToken)[0];
+  if (fastestPrompt) {
+    const ratio = none ? "" : timesFaster(baseline.prompt?.msPerToken, fastestPrompt.msPerToken);
+    lines.push(`GPU, a prompt of ${promptTokens} tokens: ${fastestPrompt.shader}, ${number(fastestPrompt.GFLOPS, 0)} GFLOPS${ratio ? ` (${ratio} the CPU)` : ""}`);
+  }
+  return lines;
+}
+
+/** The storage section's line: the writes' MB/s and the read back */
+export function storageSummary(r) {
+  const mb = (r.mib * 2 ** 20) / 1e6, rate = (part) => number(mb / part.seconds, 0);
+  return [`Storage: writes ${rate(r.sequential)} MB/s in order, ${rate(r.scattered)} far apart, ${rate(r.scatteredFlushEach)} with a flush each piece; ` +
+    `read back ${rate(r.read)} MB/s${r.read.wrong ? ` (${r.read.wrong} pieces WRONG)` : ""}`];
+}
+
+/** The line section's line: the two fetches and the paced reads */
+export function lineSummary(r) {
+  const fetched = (f) => (f?.error ? "failed" : f ? `${number(f.MBps)} MB/s (first byte ${number(f.firstByteMs, 0)} ms)` : "not measured");
+  const paced = (r.paced ?? []).map((p) => (p.slower ? "slower" : p.error ? "failed" : number(p.MBps, 2)));
+  return [`Line: this site ${fetched(r.site)}, huggingface.co ${fetched(r.hf)}` +
+    (paced.length ? `; huggingface.co read no faster than ${r.paced.map((p) => p.rate).join(", ")} MB/s: ${paced.join(", ")}` : "")];
 }

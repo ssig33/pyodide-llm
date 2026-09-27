@@ -79,7 +79,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
       <div class="report" hidden>
         <h2>Results</h2>
         <p><button id="copy" type="button">Copy the results</button> <a id="issue" target="_blank" rel="noopener">Report them as an issue</a>
-          <span id="long" class="about" hidden>(long: the results go to your clipboard, paste them into the issue)</span></p>
+          <span id="long" class="about" hidden>(long: the issue gets a summary, and the whole results go to your clipboard: paste them into the issue)</span></p>
         <pre id="markdown"></pre>
       </div>
     </main>
@@ -138,7 +138,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
 </style>
 
 <script>
-  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
+    matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -662,19 +663,35 @@ const BENCH_MODEL = "llm-jp-3-150m";
   const RUN: Record<Name, () => Promise<Result>> = { device, cpu, model: modelSection, gpu, storage, line };
   const STATE = { ok: "done", none: "not in this browser", wrong: "WRONG", error: "failed" };
 
+  const TITLES: Record<Name, string> = { device: "This browser", cpu: "CPU", model: "Model", gpu: "GPU", storage: "Storage", line: "Line" };
+  // T185: a section's lines of the summary (src/bench.js), from the data its tables are made of; a section that did not
+  // measure says its state and the first line of why. The GPU's CPU beside it is the CPU section's, as in its tables.
+  const SUMMARIES: Partial<Record<Name, (data: any) => string[]>> = {
+    device: deviceSummary, cpu: cpuSummary, storage: storageSummary, line: lineSummary,
+    gpu: (data) => gpuSummary(data.steps, cpuBaseline(results.cpu), { lost: data.lost }),
+  };
+  function summaryOf(name: Name, result: Result): string[] {
+    const lines = result.data && SUMMARIES[name] ? SUMMARIES[name]!(result.data) : [];
+    if (result.status === "ok" && lines.length) return lines;
+    const why = tableCell(result.markdown.split("\n")[0]).slice(0, 200);
+    return [`${TITLES[name]}: ${STATE[result.status]}${lines.length || !why ? "" : `: ${why}`}`, ...lines];
+  }
+
   // ---- one report: the model's table first (as ?bench=1 writes it, which tests/reports.mjs reads), then every section
   function report() {
     // the model and its table only when the model section measured: a report of the other sections names no model,
     // which tests/reports.mjs then leaves out (T134's review)
     const environment = environmentOf(navigator, { model: measured?.name, pyodide: measured?.pyodide, build: __BUILD__, site: location.origin + location.pathname });
-    const TITLES: Record<Name, string> = { device: "This browser", cpu: "CPU", model: "Model", gpu: "GPU", storage: "Storage", line: "Line" };
     // the model section's table is the one on top; the section itself only where it did not measure
-    const sections = SECTIONS.filter((name) => results[name] && (name !== "model" || results[name]!.status !== "ok"))
-      .map((name) => `#### ${TITLES[name]}${results[name]!.status === "ok" ? "" : ` (${STATE[results[name]!.status]})`}\n\n${results[name]!.markdown}`);
+    const shown = SECTIONS.filter((name) => results[name] && (name !== "model" || results[name]!.status !== "ok"));
+    const sections = shown.map((name) => `#### ${TITLES[name]}${results[name]!.status === "ok" ? "" : ` (${STATE[results[name]!.status]})`}\n\n${results[name]!.markdown}`);
     // T184: the model page's own path right under the rounds' table (a table of its own: parseReport() reads the first)
-    const markdown = [benchMarkdown(measured?.rows ?? [], environment), ...(measured?.paths ? [measured.paths] : []), ...sections].join("\n\n");
+    const head = [benchMarkdown(measured?.rows ?? [], environment), ...(measured?.paths ? [measured.paths] : [])].join("\n\n");
+    const markdown = [head, ...sections].join("\n\n");
     $("markdown").textContent = markdown;
-    ($("issue") as HTMLAnchorElement).href = reportUrl(markdown, environment);
+    // T185: where the whole is too long for the link, the link holds the head and a line a section
+    const summary = shortReport(head, shown.flatMap((name) => summaryOf(name, results[name]!)));
+    ($("issue") as HTMLAnchorElement).href = reportUrl(markdown, environment, summary);
     $("long").hidden = !reportTooLong(markdown, environment);
     (document.querySelector(".report") as HTMLElement).hidden = false;
     (window as any).__benchmark.markdown = markdown;
