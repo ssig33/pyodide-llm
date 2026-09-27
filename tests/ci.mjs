@@ -108,7 +108,7 @@ const LINES = {
   "preview.yml": "^sections:|FAILED|timed out",
   // T183: gpu-check's lines of each model and run, its tables by layer (against NumPy's and E16), each run's line and
   // ratio, and the seconds of each step
-  "gpu-prompt.yml": "^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\||^ *- |^seconds of |FAILED",
+  "gpu-prompt.yml": "^## |layers, .* heads|^  .*: keys and values |^keys and values of |^\\| (layer|all|\\d)|^\\|---|^ *- |^seconds of |FAILED",
 };
 
 async function start([workflow, ...pairs]) {
