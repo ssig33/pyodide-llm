@@ -415,7 +415,9 @@ try {
     const TESTS = { fallback: true, always: true, ...c.force };
     // T152: the steps of a generation (see the head of this file), where the GPU took them
     const generation = (engine) => {
-      if (!engine.tokenBlock) return { why: engine.gpuTokensWhyNot ?? "the GPU took no steps", planned: engine.gpuTokensPlanned };
+      // (T152's review: and the most this adapter binds, which a classifier may pass, Llama 3.2 1B's 262.7 MB on lavapipe's 128 MiB)
+      if (!engine.tokenBlock) return { why: engine.gpuTokensWhyNot ?? "the GPU took no steps", planned: engine.gpuTokensPlanned,
+        binds: Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize) };
       const greedy = c.reference.greedy, history = (ids) => [...tokens, ...ids];
       const ask = (token, pos, before, count, settings = [0, 0.9, 1], randoms = [], stops = []) => {
         const h = history(before);
@@ -816,7 +818,11 @@ function stepsRight(c, steps, { e16s, q8s, kvDim, prompt }) {
   // a model whose steps stay on the CPU (not asked of the GPU), or the run in pieces (T155: a token's layer reads a
   // matrix whole): said, and right
   if (steps.why) {
-    const right = steps.planned === false || (c.force?.pieceBytes && !steps.forced && /past a buffer/.test(steps.why));
+    // (T152's review: or a classifier larger than what the adapter binds, a table being one piece; the rows of the
+    // logits hold its size: vocabulary × dim)
+    const table = floats(ref.logits).length * ref.header[0];
+    const right = steps.planned === false || (c.force?.pieceBytes && !steps.forced && /past a buffer/.test(steps.why)) ||
+      (/^the (classifier|embedding) is past a buffer/.test(steps.why ?? "") && table > steps.binds);
     console.log(`  a token: on the CPU (${steps.why})${right ? "" : " — FAILED"}`);
     return right;
   }
