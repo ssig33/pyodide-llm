@@ -36,7 +36,9 @@
 // has the FFN's norm read the layer's input before the output matrix adds to it, into a buffer of its own (xn). The
 // last layer stops at its keys and values: nothing of a prompt's token after them is used. Then the block's
 // keys and values of every layer are copied out and read back. The activations are float32 (quantized to 8 bits first
-// for the packed shaders, as the CPU's matmul_q8 takes them), the weights int8 widened or multiplied as int8.
+// for the packed shaders, as the CPU's matmul_q8 takes them), the weights int8 widened or multiplied as int8. T155:
+// int6 weights (T98) are widened to int8 once, as they go onto the GPU; a model in a 64-bit memory (T101) goes as
+// one in a 32-bit memory (its addresses are Numbers); a matrix larger than a buffer the device binds, in pieces of rows.
 //
 // The first message is claimed before anything is awaited (a module worker's port opens at its first await, and a
 // message that comes before onmessage is set is lost: T109).
@@ -100,10 +102,8 @@ async function start(memory, plan) {
     const info = adapter.info ?? {};
     const fallback = Boolean(info.isFallbackAdapter ?? adapter.isFallbackAdapter);
     if (fallback && !plan.force.fallback) return unusable("a fallback adapter: the CPU in the GPU's place");
-    // the largest buffer of the layers: one of a layer's matrices
-    const largest = Math.max(...Object.values(plan.matrices).map(({ rows, n }) => rows * n));
+    // the largest buffer the device binds (T155: a matrix larger than it goes in pieces, piecesOf)
     const limit = Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize);
-    if (largest > limit) return unusable(`a matrix of ${megabytes(largest)} is more than a buffer of this GPU (${megabytes(limit)})`);
     // shader-f16 and subgroups where the adapter has them (a device refuses a feature it lacks), and the adapter's
     // workgroup memory and threads (the tiles and the attention size themselves by them)
     const { maxStorageBufferBindingSize, maxBufferSize, maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup,
@@ -148,7 +148,6 @@ async function start(memory, plan) {
   }
 }
 
-const megabytes = (bytes) => `${Math.round(bytes / 2 ** 20)} MiB`;
 function describe(adapter) {
   const info = adapter.info ?? {};
   const name = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(" ") || "a GPU";
@@ -242,8 +241,9 @@ async function validated(m, fn) {
 }
 const pipelineOf = (m, code, constants) => m.device.createComputePipelineAsync({ layout: "auto",
   compute: { module: m.device.createShaderModule({ code }), entryPoint: "main", constants } });
+// (a buffer, or { buffer, offset, size }: a part of one, T155's pieces of a matrix writing into their rows of the output)
 const bind = (m, pipeline, buffers) => m.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
-  entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })) });
+  entries: buffers.map((buffer, binding) => ({ binding, resource: buffer.buffer ? buffer : { buffer } })) });
 function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, group);
@@ -253,23 +253,37 @@ function dispatch(pass, pipeline, group, x, y = 1, z = 1) {
 // every layer's matrices (values and scales, as the checkpoint holds them; T154: no w3 where there is no gate) and its
 // vectors: the weights of its two norms, and (T153) Qwen2's biases of q, k and v, Qwen3's norms of a head of q and of
 // k, (T154) GPT-2's and GPT-NeoX's biases of the two LayerNorms and of every matrix (plan.vectors: each one's address in
-// the shared memory and its floats a layer)
+// the shared memory and its floats a layer). T155: a matrix in pieces of whole rows (piecesOf), a buffer of values and
+// one of scales each; int6 (plan.matrices' six) widened to int8 on the way (widener), its scales as they are (the
+// quarter of an int6 group's is already the int8 values' scale, T98). The addresses are Numbers in a 64-bit memory too
+// (exact to 2^53; the views and copies take them as they are)
 async function upload(m) {
   const { plan } = m, group = m.wgsl.GROUP;
   let bytes = 0;
-  m.matrices = Object.fromEntries(Object.entries(plan.matrices).map(([name, { rows, n }]) => [name, { rows, n, layers: [] }]));
-  for (let l = 0; l < plan.layers; l++) {
-    for (const [name, matrix] of Object.entries(plan.matrices)) {
-      const [valuesAt, scalesAt] = matrix.layers[l], valueBytes = matrix.rows * matrix.n, scaleBytes = (valueBytes / group) * 4;
-      const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
-      copyIn(m, values, valuesAt, valueBytes);
-      copyIn(m, scales, scalesAt, scaleBytes);
-      m.matrices[name].layers.push([values, scales]);
-      bytes += valueBytes + scaleBytes;
+  m.matrices = Object.fromEntries(Object.entries(plan.matrices).map(([name, { rows, n }]) =>
+    [name, { rows, n, pieces: piecesOf(m, rows, n).map(([first, count]) => ({ first, rows: count, layers: [] })) }]));
+  const widen = Object.values(plan.matrices).some((matrix) => matrix.six) ? await widener(m) : null;
+  try {
+    for (let l = 0; l < plan.layers; l++) {
+      for (const [name, matrix] of Object.entries(plan.matrices)) {
+        const [valuesAt, scalesAt] = matrix.layers[l];
+        for (const piece of m.matrices[name].pieces) {
+          const valueBytes = piece.rows * matrix.n, scaleBytes = (valueBytes / group) * 4;
+          const values = buffer(m, valueBytes, STORAGE | COPY_DST), scales = buffer(m, scaleBytes, STORAGE | COPY_DST);
+          // an int6 row is 3/4 of an int8 one (24 bytes a group of 32)
+          if (matrix.six) widen.into(values, valuesAt + (piece.first * matrix.n * 3) / 4, valueBytes / group);
+          else copyIn(m, values, valuesAt + piece.first * matrix.n, valueBytes);
+          copyIn(m, scales, scalesAt + (piece.first * matrix.n / group) * 4, scaleBytes);
+          piece.layers.push([values, scales]);
+          bytes += valueBytes + scaleBytes;
+        }
+      }
+      // what was written waits in memory until the GPU takes it: let it, before more comes
+      await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
+      if (stopping) return bytes;
     }
-    // what was written waits in memory until the GPU takes it: let it, before more comes
-    await within(m.device.queue.onSubmittedWorkDone(), `layer ${l + 1}'s weights`);
-    if (stopping) return bytes;
+  } finally {
+    widen?.done();
   }
   m.vectors = {};
   for (const [name, { at, size }] of Object.entries(plan.vectors)) {
@@ -279,6 +293,77 @@ async function upload(m) {
     bytes += vectorBytes;
   }
   return bytes;
+}
+
+// T155: the pieces of a matrix of rows × n, [first row, rows] each: whole rows, no more bytes than a buffer the device
+// binds (m.limit, or plan.force.pieceBytes in the tests), each piece's first row where its part of the output may be
+// bound (a multiple of minStorageBufferOffsetAlignment over the 4 bytes of a float32). One piece where the matrix
+// fits, as every matrix of the models of the list does at WebGPU's least limit of 128 MiB (the largest, Qwen2.5 7B's
+// w1, is 68 MB): llama.cpp's WebGPU keeps each tensor in one buffer within maxStorageBufferBindingSize and refuses a
+// larger one (ggml-webgpu.cpp, ggml_backend_webgpu_buffer_type_get_max_size, commit 2145525a, MIT; no line copied),
+// where this cuts it by rows, as T94's design had it for a classifier past a buffer
+function piecesOf(m, rows, n) {
+  const bytes = Math.min(m.limit, m.plan.force.pieceBytes ?? Infinity), align = m.device.limits.minStorageBufferOffsetAlignment / 4;
+  if (rows * n <= bytes) return [[0, rows]];
+  const step = Math.floor(bytes / n / align) * align;
+  if (!step) throw new Error(`${align} rows of ${n} weights are more than a buffer of this GPU (${bytes} bytes)`);
+  return Array.from({ length: Math.ceil(rows / step) }, (_, i) => [i * step, Math.min(step, rows - i * step)]);
+}
+
+// T155: shaders.js's WIDEN_SIX compiled and checked against JavaScript (sixValues), and into(values, address, groups):
+// groups of int6 at address in the shared memory widened into values (a buffer of int8) on the GPU. The packed bytes go
+// through one buffer of their own, written again for every piece (the queue runs a write after the submissions before
+// it); done() lets it go.
+async function widener(m) {
+  const { device, wgsl } = m;
+  if (!wgsl.WIDEN_SIX) throw new Error("int6 weights are not on the GPU yet (the shader that widens them is to be written)");
+  const pipeline = await within(validated(m, () => pipelineOf(m, wgsl.WIDEN_SIX)), "compiling the widening of int6");
+  const owned = [];
+  const largest = Math.max(CHECK_GROUPS * 24, ...Object.entries(m.plan.matrices).filter(([, matrix]) => matrix.six)
+    .flatMap(([name, { n }]) => m.matrices[name].pieces.map((piece) => (piece.rows * n * 3) / 4)));
+  const packed = buffer(m, largest, STORAGE | COPY_DST, owned);
+  const run = (values, groups, most = device.limits.maxComputeWorkgroupsPerDimension) => {
+    const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+    dispatch(pass, pipeline, bind(m, pipeline, [packed, values, uniform(m, new Uint32Array([groups, 0, 0, 0]), owned)]),
+      ...wgsl.sixDispatch(groups, most));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  };
+  const done = () => owned.splice(0).forEach((b) => b.destroy());
+  try {
+    const wrong = await within(checkWiden(m, packed, run), "checking the widening of int6");
+    if (wrong) throw new Error(`the widening of int6 is wrong on this GPU: ${wrong}`);
+  } catch (error) {
+    done();
+    throw error;
+  }
+  return {
+    into(values, address, groups) {
+      copyIn(m, packed, address, groups * 24);
+      run(values, groups);
+    },
+    done,
+  };
+}
+// The check: CHECK_GROUPS groups of random bytes (any 24 bytes are a group), dispatched over rows of 7 workgroups (a
+// second dimension, and threads past the last group), into a buffer with 64 groups more of a known byte after them
+// (which no thread may write), against JavaScript's to the bit. The reason it is wrong, or null
+const CHECK_GROUPS = 1000;
+async function checkWiden(m, packed, run) {
+  const bytes = new Uint8Array(CHECK_GROUPS * 24).map(() => (Math.random() * 256) | 0), after = 64 * 32, owned = [];
+  try {
+    const values = buffer(m, CHECK_GROUPS * 32 + after, STORAGE | COPY_DST | COPY_SRC, owned);
+    m.device.queue.writeBuffer(values, 0, new Uint8Array(CHECK_GROUPS * 32 + after).fill(0x5a));
+    m.device.queue.writeBuffer(packed, 0, bytes);
+    run(values, CHECK_GROUPS, 7);
+    const got = new Int8Array(await readBack(m, values, CHECK_GROUPS * 32 + after)), want = m.wgsl.sixValues(bytes);
+    const at = want.findIndex((v, i) => got[i] !== v);
+    if (at >= 0) return `value ${at % 32} of group ${(at / 32) | 0} is ${got[at]}, JavaScript's ${want[at]}`;
+    const past = got.subarray(want.length).findIndex((v) => v !== 0x5a);
+    return past >= 0 ? `byte ${past} past the last group was written` : null;
+  } finally {
+    owned.forEach((b) => b.destroy());
+  }
 }
 
 // the pipelines of a layer's small steps and the buffers of a block's activations
@@ -479,10 +564,16 @@ async function chooseMatrices(m) {
 // the threads of a workgroup of one dimension this device takes
 const threadsOf = (device) => Math.min(device.limits.maxComputeInvocationsPerWorkgroup, device.limits.maxComputeWorkgroupSizeX);
 
-// a matrix of rows × n (w and s, buffers) by the tokens of from into to (added where add): the bind group of form
-const productGroup = (m, form, w, s, rows, n, from, to, add, owned = m.owned, io = m) => bind(m, form.pipeline,
-  [w, s, form.packed ? io.xq : from, to, uniform(m, new Uint32Array([rows, n / 4, n / m.wgsl.GROUP, 0, n, rows, add ? 1 : 0, 0]), owned),
-   io.step, ...(form.packed ? [io.xs] : [])]);
+// layer l's matrix name by the tokens of from into to (added where add): a bind group of form and its rows for each
+// piece (T155), which writes its rows of to (bound from its first row; a token's row of to is the whole matrix's)
+const productGroups = (m, form, name, l, from, to, add, owned = m.owned) => {
+  const { rows, n, pieces } = m.matrices[name];
+  return pieces.map(({ first, rows: count, layers }) => {
+    const out = first ? { buffer: to, offset: first * 4, size: to.size - first * 4 } : to;
+    return { rows: count, group: bind(m, form.pipeline, [...layers[l], form.packed ? m.xq : from, out,
+      uniform(m, new Uint32Array([count, n / 4, n / m.wgsl.GROUP, 0, n, rows, add ? 1 : 0, 0]), owned), m.step, ...(form.packed ? [m.xs] : [])]) };
+  });
+};
 // the workgroups of form for rows by count tokens: the tiles numbered over x, then y (as T146's shaders number them)
 function multiply(m, pass, form, group, rows, count) {
   const tiles = Math.ceil(rows / form.tile.rows) * Math.ceil(count / form.tile.tokens);
@@ -541,11 +632,10 @@ async function timeForms(m, forms) {
     const products = [["wq", m.xb, m.q, false, m.quantizeXb], ["wk", m.xb, m.k], ["wv", m.xb, m.v], ["wo", m.xb, m.x, true, m.quantizeAttention],
       ["w1", m.ffnInput, m.gate, false, m.quantizeFfn], ["w3", m.ffnInput, m.up], ["w2", m.gate, m.x, true, m.quantizeGate]]
       .filter(([name]) => m.matrices[name]);
+    // (a matrix's input quantized once, before its first piece)
     for (const form of forms) {
-      layer.push(await validated(m, () => products.map(([name, from, to, add, quantize]) => {
-        const { rows, n, layers } = m.matrices[name];
-        return { group: productGroup(m, form, ...layers[0], rows, n, from, to, add, owned), rows, quantize };
-      })));
+      layer.push(await validated(m, () => products.flatMap(([name, from, to, add, quantize]) =>
+        productGroups(m, form, name, 0, from, to, add, owned).map((piece, i) => ({ ...piece, quantize: i ? null : quantize })))));
     }
     const submission = async (i, passes) => {
       const form = forms[i], encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
@@ -585,10 +675,8 @@ async function timeForms(m, forms) {
 // bias after o, w1 and w2 (GPT-2's, GPT-NeoX's)
 function bindLayers(m) {
   const { plan } = m, form = m.form, V = m.vectors;
-  const product = (name, l, from, to, add = false) => {
-    const { rows, n, layers } = m.matrices[name];
-    return { group: productGroup(m, form, ...layers[l], rows, n, from, to, add), rows };
-  };
+  // (a piece each, T155)
+  const product = (name, l, from, to, add = false) => productGroups(m, form, name, l, from, to, add);
   m.layers = [];
   for (let l = 0; l < plan.layers; l++) {
     const norm = new ArrayBuffer(16);
@@ -709,18 +797,18 @@ async function prompt({ serial, count, pos }) {
 // so. timing (T148, timeBlocks): rows and angles of zeros instead of forward.js's, and nothing written back
 async function block(m, count, pos, wanted, timing = false) {
   const { device, plan } = m, B = plan.batch, half = plan.headSize / 2, kvDim = plan.kvHeads * plan.headSize;
-  // the rows forward.js embedded (dense), and the angles of their positions (the tables forward.js has)
-  const F = new Float32Array(m.memory.buffer);
+  // the rows forward.js embedded (dense), and the angles of their positions (the tables forward.js has); views of just
+  // those floats (T155: not a view of the whole of a 64-bit memory of some GB for every block)
+  const floats = (address, n) => new Float32Array(m.memory.buffer, address, n);
   if (timing) m.rows.fill(0);
-  else m.rows.set(F.subarray(plan.rows / 4, plan.rows / 4 + count * plan.dim));
+  else m.rows.set(floats(plan.rows, count * plan.dim));
   // (T154: GPT-2 turns nothing and has no tables)
   if (timing || !plan.turned) {
     m.turns.fill(0);
   } else {
     for (let t = 0; t < count; t++) {
-      const cos = plan.cos / 4 + (pos + t) * half, sin = plan.sin / 4 + (pos + t) * half;
-      m.turns.set(F.subarray(cos, cos + half), t * plan.headSize);
-      m.turns.set(F.subarray(sin, sin + half), t * plan.headSize + half);
+      m.turns.set(floats(plan.cos + (pos + t) * half * 4, half), t * plan.headSize);
+      m.turns.set(floats(plan.sin + (pos + t) * half * 4, half), t * plan.headSize + half);
     }
   }
   device.pushErrorScope("out-of-memory");
@@ -730,7 +818,7 @@ async function block(m, count, pos, wanted, timing = false) {
   device.queue.writeBuffer(m.step, 0, new Uint32Array([count, pos, 0, 0]));
   if (pos + count > m.cache.capacity) grow(m, pos + count);
   const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass(), form = m.form;
-  const multiplied = (product) => multiply(m, pass, form, product.group, product.rows, count);
+  const multiplied = (pieces) => pieces.forEach((piece) => multiply(m, pass, form, piece.group, piece.rows, count));
   // a packed form reads its input quantized: once for the matrices that read the same one
   const quantize = (q) => form.packed && dispatch(pass, m.quantize, q.group, q.x, count);
   const flash = m.attention;

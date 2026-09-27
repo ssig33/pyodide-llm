@@ -633,6 +633,46 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   xs[token * (quantize.xStride / ${GROUP}u) + g] = scale;
 }`;
 
+// ---- T155: int6 weights (T98) on the GPU. The model's GPU worker widens every int6 matrix once, as it puts it on the
+// GPU, into the int8 the tiled shaders read (and keeps no int6 there): an int6 value is an int8 with its two low bits
+// zero and its scale is a quarter (llama2_numpy.pack6), so the widened values and the checkpoint's own scales are an
+// int8 matrix, the same products to the bit, and every tiled shader, check and timing stays as it is.
+//
+// WIDEN_SIX: the WGSL of that widening, one dispatch a piece of a matrix (gpu.js's upload). No public implementation
+// has this packing (llama.cpp's Q6_K packs otherwise), so it is written apart (T155: Fable high); null until then, and
+// the GPU's worker leaves an int6 model on the CPU with that reason. What gpu.js gives it:
+//   @group(0) @binding(0) var<storage, read> packed: array<u32>;         the groups as llama2_numpy.pack6 writes them,
+//                                                                        24 bytes (6 words) a group, one after another,
+//                                                                        from word 0 (the piece alone, uploaded apart)
+//   @group(0) @binding(1) var<storage, read_write> values: array<u32>;   the same groups widened, 32 int8 (8 words) a
+//                                                                        group, value j of a group at its byte j (four
+//                                                                        to a word, the lowest byte first), from word 0
+//   @group(0) @binding(2) var<uniform> widen: vec4<u32>;                 x: the groups; y, z, w: 0
+// dispatched as @workgroup_size(WIDEN_SIX_WORKGROUP) with sixDispatch(groups, the device's
+// maxComputeWorkgroupsPerDimension): a thread a group, group number (workgroup_id.y × num_workgroups.x +
+// workgroup_id.x) × WIDEN_SIX_WORKGROUP + local_invocation_index, those past widen.x doing nothing. gpu.js checks it
+// against sixValues() below as it starts (every group of random bytes: any 24 bytes are a group), to the bit.
+export const WIDEN_SIX = null;
+export const WIDEN_SIX_WORKGROUP = 64;
+/** the workgroups [x, y] of WIDEN_SIX for groups: a second dimension past the device's most of one */
+export const sixDispatch = (groups, most) => {
+  const workgroups = Math.ceil(groups / WIDEN_SIX_WORKGROUP), x = Math.min(workgroups, most);
+  return [Math.max(1, x), Math.ceil(workgroups / Math.max(1, x))];
+};
+/** JavaScript's widening (the check's answer): the int8 values of groups of 24 packed bytes (a Uint8Array), as
+ * llama2_numpy.unpack6 and forward.js's weightAt read them */
+export function sixValues(packed) {
+  const groups = packed.length / 24, out = new Int8Array(groups * 32);
+  for (let g = 0; g < groups; g++) {
+    for (let j = 0; j < 32; j++) {
+      const low = j < 16 ? packed[g * 24 + j] & 15 : packed[g * 24 + j - 16] >> 4;
+      const top = (packed[g * 24 + 16 + (j % 8)] >> (2 * ((j / 8) | 0))) & 3;
+      out[g * 32 + j] = ((low | (top << 4)) << 2) << 24 >> 24;
+    }
+  }
+  return out;
+}
+
 // ---- T147: the tiled shaders a device may run a prompt's matrices with (T146's), for the model's GPU worker, which
 // checks each against JavaScript on a small matrix (tiledOff) and times the right ones on the model's own weights, and
 // takes the fastest: which is fastest differs from GPU to GPU (T146), and only the device can say. none: why a shape

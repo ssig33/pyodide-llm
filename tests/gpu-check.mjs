@@ -34,7 +34,12 @@
 // same with RoPE on the first quarter of every head, as Pythia's rotary_pct 0.25, and the parallel residual), both of
 // three layers and 4 heads of keys and values (neither has grouped-query attention), their biases drawn around 0 (the
 // review of T154: a bias of 1 ± 0.03 is nearly the same number everywhere, and LayerNorm's mean takes most of it out);
-// "synthetic-neox-256", GPT-NeoX with Pythia 1B's heads of 256 (dim 512, 2 heads), 64 of them turned. The others are the models of this directory (make models kernels), or <prefix>.json: a
+// "synthetic-neox-256", GPT-NeoX with Pythia 1B's heads of 256 (dim 512, 2 heads), 64 of them turned. T155:
+// "synthetic-6bit", int6 weights (T98's, which the GPU widens to int8 as it takes them: the shader is shaders.js's
+// WIDEN_SIX), and "synthetic-wide", int8 in a 64-bit memory with the checkpoint 4 GiB up (T101: every address past
+// 2^32; the pages below are never touched), both of dim 128 and hidden 320 with the GPU's matrices in pieces of
+// 20480 bytes at most (gpuForce.pieceBytes: w1 and w3 in three, w2 in two, the last of w1's rows short), as a matrix
+// past a buffer of the device goes. The others are the models of this directory (make models kernels), or <prefix>.json: a
 // model tests/perplexity_prepare.py converted (<prefix>.bin, <prefix>.tokenizer.bin, and the options in <prefix>.json;
 // gpu-prompt.yml's input real= fetches and converts models of src/models.js so, T183), whose NumPy answer comes from
 // the native Python ($PYTHON, python3 by default).
@@ -61,14 +66,17 @@ const engine = option("--engine", "chromium");
 const only = option("--forms", "");
 const webgpu = option("--webgpu", "");
 const ids = args.length ? args : ["synthetic", "synthetic-qwen2", "synthetic-qwen3", "synthetic-gpt2", "synthetic-neox", "synthetic-neox-256",
-  "stories15M", "tiny-lm", "llm-jp-3-150m"];
+  "synthetic-6bit", "synthetic-wide", "stories15M", "tiny-lm", "llm-jp-3-150m"];
 // T153: the made-up models of another form (see above). Three layers: a layer's vectors are read at l × their size,
 // which a second layer alone would not tell from 0 + size
 const SYNTHETIC = { "synthetic": [{}, {}], "synthetic-qwen2": [{ layers: 3, bias: true }, { bias: true, rms_norm_eps: 1e-6 }],
   "synthetic-qwen3": [{ layers: 3, qk_norm: true, head_dim: 32 }, { qk_norm: true, head_dim: 32, rms_norm_eps: 0.5 }],
   "synthetic-gpt2": [{ layers: 3, kv_heads: 4, arch: "gpt2" }, { arch: "gpt2" }],
   "synthetic-neox": [{ layers: 3, kv_heads: 4, arch: "neox" }, { arch: "neox", rotary: 4, parallel_residual: true }],
-  "synthetic-neox-256": [{ dim: 512, hidden: 1024, layers: 3, heads: 2, kv_heads: 2, arch: "neox" }, { arch: "neox", rotary: 64, parallel_residual: true }] };
+  "synthetic-neox-256": [{ dim: 512, hidden: 1024, layers: 3, heads: 2, kv_heads: 2, arch: "neox" }, { arch: "neox", rotary: 64, parallel_residual: true }],
+  // T155: [form, options, the run's: the GPU's pieces, a 64-bit memory]
+  "synthetic-6bit": [{ dim: 128, hidden: 320, layers: 3, six: true }, { dtype: "int6" }, { force: { pieceBytes: 20480 } }],
+  "synthetic-wide": [{ dim: 128, hidden: 320, layers: 3 }, {}, { force: { pieceBytes: 20480 }, wide: true }] };
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
@@ -109,9 +117,10 @@ const PYTHON = `
 import base64, struct, numpy as np, llama2_numpy, llama2_convert
 from llama2_numpy import Llama
 
-def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0, **form):
+def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_len=256, seed=0, six=False, **form):
     """A made-up int8 checkpoint and its tokenizer.bin, as quantize.py writes one: grouped-query attention. form
-    (T153): llama2_numpy.FORM's bias, qk_norm and head_dim, whose vectors are drawn as the norms' are"""
+    (T153): llama2_numpy.FORM's bias, qk_norm and head_dim, whose vectors are drawn as the norms' are. six (T155):
+    int6 (T98), as llama2_convert's Writer writes it: every matrix's packed values, then its scales"""
     rng = np.random.default_rng(seed)
     header = (dim, hidden, layers, heads, kv_heads, vocab, seq_len)
     out = [struct.pack("<7i", *header)]
@@ -126,6 +135,10 @@ def synthetic(dim=64, hidden=128, layers=2, heads=4, kv_heads=2, vocab=320, seq_
             bias = weights is not None and vectors not in weights
             vectors += 1
             out.append((values if bias else 1.0 + values * 0.1).astype(np.float32).tobytes())
+            continue
+        if six:
+            q, scales = llama2_numpy.quantize6(values.reshape(-1, shape[-1]))
+            out += [llama2_numpy.pack6(q).tobytes(), scales.tobytes()]
             continue
         q, scales = llama2_convert.quantize(values.reshape(-1, shape[-1]))
         out += [q.tobytes(), scales.tobytes()]
@@ -186,10 +199,11 @@ const cases = [];
 const directory = path.join(root, ".tmp", "gpu-check");
 fs.mkdirSync(directory, { recursive: true });
 for (const id of ids) {
-  let options, text;
+  let options, text, run = {};
   const began = performance.now();
   if (SYNTHETIC[id]) {
     const [form, engineOptions] = SYNTHETIC[id];
+    run = SYNTHETIC[id][2] ?? {};
     py.globals.set("FORM", py.toPy(form));
     py.runPython(`data, vocabulary = synthetic(**FORM)`);
     options = { dtype: "int8", ...engineOptions };
@@ -218,12 +232,12 @@ print(json.dumps(answers(data, vocabulary, sys.argv[2], ${COUNT}, json.load(open
     options = entry.options;
     text = (/日本語/.test(entry.note) ? TEXTS.japanese : TEXTS.english).repeat(3);
   }
-  if (options.dtype !== "int8") throw new Error(`${id} is ${options.dtype}: the GPU takes int8 weights`);
+  if (options.dtype !== "int8" && options.dtype !== "int6") throw new Error(`${id} is ${options.dtype}: the GPU takes int8 and int6 weights`);
   py.globals.set("OPTIONS", py.toPy(options));
   py.globals.set("TEXT", text ?? "");
   const reference = py.runPython(`answers(data, vocabulary, TEXT, ${COUNT}, OPTIONS)`).toJs({ dict_converter: Object.fromEntries });
   const numpySeconds = (performance.now() - began) / 1000;
-  cases.push({ ...caseOf(id, options, reference, py.runPython("data").toJs()), numpySeconds });
+  cases.push({ ...caseOf(id, options, reference, py.runPython("data").toJs()), numpySeconds, ...run });
 }
 // the plan forward.js gets from Python (the vocabulary in Pyodide's globals), recorded: Llama(external=) with a start()
 // that keeps it, and the case the browser runs
@@ -244,7 +258,8 @@ function caseOf(id, options, reference, bytes) {
   for (const [name, value] of Object.entries(plan.derived)) plan.derived[name] = Buffer.from(value).toString("base64");
   const name = path.basename(id), file = path.join(directory, `${name}.bin`);
   fs.writeFileSync(file, bytes);
-  return { id, plan, headDim: options.head_dim ?? 0, arch: options.arch ?? "llama", checkpoint: `/case/${name}.bin`, file, reference, planSeconds: (performance.now() - began) / 1000 };
+  return { id, plan, headDim: options.head_dim ?? 0, arch: options.arch ?? "llama", dtype: options.dtype, checkpoint: `/case/${name}.bin`, file, reference,
+    planSeconds: (performance.now() - began) / 1000 };
 }
 
 // ---- the browser: a page that is cross-origin isolated (its own headers), a worker that runs forward.js
@@ -269,17 +284,23 @@ const forms = !adapter ? [] : wgsl.promptForms({ half: adapter.features.has("sha
   memory: adapter.limits.maxComputeWorkgroupStorageSize, threads: adapter.limits.maxComputeInvocationsPerWorkgroup })
   .filter((form) => !form.none).map((form) => form.name).filter((name) => !ONLY.length || ONLY.some((part) => name.includes(part)));
 try {
-  const kernels = compileKernels(await fetched("/public/simdkernel_shared.wasm"), await fetched("/public/simdkernel_relaxed_shared.wasm"));
+  const narrow = compileKernels(await fetched("/public/simdkernel_shared.wasm"), await fetched("/public/simdkernel_relaxed_shared.wasm"));
   const results = [];
   for (const c of await (await fetch("/cases.json")).json()) {
     const plan = c.plan;
     for (const name of Object.keys(plan.derived)) plan.derived[name] = Uint8Array.from(atob(plan.derived[name]), (ch) => ch.charCodeAt(0));
     const checkpoint = await fetched(c.checkpoint), size = checkpoint.length, tokens = c.reference.tokens, n = tokens.length - 1;
-    const { memory, base } = weightsMemory(size, { shared: true, after: footprint(c.reference.header, size, { dtype: "int8", halfKV: true, gpu: true, kvStart: plan.kv_start, head_dim: c.headDim, arch: c.arch }) });
+    // T155: a 64-bit memory (c.wide) with its kernels, the checkpoint 4 GiB up as threads-check's --high puts it
+    const high = c.wide ? 2 ** 32 : 0;
+    const kernels = c.wide ? compileKernels(await fetched("/public/simdkernel_shared64.wasm"), await fetched("/public/simdkernel_relaxed_shared64.wasm"), true) : narrow;
+    const after = footprint(c.reference.header, size, { dtype: c.dtype, halfKV: true, gpu: true, kvStart: plan.kv_start, head_dim: c.headDim, arch: c.arch });
+    const { memory, base: low } = weightsMemory(size + high, { shared: true, wide: Boolean(c.wide), after });
+    const base = low + high;
     new Uint8Array(memory.buffer, base, size).set(checkpoint);
     // T148: SwiftShader and lavapipe are fallback adapters, which the page refuses: the tests take them (fallback),
-    // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU)
-    const TESTS = { fallback: true, always: true };
+    // and give the GPU every block it can take (always: a fallback adapter is far slower than the CPU). T155: the
+    // case's own (the pieces of its matrices)
+    const TESTS = { fallback: true, always: true, ...c.force };
     const run = async (gpu, gpuForce, gpuRemembered) => {
       const started = performance.now();
       const engine = createForward({ memory, base, size, kernels, plan, gpu, gpuForce: { ...TESTS, ...gpuForce }, gpuRemembered });

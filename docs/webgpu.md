@@ -42,9 +42,11 @@ CPU (faster here than WebGPU)", or "prompts on the CPU (reason)".
 - The adapter is a fallback that runs on the CPU (SwiftShader, lavapipe): it would never be faster, and compiling
   the shaders took 2 to 4 minutes.
 - The page is not cross-origin isolated (no shared memory between the workers).
-- The model needs 64-bit memory, or its weights are not int8. Qwen2's biases, Qwen3's per-head norms of q and k,
-  and GPT-2 and GPT-NeoX (LayerNorm, GELU, the biases, learned positions, partial RoPE, the parallel residual) run
-  on the GPU as well; 6-bit weights are a later task.
+- The model's weights are float32 (not int8 or 6-bit). Qwen2's biases, Qwen3's per-head norms of q and k, and
+  GPT-2 and GPT-NeoX (LayerNorm, GELU, the biases, learned positions, partial RoPE, the parallel residual) run on
+  the GPU as well. A model in 64-bit memory (over 4 GB) goes as one in 32-bit memory, and a matrix larger than a
+  buffer the device binds goes in pieces of rows. 6-bit weights are to be widened to int8 on the GPU as they are
+  uploaded; until the shader for that is in, a 6-bit model stays on the CPU.
 - The weights would not fit twice: today they are kept in WebAssembly memory for the CPU and again on the GPU. On
   phones and Apple devices both are the same memory. If the total is more than half of `navigator.deviceMemory`,
   the model stays on the CPU. Chromium reports at most 8, which is read as "8 GB or more"; a browser that does not
@@ -98,7 +100,7 @@ say only that the shaders are right, not how fast a GPU is.
 In order: generation on the GPU where the device measures it faster (several tokens a submission, sampled on the
 GPU with the CPU's random numbers, is in the benchmark: a seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
-activations to 7 or 8 bits)); then 6-bit weights and 64-bit memory; and keeping the weights once
+activations to 7 or 8 bits)); then the shader that widens 6-bit weights; and keeping the weights once
 instead of twice. The tasks are in [TODO.md](../TODO.md) (T151 to T157, in Japanese).
 
 ## Try it yourself

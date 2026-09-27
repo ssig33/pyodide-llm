@@ -301,7 +301,8 @@ function halfToFloat(h) {
  * (SwiftShader and lavapipe: the only WebGPU of CI and the development machine); always, every block the GPU can take
  * goes there, whatever the CPU's time (a fallback adapter is far slower than the CPU); quick (the page's tests), the
  * first right shader of the matrices untimed, and no block timed (SwiftShader timing Llama 3.2 1B's took more than
- * gpu.js's STEP_MS in CI, T147) */
+ * gpu.js's STEP_MS in CI, T147); pieceBytes (T155), the most bytes of a piece of a matrix on the GPU, so that a small
+ * model goes in pieces as a matrix past a buffer of the device does */
 export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, gpuRemembered, gpuForce = {},
   wrap = (exports) => exports, stalledMs = STALLED_MS }) {
   const { dim, n_layers: layers, n_heads: heads, n_kv_heads: kvHeads, head_size: headSize, vocab_size: vocab,
@@ -833,18 +834,16 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
   // (T153: with Qwen2's biases, Qwen3's norms of the heads and heads of another size than dim / heads as well; T154:
-  // GPT-2's and GPT-NeoX's as well, whose FFN has no gate: w3 is null)
+  // GPT-2's and GPT-NeoX's as well, whose FFN has no gate: w3 is null; T155: int6 weights and 64-bit memories too)
   // (a function, not a const: gpuUnfit runs before this line, AGENTS.md)
   function gpuMatrices() {
     return Object.fromEntries(Object.entries({ wq, wk, wv, wo, w1, w2, w3 }).filter(([, m]) => m));
   }
+  // (T155: int6 weights too, widened to int8 on the GPU, and a model in a 64-bit memory: gpu.js)
   function gpuUnfit() {
     if (!sharedMemory) return "the page is not cross-origin isolated";
-    if (wide) return "a 64-bit memory: not on the GPU yet";
     if (headSize % 4) return "heads of a size that is no multiple of 4 are not on the GPU";
-    if (!Object.values(gpuMatrices()).every((m) => m.int8 && !m.six && m.group === 32)) {
-      return `${T.wq?.kind === "int6" ? "int6" : "float32"} weights are not on the GPU yet`;
-    }
+    if (!Object.values(gpuMatrices()).every((m) => m.int8 && m.group === 32)) return "float32 weights are not on the GPU yet";
     // T148: the layers twice, in this memory and on the GPU (T156 will keep one): a device with too little memory
     // for both keeps the CPU's alone (a phone or an Apple shares its memory between the two)
     // (T153, the review: with the GPU's own keys and values, float16, as the prompt may fill the whole context: Qwen3
@@ -869,8 +868,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function startGpu() {
     // the values of a head RoPE turns: all of them, GPT-NeoX's first rotary (T154), none of GPT-2's
     const turned = gpt2 ? 0 : plan.rotary > 0 && plan.rotary < headSize ? plan.rotary : headSize;
+    // (six, T155: the values at a layer's address are int6, packed as llama2_numpy.pack6 packs them)
     const matrices = Object.fromEntries(Object.entries(gpuMatrices()).map(([name, m]) =>
-      [name, { rows: m.rows, n: m.n, layers: Array.from({ length: layers }, (_, l) => m.layer(l).slice(0, 2)) }]));
+      [name, { rows: m.rows, n: m.n, six: m.six, layers: Array.from({ length: layers }, (_, l) => m.layer(l).slice(0, 2)) }]));
     let quiet;
     const listen = () => {
       clearTimeout(quiet);
