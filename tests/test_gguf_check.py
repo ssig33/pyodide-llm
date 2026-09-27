@@ -10,7 +10,7 @@ import pytest
 from conftest import synthetic_weights
 from make_hf_fixture import field
 from test_convert import hugging_face, safetensors_file
-from test_gguf import gguf_file
+from test_gguf import gguf_file, other_gguf, the_other
 
 import gguf_check
 from llama2_numpy import rope_frequencies
@@ -279,3 +279,49 @@ def test_rows_that_pass_only_against_a_q8_0_are_listed_with_their_piece(tmp_path
     _, _, against, near, norm = rows[0]
     assert against > gguf_check.ROW_LINE and near == 0 and norm < 1e-3
     assert result["past_tight"] == {} and result["mismatches"] == 0
+
+
+def other_model(tmp_path, model, change=None):
+    """T136's third stage: a GPT-2 or GPT-NeoX GGUF as llama.cpp writes one (test_gguf.other_gguf) and its original;
+    change(tensors) alters what the GGUF is written from."""
+    tensors, config = the_other(model)
+    written = {name: tensor.copy() for name, tensor in tensors.items()}
+    if change:
+        change(written)
+    file, _ = other_gguf(written, config)
+    (tmp_path / "model.gguf").write_bytes(file)
+    (tmp_path / "model.safetensors").write_bytes(safetensors_file(tensors))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return tmp_path / "model.gguf", tmp_path
+
+
+@pytest.mark.parametrize("block", [gguf_check.BLOCK, 256])  # whole, and query_key_value a head's q, k or v at a time
+@pytest.mark.parametrize("model, order", [("gpt2", "transposed (out, in)"), ("neox", "split (q, k, v)"),
+                                          ("neox-serial", "split (q, k, v)")])
+def test_a_gpt2_or_neox_gguf_of_the_same_weights_passes_in_llama_cpps_order(tmp_path, capsys, monkeypatch, block, model,
+                                                                             order):
+    """GPT-2's Conv1D matrices are held to the original turned to (out, in), GPT-NeoX's query_key_value to it split
+    into q, k and v, and the order found is said; GPT-2's output.weight (llama.cpp's copy) to the embedding."""
+    monkeypatch.setattr(gguf_check, "BLOCK", block)
+    assert gguf_check.check_tensors(*other_model(tmp_path, model))
+    result = summary(capsys)
+    assert result["mismatches"] == 0 and result["orders"] == [order] and result["nearest"] <= gguf_check.TIGHT
+
+
+@pytest.mark.parametrize("block", [gguf_check.BLOCK, 256])
+@pytest.mark.parametrize("model, name", [("neox", "gpt_neox.layers.1.attention.query_key_value.weight"),
+                                         ("neox", "gpt_neox.layers.0.attention.query_key_value.bias"),
+                                         ("gpt2", "transformer.h.1.attn.c_attn.weight"),
+                                         ("gpt2", "transformer.h.0.mlp.c_proj.weight")])
+def test_a_gpt2_or_neox_gguf_of_other_weights_does_not(tmp_path, capsys, monkeypatch, block, model, name):
+    """Two heads' rows swapped in a fused q, k, v (or two rows of a matrix): the order is still found, the values
+    are not the original's."""
+    monkeypatch.setattr(gguf_check, "BLOCK", block)
+
+    def swap(tensors):
+        tensor = tensors[name]
+        rows = tensor.shape[0] // 4  # a head's q, k and v of a NeoX; a quarter of the rows otherwise
+        tensor[:rows], tensor[rows:2 * rows] = tensor[rows:2 * rows].copy(), tensor[:rows].copy()
+
+    assert not gguf_check.check_tensors(*other_model(tmp_path, model, swap))
+    assert summary(capsys)["mismatches"] >= 1

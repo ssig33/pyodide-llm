@@ -1326,20 +1326,30 @@ class Stream:
         if info["dtype"] == "Q8_0" and self.q8_0 is not None:
             reader = self.q8_0
         shape = tuple(info["shape"])
-        row = int((int(np.prod(shape[1:])) if len(shape) > 1 else int(shape[0])) * itemsize)
-        # the head permutation needs its whole matrix (a small one); everything else goes row by row, as it comes
-        whole = any(transform for _, _, transform in targets) or len(targets) > 1
+        # T136's third stage: a GPT-2's Conv1D matrix, which the GGUF holds as (out, in), is read in that shape
+        stored = tuple(reversed(shape)) if info.get("transposed") else shape
+        row = int((int(np.prod(stored[1:])) if len(stored) > 1 else int(stored[0])) * itemsize)
+        # the head permutation needs its whole matrix (a small one); everything else goes row by row, as it comes.
+        # A GGUF's tensor held in another order than Hugging Face's is put back whole too
+        again = info.get("turned") or info.get("split") or info.get("transposed")
+        whole = any(transform for _, _, transform in targets) or len(targets) > 1 or bool(again)
         rows = len(self.pending) // row if not whole or last else 0
         if whole and last:
-            rows = shape[0] if len(shape) > 1 else 1  # a vector is one row of its own length
+            rows = stored[0] if len(stored) > 1 else 1  # a vector is one row of its own length
         if rows == 0 or (len(self.pending) < PIECE and not last):
             return
-        values = reader(bytes(self.pending[:rows * row])).reshape(rows, *shape[1:]) if len(shape) > 1 else reader(bytes(self.pending[:rows * row]))
+        values = reader(bytes(self.pending[:rows * row]))
         del self.pending[:rows * row]
+        if len(stored) > 1:
+            values = values.reshape(rows, *stored[1:])
+        if info.get("transposed"):
+            values = values.T  # back to (in, out), which the plan transposes as it does a safetensors' own
         if info.get("turned"):
             # a GGUF of a Llama holds q and k turned already (llama.cpp's convert does what permute_heads does):
             # back to Hugging Face's order, so that the plan below turns them once, like everything else
             values = unturned(values, info["turned"])
+        if info.get("split"):
+            values = unsplit(values, info["split"])
         for index, first, transform in targets:
             out = transformed(values, transform, self.head_size)
             self.writer.write(index, first + self.first, out)
@@ -1358,9 +1368,15 @@ def unturned(w, heads):
     return w.reshape(heads, rows // 2, 2, -1).transpose(0, 2, 1, 3).reshape(w.shape)
 
 
+def unsplit(w, heads):
+    """GPT-NeoX's query_key_value (or its bias) as llama.cpp stores it, [all of q; all of k; all of v], back to
+    Hugging Face's order, q, k and v of the first head, then of the second, ... (T136's third stage)."""
+    return w.reshape(3, heads, w.shape[0] // 3 // heads, -1).swapaxes(0, 1).reshape(w.shape)
+
+
 # ------------------------------------------------------------------------------------------------- GGUF (T74)
 # A GGUF file holds what config.json, tokenizer.json and model.safetensors hold, in one. Only what a Q8_0 or F16
-# Llama or Qwen2 needs is read; tests/gguf_check.py is the separate reference this is held to.
+# Llama, Qwen2, GPT-2 or GPT-NeoX needs is read; tests/gguf_check.py is the separate reference this is held to.
 class Incomplete(Exception):
     """The GGUF header goes on past the bytes given: fetch more and try again."""
 
@@ -1374,6 +1390,21 @@ GGUF_LAYER = {"attn_norm": "input_layernorm", "ffn_norm": "post_attention_layern
               "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj"}
 GGUF_NAMES = {"token_embd.weight": "model.embed_tokens.weight", "output_norm.weight": "model.norm.weight",
               "output.weight": "lm_head.weight"}
+# T136's third stage: GPT-2 and GPT-NeoX, by the names of their own safetensors (openai-community/gpt2's, without
+# "transformer."). For each architecture: the tensors outside the layers, where a layer's go, and the layer's names
+GGUF_ARCHITECTURES = {
+    "llama": (GGUF_NAMES, "model.layers.{}.", GGUF_LAYER),
+    "qwen2": (GGUF_NAMES, "model.layers.{}.", GGUF_LAYER),
+    "gpt2": ({"token_embd.weight": "wte.weight", "position_embd.weight": "wpe.weight", "output_norm.weight": "ln_f.weight",
+              "output_norm.bias": "ln_f.bias", "output.weight": "lm_head.weight"}, "h.{}.",
+             {"attn_norm": "ln_1", "attn_qkv": "attn.c_attn", "attn_output": "attn.c_proj", "ffn_norm": "ln_2",
+              "ffn_up": "mlp.c_fc", "ffn_down": "mlp.c_proj"}),
+    "gptneox": ({"token_embd.weight": "gpt_neox.embed_in.weight", "output_norm.weight": "gpt_neox.final_layer_norm.weight",
+                 "output_norm.bias": "gpt_neox.final_layer_norm.bias", "output.weight": "embed_out.weight"},
+                "gpt_neox.layers.{}.",
+                {"attn_norm": "input_layernorm", "attn_qkv": "attention.query_key_value", "attn_output": "attention.dense",
+                 "ffn_norm": "post_attention_layernorm", "ffn_up": "mlp.dense_h_to_4h", "ffn_down": "mlp.dense_4h_to_h"}),
+}
 
 
 def gguf_read(data):
@@ -1434,21 +1465,41 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
     rope_freqs: keep llama.cpp's table of Llama 3's RoPE scaling in the header, to be checked against the original's
     rope_scaling as it streams past (gguf_weights, T136), instead of refusing it."""
     arch = metadata.get("general.architecture")
-    if arch not in ("llama", "qwen2"):
-        raise ValueError(f"This GGUF holds a {arch}: only Llama and Qwen2 ones are supported.")
+    if arch not in GGUF_ARCHITECTURES:
+        raise ValueError(f"This GGUF holds a {arch}: only Llama, Qwen2, GPT-2 and GPT-NeoX ones are supported.")
     key = lambda name, default=None: metadata.get(f"{arch}.{name}", default)
-    config = {"model_type": arch, "hidden_size": key("embedding_length"), "intermediate_size": key("feed_forward_length"),
-              "num_hidden_layers": key("block_count"), "num_attention_heads": key("attention.head_count"),
-              "num_key_value_heads": key("attention.head_count_kv", key("attention.head_count")),
-              "max_position_embeddings": key("context_length"), "rope_theta": float(key("rope.freq_base", 10000.0)),
-              "vocab_size": tensors["token_embd.weight"]["shape"][0] if "token_embd.weight" in tensors else None,
-              "tie_word_embeddings": "output.weight" not in tensors, "hidden_act": "silu",
+    common = {"vocab_size": tensors["token_embd.weight"]["shape"][0] if "token_embd.weight" in tensors else None,
               "bos_token_id": metadata.get("tokenizer.ggml.bos_token_id", 1),
-              "eos_token_id": metadata.get("tokenizer.ggml.eos_token_id", 2),
-              # a head of another size than dim / heads (T124): llama.cpp says it as the length of a key
-              "head_dim": key("attention.key_length"), "rms_norm_eps": key("attention.layer_norm_rms_epsilon")}
-    if key("rope.scaling.type", "none") not in ("none", None):
-        config["rope_scaling"] = {"type": key("rope.scaling.type"), "factor": key("rope.scaling.factor", 1.0)}
+              "eos_token_id": metadata.get("tokenizer.ggml.eos_token_id", 2)}
+    heads = key("attention.head_count")
+    if arch == "gpt2":
+        # T136's third stage: config.json's own spelling, which normalize() reads. GPT-2 always shares its classifier
+        # with the embedding: llama.cpp writes a copy of it as output.weight, which the conversion leaves unread
+        config = {"model_type": "gpt2", "n_embd": key("embedding_length"), "n_inner": key("feed_forward_length"),
+                  "n_layer": key("block_count"), "n_head": heads, "n_positions": key("context_length"),
+                  "layer_norm_epsilon": key("attention.layer_norm_epsilon"), "tie_word_embeddings": True, **common}
+    elif arch == "gptneox":
+        dim = key("embedding_length")
+        config = {"model_type": "gpt_neox", "hidden_size": dim, "intermediate_size": key("feed_forward_length"),
+                  "num_hidden_layers": key("block_count"), "num_attention_heads": heads,
+                  "max_position_embeddings": key("context_length"),
+                  "rotary_emb_base": float(key("rope.freq_base", 10000.0)),
+                  # llama.cpp says the rotated part as a number of values, config.json as a share of the head
+                  "rotary_pct": key("rope.dimension_count", 0) / (dim // heads) if dim and heads else None,
+                  "use_parallel_residual": bool(key("use_parallel_residual", True)),
+                  "layer_norm_eps": key("attention.layer_norm_epsilon"), "hidden_act": "gelu",
+                  "tie_word_embeddings": "output.weight" not in tensors, **common}
+    else:
+        config = {"model_type": arch, "hidden_size": key("embedding_length"), "intermediate_size": key("feed_forward_length"),
+                  "num_hidden_layers": key("block_count"), "num_attention_heads": heads,
+                  "num_key_value_heads": key("attention.head_count_kv", heads),
+                  "max_position_embeddings": key("context_length"), "rope_theta": float(key("rope.freq_base", 10000.0)),
+                  "tie_word_embeddings": "output.weight" not in tensors, "hidden_act": "silu",
+                  # a head of another size than dim / heads (T124): llama.cpp says it as the length of a key
+                  "head_dim": key("attention.key_length"), "rms_norm_eps": key("attention.layer_norm_rms_epsilon"),
+                  **common}
+        if key("rope.scaling.type", "none") not in ("none", None):
+            config["rope_scaling"] = {"type": key("rope.scaling.type"), "factor": key("rope.scaling.factor", 1.0)}
     header = {}
     if "rope_freqs.weight" in tensors:
         # llama.cpp writes Llama 3's RoPE scaling as a table of divisors instead of the rope_scaling of config.json
@@ -1460,28 +1511,38 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
         size = 4 * int(np.prod(info["shape"]))
         header["rope_freqs.weight"] = {"dtype": "F32", "shape": info["shape"], "rope_freqs": True,
                                        "data_offsets": [info["offset"], info["offset"] + size]}
-    heads = {"attn_q": config["num_attention_heads"], "attn_k": config["num_key_value_heads"]}
+    names, layer, layers = GGUF_ARCHITECTURES[arch]
+    turns = {"attn_q": heads, "attn_k": config.get("num_key_value_heads")}
     for name, info in tensors.items():
         if info["type"] not in GGUF_TENSORS:
             raise ValueError(f"{name} is stored as ggml type {info['type']}: only F32, F16 and Q8_0 GGUF files are "
                              f"supported (not the K-quants).")
-        if name in GGUF_NAMES:
-            target = GGUF_NAMES[name]
+        parts = name.split(".")
+        if name in names:
+            target = names[name]
+        elif len(parts) == 4 and parts[0] == "blk" and parts[2] in layers:
+            target = f"{layer.format(parts[1])}{layers[parts[2]]}.{parts[3]}"
         else:
-            parts = name.split(".")
-            if len(parts) != 4 or parts[0] != "blk" or parts[2] not in GGUF_LAYER:
-                continue  # nothing the engine reads
-            target = f"model.layers.{parts[1]}.{GGUF_LAYER[parts[2]]}.{parts[3]}"
+            continue  # nothing the engine reads
         dtype = GGUF_TENSORS[info["type"]]
         if dtype == "Q8_0" and info["shape"][-1] % 32:
             # ggml itself requires it; a file that breaks it would be read at the wrong offsets and write nonsense
             raise ValueError(f"{name} is Q8_0 with rows of {info['shape'][-1]}, which is not a multiple of 32.")
         size = int(int(np.prod(info["shape"])) * READERS[dtype][0])
         entry = {"dtype": dtype, "shape": info["shape"], "data_offsets": [info["offset"], info["offset"] + size]}
-        # llama.cpp turns q and k of a Llama (and their biases) into llama2.c's order; a Qwen2 it leaves alone
-        # (it rotates the other way at run time). tests/gguf_check.py found SmolLM2's turned.
-        if arch == "llama" and len(name.split(".")) == 4 and name.split(".")[2] in heads:
-            entry["turned"] = heads[name.split(".")[2]]
+        kind = parts[2] if len(parts) == 4 else None
+        if arch == "llama" and kind in turns:
+            # llama.cpp turns q and k of a Llama (and their biases) into llama2.c's order; a Qwen2 it leaves alone
+            # (it rotates the other way at run time). tests/gguf_check.py found SmolLM2's turned.
+            entry["turned"] = turns[kind]
+        if arch == "gpt2" and parts[-1] == "weight" and kind in ("attn_qkv", "attn_output", "ffn_up", "ffn_down"):
+            # GPT-2's matrices are Conv1D, (in, out): llama.cpp stores them the other way round, as every other
+            # model's. Back to Hugging Face's, so that the plan transposes them once, as it does a safetensors' own
+            entry["shape"], entry["transposed"] = list(reversed(info["shape"])), True
+        if arch == "gptneox" and kind == "attn_qkv":
+            # GPT-NeoX's query_key_value holds q, k and v of every head in turn; llama.cpp stores all of q, then k,
+            # then v (the matrix and its bias). Back to Hugging Face's order, like the turned q and k of a Llama
+            entry["split"] = heads
         header[target] = entry
     return header, config
 
@@ -1500,7 +1561,7 @@ def gguf_weights(head, config):
         raise ValueError("config.json is not JSON.") from None
     if not isinstance(original, dict):
         raise ValueError("config.json is not the configuration of a model.")
-    gguf_agrees(own, normalize(original))
+    gguf_agrees(normalize(own), normalize(original))
     return json.dumps(header), base
 
 
@@ -1510,18 +1571,27 @@ def gguf_agrees(own, config):
     key-value heads of the same product, the number of layers (a GGUF of more layers than config.json says went
     through cut to that many: Stream reads the layers the header asks for), a classifier that would silently be the
     embedding (Stream shares it where lm_head is missing), and the numbers that are no tensor. The context is not
-    compared: a sliding window cuts it (RakutenAI 2.0 mini: 131072 in the GGUF, 8192 as normalize() cuts it)."""
+    compared: a sliding window cuts it (RakutenAI 2.0 mini: 131072 in the GGUF, 8192 as normalize() cuts it).
+    Both are normalize()d. GPT-NeoX's (T136's third stage): also how much of each head turns and whether the two
+    branches run in parallel, which the options say (no tensor does)."""
     f32 = lambda value: float(np.float32(value))
     heads = config.get("num_attention_heads")
     pairs = [("architecture", own["model_type"], config.get("model_type")),
              ("number of layers", own["num_hidden_layers"], config.get("num_hidden_layers")),
              ("number of heads", own["num_attention_heads"], heads),
-             ("number of key-value heads", own["num_key_value_heads"], config.get("num_key_value_heads", heads)),
-             ("RoPE theta", f32(own["rope_theta"]), f32(config.get("rope_theta", 10000.0)))]
+             ("number of key-value heads", own.get("num_key_value_heads", own["num_attention_heads"]),
+              config.get("num_key_value_heads", heads)),
+             ("RoPE theta", f32(own.get("rope_theta", 10000.0)), f32(config.get("rope_theta", 10000.0)))]
     if own.get("head_dim") and config.get("hidden_size") and heads:
         pairs.append(("size of a head", own["head_dim"], head_size(config)))
     if own.get("rms_norm_eps") is not None and config.get("rms_norm_eps") is not None:
         pairs.append(("RMSNorm epsilon", f32(own["rms_norm_eps"]), f32(config["rms_norm_eps"])))
+    layer_norm_eps = lambda c: c.get("layer_norm_eps", c.get("layer_norm_epsilon"))
+    if layer_norm_eps(own) is not None and layer_norm_eps(config) is not None:
+        pairs.append(("LayerNorm epsilon", f32(layer_norm_eps(own)), f32(layer_norm_eps(config))))
+    if architecture(own) == "neox" and architecture(config) == "neox":
+        pairs += [("number of rotated values of a head", rotary_dim(own), rotary_dim(config)),
+                  ("parallel residual", own.get("use_parallel_residual", True), config.get("use_parallel_residual", True))]
     for what, here, there in pairs:
         if here != there:
             raise ValueError(f"This GGUF does not belong with the original's config.json: its {what} is {here} here "
@@ -1814,7 +1884,7 @@ class Conversion:
         header, config = gguf_model(metadata, tensors, base)
         self = cls.__new__(cls)
         self.config = config
-        check_config(config)
+        check_config(normalize(config))  # a GPT-2's is in config.json's own spelling (T136's third stage)
         if not callable(dtype):
             check_dtype(dtype)
         self.tokenizer, options, tokenizer_config, specials = gguf_tokenizer(metadata, config["vocab_size"])

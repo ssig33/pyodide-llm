@@ -281,3 +281,136 @@ def test_a_rope_freqs_table_that_is_not_the_originals_scaling_is_refused():
     # without the original's config.json (?hf= of a GGUF) the table is refused as before
     with pytest.raises(ValueError, match="rope_freqs table"):
         Conversion.from_gguf(file)
+
+
+# ---- T136's third stage: GPT-2 and GPT-NeoX, as llama.cpp's convert_hf_to_gguf.py writes them
+GPT2_NAMES = {"wte.weight": "token_embd.weight", "wpe.weight": "position_embd.weight", "ln_f.weight": "output_norm.weight",
+              "ln_f.bias": "output_norm.bias", "ln_1": "attn_norm", "attn.c_attn": "attn_qkv", "attn.c_proj": "attn_output",
+              "ln_2": "ffn_norm", "mlp.c_fc": "ffn_up", "mlp.c_proj": "ffn_down"}
+NEOX_NAMES = {"gpt_neox.embed_in.weight": "token_embd.weight", "embed_out.weight": "output.weight",
+              "gpt_neox.final_layer_norm.weight": "output_norm.weight", "gpt_neox.final_layer_norm.bias": "output_norm.bias",
+              "input_layernorm": "attn_norm", "attention.query_key_value": "attn_qkv", "attention.dense": "attn_output",
+              "post_attention_layernorm": "ffn_norm", "mlp.dense_h_to_4h": "ffn_up", "mlp.dense_4h_to_h": "ffn_down"}
+CONV1D = ("attn_qkv", "attn_output", "ffn_up", "ffn_down")  # GPT-2's matrices, which llama.cpp stores as (out, in)
+
+
+def other_gguf(tensors, config):
+    """A GGUF v3 of a GPT-2's or GPT-NeoX's Hugging Face tensors the way llama.cpp writes one (checked on the real
+    files by Range, T136's third stage): GPT-2's Conv1D matrices turned to (out, in) and a copy of the embedding as
+    output.weight, GPT-NeoX's query_key_value (and its bias) as all of q, then k, then v; Q8_0 matrices (GPT-2's
+    positions F32), F32 vectors. Returns the file and, under the Hugging Face names, the values it stands for."""
+    string = lambda text: struct.pack("<Q", len(text.encode())) + text.encode()
+    neox = config["model_type"] == "gpt_neox"
+    arch = "gptneox" if neox else "gpt2"
+    heads = config["num_attention_heads"] if neox else config["n_head"]
+    dim = config["hidden_size"] if neox else config["n_embd"]
+    metadata = [("general.architecture", 8, arch), (f"{arch}.embedding_length", 4, dim),
+                (f"{arch}.attention.head_count", 4, heads), (f"{arch}.attention.layer_norm_epsilon", 6, 1e-5)]
+    if neox:
+        metadata += [(f"{arch}.block_count", 4, config["num_hidden_layers"]),
+                     (f"{arch}.context_length", 4, config["max_position_embeddings"]),
+                     (f"{arch}.feed_forward_length", 4, config["intermediate_size"]),
+                     (f"{arch}.rope.dimension_count", 4, llama2_convert.rotary_dim(config)),
+                     (f"{arch}.use_parallel_residual", 7, config["use_parallel_residual"])]
+    else:
+        metadata += [(f"{arch}.block_count", 4, config["n_layer"]), (f"{arch}.context_length", 4, config["n_positions"]),
+                     (f"{arch}.feed_forward_length", 4, config["n_inner"])]
+    names = NEOX_NAMES if neox else GPT2_NAMES
+    stored = {}  # GGUF name: (Hugging Face name, the values as the GGUF holds them)
+    for name, tensor in tensors.items():
+        if name.endswith(("masked_bias", "inv_freq")):
+            continue  # nothing llama.cpp writes
+        short = name.removeprefix("transformer.")
+        if short in names:
+            stored[names[short]] = (name, tensor)
+            continue
+        parts = short.split(".")
+        at = 3 if neox else 2  # gpt_neox.layers.N. or h.N.
+        layer, what, kind = parts[at - 1], ".".join(parts[at:-1]), parts[-1]
+        gguf, value = names[what], tensor
+        if not neox and kind == "weight" and gguf in CONV1D:
+            value = tensor.T
+        if neox and gguf == "attn_qkv":
+            value = tensor.reshape(heads, 3, dim // heads, -1).swapaxes(0, 1).reshape(tensor.shape)
+        stored[f"blk.{layer}.{gguf}.{kind}"] = (name, value)
+    if not neox:
+        stored["output.weight"] = (None, stored["token_embd.weight"][1])
+    out = [b"GGUF", struct.pack("<IQQ", 3, len(stored), len(metadata))]
+    for key, kind, value in metadata:
+        out.append(string(key) + struct.pack("<I", kind))
+        out.append(string(value) if kind == 8 else struct.pack({4: "<I", 6: "<f", 7: "<?"}[kind], value))
+    blobs, offset, same = [], 0, {}
+    for gguf, (name, value) in stored.items():
+        if value.ndim == 2 and gguf != "position_embd.weight":
+            blob, held = q8_0_blocks(np.ascontiguousarray(value))
+            type_ = 8
+        else:
+            blob, held, type_ = np.ascontiguousarray(value, np.float32).tobytes(), value.astype(np.float32), 0
+        if name is not None:  # back to the Hugging Face tensor these values stand for
+            if not neox and gguf.endswith(".weight") and gguf.split(".")[2] in CONV1D:
+                held = held.T
+            if neox and ".attn_qkv." in gguf:
+                held = held.reshape(3, heads, dim // heads, -1).swapaxes(0, 1).reshape(held.shape)
+            same[name] = np.ascontiguousarray(held)
+        out.append(string(gguf) + struct.pack("<I", value.ndim) + struct.pack(f"<{value.ndim}Q", *reversed(value.shape))
+                   + struct.pack("<IQ", type_, offset))
+        blobs.append(blob + b"\0" * (-len(blob) % 32))
+        offset += len(blobs[-1])
+    head = b"".join(out)
+    head += b"\0" * (-len(head) % 32)
+    return head + b"".join(blobs), same
+
+
+def unigram(vocab_size):
+    return json.dumps({"added_tokens": [], "model": {"type": "Unigram", "unk_id": 0,
+                       "vocab": [[f"w{i}", -float(i)] for i in range(vocab_size)]}}).encode()
+
+
+def the_other(model):
+    from test_gpt2 import gpt2_model
+    from test_neox import neox_model
+    if model == "gpt2":
+        return gpt2_model()
+    return neox_model(*{"neox": (0.25, True), "neox-serial": (1.0, False)}[model])
+
+
+@pytest.mark.parametrize("dtype", ["int8", "float32"])
+@pytest.mark.parametrize("model", ["gpt2", "neox", "neox-serial"])
+def test_a_gpt2_or_neox_gguf_with_the_originals_files_is_the_safetensors_conversion(model, dtype):
+    """T136's third stage: GPT-2's matrices turned back to Conv1D and GPT-NeoX's q, k and v put back per head give
+    the checkpoint, tokenizer.bin and options of the safetensors of the same values. Leaving either out of the reader
+    (the transposed entries, llama2_convert.unsplit) makes the checkpoint differ."""
+    tensors, config = the_other(model)
+    file, same = other_gguf(tensors, config)
+    vocabulary = unigram(config["vocab_size"])
+    got = with_original(file, config, vocabulary, "tokenizer.json", dtype)
+    safetensors = safetensors_file(same)
+    size = struct.unpack("<Q", safetensors[:8])[0]
+    expected = Conversion(safetensors[8:8 + size].decode(), 8 + size, json.dumps(config), vocabulary, "tokenizer.json",
+                          dtype=dtype, max_seq_len=1 << 20)
+    expected.feed(safetensors)
+    expected.finish()
+    assert bytes(got.checkpoint) == bytes(expected.checkpoint)
+    assert bytes(got.tokenizer) == bytes(expected.tokenizer)
+    assert got.options == expected.options
+    assert got.options["arch"] == ("gpt2" if model == "gpt2" else "neox")
+
+
+@pytest.mark.parametrize("model, change, what", [
+    ("neox", dict(rotary_pct=0.5), "rotated values"),
+    ("neox", dict(use_parallel_residual=False), "parallel residual"),
+    ("neox", dict(layer_norm_eps=1e-6), "LayerNorm epsilon"),
+    ("neox", dict(num_hidden_layers=1), "number of layers"),
+    ("neox", dict(num_attention_heads=2), "number of heads"),
+    ("neox", dict(model_type="llama"), "architecture"),
+    ("gpt2", dict(n_head=2), "number of heads"),
+    ("gpt2", dict(n_layer=1), "number of layers"),
+])
+def test_a_gpt2_or_neox_gguf_that_is_not_the_originals_is_refused(model, change, what):
+    """What the tensors do not say: GPT-NeoX's rotated part and parallel branches (the options carry them, and the
+    wrong ones write nonsense without a word, T72), heads of the same product, the layers."""
+    tensors, config = the_other(model)
+    file, _ = other_gguf(tensors, config)
+    llama2_convert.gguf_weights(file, json.dumps(config))  # its own config goes through
+    with pytest.raises(ValueError, match=what):
+        llama2_convert.gguf_weights(file, json.dumps({**config, **change}))

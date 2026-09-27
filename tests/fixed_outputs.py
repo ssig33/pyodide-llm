@@ -23,6 +23,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "public"))
+import llama2_convert  # noqa: E402
 from llama2_convert import Conversion, Incomplete  # noqa: E402
 from llama2_numpy import Llama  # noqa: E402
 
@@ -83,7 +84,9 @@ def converted(entry, directory):
     weights = fetch(entry, hf["weights"], directory)
     data = np.memmap(weights, dtype=np.uint8, mode="r")
     sink = File(weights.with_name("float32.bin"))
-    if hf["weights"].endswith(".gguf"):
+    # T136's second and third stages: a GGUF's weights with the vocabulary and config.json of the original
+    vocabulary = hf.get("vocabulary")
+    if hf["weights"].endswith(".gguf") and not vocabulary:
         size = 1 << 20
         while True:
             try:
@@ -93,17 +96,27 @@ def converted(entry, directory):
                 size *= 4
         first = conversion.base
     else:
-        tokenizer = hf["tokenizer"] if isinstance(hf["tokenizer"], str) else hf["tokenizer"][0]
-        (header,) = np.frombuffer(bytes(data[:8]), dtype="<u8")
+        source = {"hf": vocabulary} if vocabulary else entry
+        tokenizer = (vocabulary or hf)["tokenizer"]
+        tokenizer = tokenizer if isinstance(tokenizer, str) else tokenizer[0]
         try:
-            tokenizer_config = fetch(entry, "tokenizer_config.json", directory).read_text()
+            tokenizer_config = fetch(source, "tokenizer_config.json", directory).read_text()
         except OSError:
             tokenizer_config = ""
-        conversion = Conversion(bytes(data[8:8 + int(header)]).decode(), 8 + int(header),
-                                fetch(entry, hf["config"], directory).read_text(),
-                                fetch(entry, tokenizer, directory).read_bytes(), tokenizer, dtype="float32",
-                                tokenizer_config=tokenizer_config, sink=sink)
-        first = 0
+        config = fetch(source, "config.json" if vocabulary else hf["config"], directory).read_text()
+        if vocabulary:
+            size = 1 << 20
+            while True:
+                try:
+                    header, first = llama2_convert.gguf_weights(bytes(data[:size]), config)
+                    break
+                except Incomplete:
+                    size *= 4
+        else:
+            (length,) = np.frombuffer(bytes(data[:8]), dtype="<u8")
+            header, first = bytes(data[8:8 + int(length)]).decode(), 8 + int(length)
+        conversion = Conversion(header, first, config, fetch(source, tokenizer, directory).read_bytes(), tokenizer,
+                                dtype="float32", tokenizer_config=tokenizer_config, sink=sink, start=first)
     for start in range(first, len(data), CHUNK):
         conversion.feed(bytes(data[start:start + CHUNK]))
     conversion.finish()

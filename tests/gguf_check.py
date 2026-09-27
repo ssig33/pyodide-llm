@@ -16,7 +16,9 @@
 #       the nearest of what a GGUF made the usual ways holds (TIGHT), and the rows that pass only against a Q8_0 of
 #       the original are listed with their id, piece and norm. --original-vocabulary (stage 2:
 #       the page takes the vocabulary from the original) shows a difference in the GGUF's vocabulary without
-#       counting it. The last line is the summary as JSON.
+#       counting it. The last line is the summary as JSON. T136's third stage: GPT-2 (its Conv1D matrices, which
+#       llama.cpp turns to (out, in), and its output.weight, a copy of the embedding) and GPT-NeoX (its
+#       query_key_value, which llama.cpp splits into all of q, k, then v); the order found is said as for q and k.
 #   python3 tests/gguf_check.py logits <out A> <out B> <text file> [tokens = 300]
 #       Two converted checkpoints (the <out> of tests/perplexity_prepare.py) on the same text: the largest logit
 #       difference, how often the most likely token agrees, and the perplexity of each. The acceptance of T74 is
@@ -182,23 +184,41 @@ def tensor(info, data, base, first=0, last=None):
 
 
 # ------------------------------------------------------------------------------------------- names and orders
-def hugging_face_name(name):
+# llama.cpp's names and Hugging Face's, for each architecture: the tensors outside the layers, where a layer's go,
+# and the layer's. GPT-2's are openai-community/gpt2's (no "transformer." in front; check_tensors() tries both), and
+# its output.weight is the copy of the embedding llama.cpp writes for a GPT-2 (T136's third stage)
+NAMES = {
+    "llama": ({"token_embd.weight": "model.embed_tokens.weight", "output_norm.weight": "model.norm.weight",
+               "output.weight": "lm_head.weight"}, "model.layers.{}.",
+              {"attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm", "attn_q": "self_attn.q_proj",
+               "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj",
+               "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj"}),
+    "gpt2": ({"token_embd.weight": "wte.weight", "position_embd.weight": "wpe.weight", "output_norm.weight": "ln_f.weight",
+              "output_norm.bias": "ln_f.bias", "output.weight": "wte.weight"}, "h.{}.",
+             {"attn_norm": "ln_1", "attn_qkv": "attn.c_attn", "attn_output": "attn.c_proj", "ffn_norm": "ln_2",
+              "ffn_up": "mlp.c_fc", "ffn_down": "mlp.c_proj"}),
+    "gptneox": ({"token_embd.weight": "gpt_neox.embed_in.weight", "output_norm.weight": "gpt_neox.final_layer_norm.weight",
+                 "output_norm.bias": "gpt_neox.final_layer_norm.bias", "output.weight": "embed_out.weight"},
+                "gpt_neox.layers.{}.",
+                {"attn_norm": "input_layernorm", "attn_qkv": "attention.query_key_value", "attn_output": "attention.dense",
+                 "ffn_norm": "post_attention_layernorm", "ffn_up": "mlp.dense_h_to_4h", "ffn_down": "mlp.dense_4h_to_h"}),
+}
+NAMES["qwen2"] = NAMES["llama"]
+
+
+def hugging_face_name(name, arch="llama"):
     """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj.weight (Llama; T74 starts with it). None for a
     tensor Hugging Face has no counterpart of (rope_freqs.weight: llama.cpp's table of Llama 3's RoPE scaling,
     made from config.json's rope_scaling, checked on its own)."""
-    fixed = {"token_embd.weight": "model.embed_tokens.weight", "output_norm.weight": "model.norm.weight",
-             "output.weight": "lm_head.weight"}
+    fixed, layer, parts = NAMES.get(arch, NAMES["llama"])
     if name in fixed:
         return fixed[name]
-    parts = {"attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm", "attn_q": "self_attn.q_proj",
-             "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj",
-             "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj"}
     pieces = name.split(".", 2)
     if len(pieces) != 3 or pieces[0] != "blk":
         return None
-    _, layer, rest = pieces
+    _, number, rest = pieces
     tensor, kind = rest.rsplit(".", 1)  # .weight, or .bias (Qwen2's q, k and v)
-    return f"model.layers.{layer}.{parts[tensor]}.{kind}" if tensor in parts else None
+    return f"{layer.format(number)}{parts[tensor]}.{kind}" if tensor in parts else None
 
 
 def turned(w, heads):
@@ -207,6 +227,13 @@ def turned(w, heads):
     rather than taken from llama2_convert.permute_heads, which is what is being checked."""
     rows = w.shape[0] // heads
     return w.reshape(heads, 2, rows // 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
+
+
+def split(w, heads):
+    """What llama.cpp's convert_hf_to_gguf.py does to GPT-NeoX's query_key_value (and its bias): q, k and v of each
+    head in turn, as Hugging Face keeps them, to all of q, then all of k, then all of v. Written out here rather than
+    taken from llama2_convert.unsplit, which is what is being checked."""
+    return w.reshape(heads, 3, w.shape[0] // heads // 3, *w.shape[1:]).swapaxes(0, 1).reshape(w.shape)
 
 
 def relative(a, b):
@@ -369,13 +396,18 @@ def row_check(parts):
              for i in rounded[:64]])
 
 
-def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
+def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0, split_heads=0):
     """relative error, the error against the nearest reference (squares()) and int8 equality of a large matrix, a
     block of rows at a time; by_row: also the error of each row (row_check()). head_rows: q or k, whose heads of head_rows rows the GGUF may hold turned: the
-    blocks are whole heads, and the order is the one of the first block (the order found is returned too)."""
+    blocks are whole heads, and the order is the one of the first block (the order found is returned too).
+    split_heads: GPT-NeoX's query_key_value of that many heads, which the GGUF may hold split (split()): the blocks
+    are one head's q, k or v, and the original's rows of it are fetched from where Hugging Face keeps them."""
     rows = max(1, BLOCK // math.prod(shape[1:]))
     if head_rows:
         rows = max(head_rows, rows // head_rows * head_rows)
+    size = shape[0] // 3 // split_heads if split_heads else 0
+    if split_heads:
+        rows = size
     difference = total = same = count = 0.0
     parts, sums = [], None
     order = ""
@@ -383,6 +415,14 @@ def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
         last = min(first + rows, shape[0])
         values, raw = tensor(info, data, base, first, last)
         original = hf.rows(target, first, last).reshape(last - first, *shape[1:]).astype(np.float32)
+        if split_heads:
+            part, head = divmod(first // size, split_heads)
+            source = (head * 3 + part) * size
+            moved = hf.rows(target, source, source + size).reshape(size, *shape[1:]).astype(np.float32)
+            if not order:
+                order = "split (q, k, v)" if relative(values, moved) < relative(values, original) else "as Hugging Face"
+            if order.startswith("split"):
+                original = moved
         if head_rows:
             turn = turned(original, (last - first) // head_rows)
             if not order:
@@ -406,14 +446,27 @@ def large(info, data, base, hf, target, shape, quantize, by_row, head_rows=0):
             rowwise, order)
 
 
-def config_pairs(config):
+def config_pairs(config, arch="llama"):
     """(GGUF key, config.json name, the value config.json says, counted) of the original's config.json after
     normalize(): what the page reads (CAT-Translate 1.4b writes transformers 5's rope_parameters). The context is
-    shown and not counted: a Mistral's sliding window cuts it in normalize()."""
-    from llama2_convert import head_size, normalize
+    shown and not counted: a Mistral's sliding window cuts it in normalize(). GPT-2's and GPT-NeoX's (T136's third
+    stage): LayerNorm's epsilon, and GPT-NeoX's rotated part of a head and parallel branches, which no tensor says."""
+    from llama2_convert import head_size, normalize, rotary_dim
 
     config = normalize(config)
     heads = config["num_attention_heads"]
+    if arch in ("gpt2", "gptneox"):
+        pairs = [("block_count", "num_hidden_layers", config.get("num_hidden_layers"), True),
+                 ("embedding_length", "hidden_size", config.get("hidden_size"), True),
+                 ("feed_forward_length", "intermediate_size", config.get("intermediate_size"), True),
+                 ("attention.head_count", "num_attention_heads", heads, True),
+                 ("attention.layer_norm_epsilon", "layer_norm_eps",
+                  config.get("layer_norm_eps", config.get("layer_norm_epsilon")), True),
+                 ("context_length", "max_position_embeddings", config.get("max_position_embeddings"), False)]
+        if arch == "gptneox":
+            pairs += [("rope.dimension_count", "rotary_pct (as values)", rotary_dim(config), True),
+                      ("use_parallel_residual", "use_parallel_residual", config.get("use_parallel_residual", True), True)]
+        return pairs, config
     return [("block_count", "num_hidden_layers", config.get("num_hidden_layers"), True),
             ("embedding_length", "hidden_size", config.get("hidden_size"), True),
             ("feed_forward_length", "intermediate_size", config.get("intermediate_size"), True),
@@ -457,7 +510,7 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
           f"types {sorted({TYPE_NAMES.get(i['type'], i['type']) for i in infos.values()})}")
 
     print("\n| metadata | GGUF | config.json (normalized) |\n|---|---|---|")
-    pairs, config = config_pairs(raw_config)
+    pairs, config = config_pairs(raw_config, arch)
     mismatched = 0
     for key, name, theirs, counted in pairs:
         ours = metadata.get(f"{arch}.{key}")
@@ -469,7 +522,9 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
         note = "" if same else " **differs**" if counted else " (differs, not counted)"
         print(f"| {arch}.{key} | {ours} | {name} = {theirs}{note} |")
     rows = infos["token_embd.weight"]["shape"][0] if "token_embd.weight" in infos else None
-    tied = "output.weight" not in infos
+    # a GPT-2 always shares its classifier: llama.cpp writes a copy of the embedding as output.weight, which is held
+    # to the original's embedding below (T136's third stage)
+    tied = "output.weight" not in infos or arch == "gpt2"
     for what, ours, theirs in (("embedding rows", rows, config.get("vocab_size")),
                                ("classifier shared with the embedding", tied, bool(config.get("tie_word_embeddings", False)))):
         mismatched += ours != theirs
@@ -499,7 +554,9 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | {rope_difference:.2e} against "
                   f"rope_frequencies() of rope_scaling = {config.get('rope_scaling')}{' **differs**' if counted else ''} | | | | |")
             continue
-        target = hugging_face_name(name)
+        target = hugging_face_name(name, arch)
+        if target is not None and target not in hf and f"transformer.{target}" in hf:
+            target = f"transformer.{target}"  # a GPT-2 of the other spelling (rinna's)
         if target is None or target not in hf:
             print(f"| {name} | {TYPE_NAMES.get(info['type'])} | {info['shape']} | | | no {target} in safetensors | | |")
             mismatched += 1
@@ -507,7 +564,9 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
         shape = tuple(hf.shape(target))
         by_row = name in BY_ROW
         rowwise = None
-        if math.prod(shape) > BLOCK and len(shape) > 1 and tuple(info["shape"]) == shape:
+        # GPT-2's Conv1D matrices go whole, to be read turned (a square one has the same shape either way)
+        conv1d = arch == "gpt2" and name.startswith("blk.") and name.endswith(".weight") and len(shape) == 2
+        if math.prod(shape) > BLOCK and len(shape) > 1 and tuple(info["shape"]) == shape and not conv1d:
             # a large matrix (Qwen's embedding is 545 MB as float32) is compared a block of rows at a time: two
             # whole copies side by side are what took this machine down
             # (q and k of an 8B are 16.8M values: before T136's stage 2 they were compared here as Hugging Face holds
@@ -515,7 +574,9 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
             head_rows = 0
             if name.endswith(("attn_q.weight", "attn_k.weight")):
                 head_rows = shape[0] // (heads if "attn_q" in name else kv_heads)
-            error, near, equal, rowwise, order = large(info, data, base, hf, target, shape, quantize, by_row, head_rows)
+            split_heads = heads if arch == "gptneox" and name.endswith("attn_qkv.weight") else 0
+            error, near, equal, rowwise, order = large(info, data, base, hf, target, shape, quantize, by_row, head_rows,
+                                                       split_heads)
             if order:
                 orders.add(order)
         else:
@@ -529,6 +590,22 @@ def check_tensors(gguf_path, directory, original_vocabulary=False):
                 orders.add(order)
                 if turn < as_is:
                     original = turned(original, n)
+            if arch == "gptneox" and name.endswith(("attn_qkv.weight", "attn_qkv.bias")):
+                # T136's third stage: llama.cpp splits query_key_value into all of q, k, then v
+                as_is, moved = relative(values, original), relative(values, split(original, heads))
+                order = "split (q, k, v)" if moved < as_is else "as Hugging Face"
+                orders.add(order)
+                if moved < as_is:
+                    original = split(original, heads)
+            if conv1d:
+                # and GPT-2's Conv1D matrices, (in, out), it stores as every other model's, (out, in)
+                transposed = np.ascontiguousarray(original.T)
+                as_is = relative(values, original) if values.shape == original.shape else math.inf
+                turn = relative(values, transposed) if values.shape == transposed.shape else math.inf
+                order = "transposed (out, in)" if turn < as_is else "as Hugging Face (in, out)"
+                orders.add(order)
+                if turn < as_is:
+                    original = transposed
             error = relative(values, original) if values.shape == original.shape else float("nan")
             near = nearest(squares(values, original, raw is not None)) if values.shape == original.shape else float("nan")
             equal = ""
