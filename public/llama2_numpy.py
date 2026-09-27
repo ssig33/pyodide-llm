@@ -389,6 +389,9 @@ def rope_frequencies(width, theta, scaling=None):
 
 
 REPETITION_WINDOW = 64  # the repetition penalty looks at this many of the latest tokens
+# T195: what sample() says, on the kernels and in NumPy, when the largest logit is NaN or an infinity (a NaN anywhere,
+# +inf anywhere, or all -inf): a broken model or an overflow. No token is drawn from logits like these
+NOT_FINITE = "The model computed logits that are not finite numbers (NaN or infinity), so no token can be drawn: its weights are broken or its numbers overflowed."
 # The KV cache starts with room for this many positions and doubles when a run gets there: a context of 4096
 # tokens is 200 MB of cache for llm-jp-3-150m, which a short text should not have to pay for (and WebAssembly
 # never gives memory back)
@@ -1076,9 +1079,12 @@ class Llama:
 
         def sample(logits, temperature, topp, rng):
             if temperature == 0.0:
-                return int(np.argmax(logits))
+                return Llama.greedy(logits)
             # the random number is drawn here, so that a seed gives the same text again
-            return kernel_sample(address(logits), logits.size, temperature, topp, rng.random(), probabilities_p, order_p)
+            token = kernel_sample(address(logits), logits.size, temperature, topp, rng.random(), probabilities_p, order_p)
+            if token < 0:
+                raise ValueError(NOT_FINITE)
+            return token
 
         return penalize, sample
 
@@ -1087,21 +1093,32 @@ class Llama:
         recent = np.unique(history[-REPETITION_WINDOW:])
         logits[recent] = np.where(logits[recent] > 0, logits[recent] / penalty, logits[recent] * penalty)
 
+    @staticmethod
+    def greedy(logits):
+        """Greedy argmax sampling: take the token with the highest probability. NumPy's argmax takes a NaN for the
+        largest, so the logit it picks is finite exactly when the largest one is (T195)."""
+        token = int(np.argmax(logits))
+        if not math.isfinite(logits[token]):
+            raise ValueError(NOT_FINITE)
+        return token
+
     def sample(self, logits, temperature, topp, rng):
         if temperature == 0.0:
-            # Greedy argmax sampling: take the token with the highest probability
-            return int(np.argmax(logits))
+            return self.greedy(logits)
+        # max() keeps a NaN (T195)
+        best = logits.max()
+        if not math.isfinite(best):
+            raise ValueError(NOT_FINITE)
         nucleus = 0.0 < topp < 1.0
         if nucleus:
             # exp() over a vocabulary of 50000 or 100000 tokens costs as much as half a forward pass, and nearly all
             # of it goes to tokens that cannot be drawn: leave out, while still cheap, whatever is less than a ten
             # millionth as probable as the best token (together far below one percent of the probability mass)
-            best = logits.max()
             candidates = np.flatnonzero(logits >= best + temperature * math.log(1e-7))
             probabilities = np.exp((logits[candidates] - best) / temperature).astype(np.float64)
         else:
             candidates = np.arange(logits.size)
-            probabilities = np.exp((logits - logits.max()) / temperature).astype(np.float64)
+            probabilities = np.exp((logits - best) / temperature).astype(np.float64)
         probabilities /= probabilities.sum()
         if nucleus:
             # Top-p (nucleus) sampling: only the most probable tokens whose probabilities add up to topp.

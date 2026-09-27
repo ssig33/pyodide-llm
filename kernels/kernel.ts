@@ -713,6 +713,9 @@ function sortNucleus(probs: usize, index: usize, lo: i32, hi: i32): void {
 
 // Draws a token from softmax(logits / temperature), restricted to the nucleus when 0 < topp < 1.
 // random: one number in [0, 1) from Python's generator, so that a seed reproduces. probs and index: scratch of n each.
+// -1 when the largest logit is no finite number (T195): a NaN anywhere makes it NaN (f32x4.max and max keep a NaN),
+// +inf makes it +inf, and all -inf make it -inf. Logits like these come of a broken model or an overflow; the engine
+// stops with an error on -1 (NumPy's sample() and shaders.js's sampleLikeCpu() stop on the same logits)
 export function sample(logits: usize, n: i32, temperature: f32, topp: f32, random: f64, probs: usize, index: usize): i32 {
   let best = load<f32>(logits);
   let i = 0;
@@ -732,6 +735,7 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
     best = max(max(f32x4.extract_lane(bests, 0), f32x4.extract_lane(bests, 1)), max(f32x4.extract_lane(bests, 2), f32x4.extract_lane(bests, 3)));
   }
   for (; i < n; i++) best = max(best, load<f32>(logits + (<usize>i << 2)));
+  if (!isFinite<f32>(best)) return -1;
   const nucleus = topp > 0 && topp < 1;
   // With a nucleus, tokens less than a ten millionth as probable as the best one cannot matter (ln 1e-7 = -16.118):
   // they are left out before exp(), which is the expensive part

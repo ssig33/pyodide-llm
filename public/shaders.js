@@ -2836,7 +2836,7 @@ export function penalizeLikeCpu(logits, history, penalty) {
  * sorted from the most probable, equal ones in the order of their index (the kernel's quicksort takes them in no set
  * order: either is its distribution). temperature 0: the first index of the largest logit (NumPy's argmax). */
 export function sampleLikeCpu(logits, temperature, topp, random) {
-  if (temperature === 0) return argmaxLikeCpu(logits);
+  if (temperature === 0) return argmaxLikeCpu(finiteLikeCpu(logits));
   const { tokens, cumulative, mass } = walkLikeCpu(logits, temperature, topp);
   const goal = random * mass;
   for (let k = 0; k < tokens.length; k++) if (cumulative[k] > goal) return tokens[k];
@@ -2847,10 +2847,24 @@ export function argmaxLikeCpu(logits) {
   for (let i = 0; i < logits.length; i++) if (logits[i] > best) [best, first] = [logits[i], i];
   return first;
 }
+/** T195: the engine draws no token when the largest logit is no finite number (a NaN anywhere, +inf anywhere, or
+ * all -inf): the kernel returns -1 and NumPy's sample() raises, and the engine stops with an error. So does this: it
+ * throws, and returns the logits otherwise. (argmaxLikeCpu alone passes over a NaN, as `>` is false for it.) SAMPLE
+ * cannot be held to it: WGSL lets an implementation assume that no NaN nor infinity occurs (§15.7), so what it draws
+ * from such logits is the device's; the engine has to find them some other way before it trusts SAMPLE (T152). */
+export function finiteLikeCpu(logits) {
+  let best = -Infinity;
+  for (let i = 0; i < logits.length; i++) {
+    if (Number.isNaN(logits[i])) best = NaN;
+    else if (logits[i] > best) best = logits[i];
+  }
+  if (!Number.isFinite(best)) throw new Error(`the largest logit is ${best}: no token is drawn from logits that are not finite (T195)`);
+  return logits;
+}
 /** The tokens kernel.ts's sample() walks for a random number, in its order (the nucleus's, sorted; else the index's),
  * the running sum after each (float64) and the mass the random number is a share of. */
 export function walkLikeCpu(logits, temperature, topp) {
-  const f = Math.fround, n = logits.length, best = logits[argmaxLikeCpu(logits)];
+  const f = Math.fround, n = logits.length, best = logits[argmaxLikeCpu(finiteLikeCpu(logits))];
   const nucleus = topp > 0 && topp < 1;
   const lowest = nucleus ? f(best - f(f(temperature) * f(16.118095))) : -Infinity, inverse = f(1 / f(temperature));
   const probs = [], index = [];

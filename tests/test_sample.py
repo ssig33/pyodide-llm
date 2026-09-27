@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from conftest import pack_checkpoint, pack_tokenizer, synthetic_weights, tiny_vocab
-from llama2_numpy import REPETITION_WINDOW, Llama
+from llama2_numpy import NOT_FINITE, REPETITION_WINDOW, Llama
 
 
 @pytest.fixture(scope="module")
@@ -98,3 +98,27 @@ def test_a_low_top_p_over_few_likely_tokens(llama, topp, above):
             nucleus = reference_nucleus(logits, temperature, topp)
             # equal logits: any of them is the most probable one (the sort decides which)
             assert drawn <= set(np.flatnonzero(logits == logits.max()).tolist()) if spread == 0.0 else drawn == nucleus
+
+
+@pytest.mark.parametrize("where", [0, 7, 199])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+@pytest.mark.parametrize("temperature, topp", [(1.0, 0.9), (0.7, 1.0), (0.0, 0.9)])
+def test_logits_that_are_not_finite_stop(llama, where, bad, temperature, topp):
+    """T195: a NaN or +inf anywhere (and all -inf) leaves no distribution to draw from: a broken model or an overflow.
+    sample() says so, as the kernel's does (tests/smoke.mjs), rather than draw a token."""
+    logits = np.random.default_rng(where).standard_normal(200).astype(np.float32)
+    logits[where] = bad
+    for broken in (logits, np.full(200, -np.inf, dtype=np.float32)):
+        with pytest.raises(ValueError) as refused:
+            llama.sample(broken, temperature, topp, FixedRng([0.5]))
+        assert str(refused.value) == NOT_FINITE
+
+
+def test_some_minus_infinity_is_no_fault(llama):
+    """T195: tokens at -inf cannot be drawn; the others are drawn as before."""
+    logits = np.random.default_rng(3).standard_normal(200).astype(np.float32)
+    logits[::3] = -np.inf
+    for topp in (0.9, 1.0):
+        drawn = {llama.sample(logits, 1.0, topp, FixedRng([u])) for u in np.linspace(0.0, 1.0, 51)[:-1]}
+        assert all(np.isfinite(logits[token]) for token in drawn)
+    assert llama.sample(logits, 0.0, 0.9, FixedRng([])) == int(np.argmax(logits))

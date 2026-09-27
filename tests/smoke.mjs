@@ -234,6 +234,37 @@ for above in (2, 3, 5):
                 picks = (fast.sample(few(above), temperature, topp, Fixed(value)),
                          llama2_numpy.Llama.sample(fast, few(above), temperature, topp, Fixed(value)))
                 assert picks == (above - 1, above - 1), (above, topp, temperature, value, picks)
+# T195: logits whose largest is no finite number (a NaN anywhere, +inf anywhere, all -inf): the kernel drew index[-1]
+# (a word outside the vocabulary, or the last one), NumPy raised an error of its own or drew a token. Both stop with the
+# same ValueError now, greedy too, with the NaN or the infinity in each part of the kernel's maximum (the first four,
+# the sixteens, the fours after them, the tail one at a time). Some -inf among finite logits is no fault: those tokens
+# are not drawn, and the rest draw as before
+def refuses(draw, broken, temperature, topp):
+    try:
+        draw(broken, temperature, topp, Fixed(0.5))
+    except ValueError as error:
+        return str(error) == llama2_numpy.NOT_FINITE
+    return False
+def numpy_sample(*arguments):
+    return llama2_numpy.Llama.sample(fast, *arguments)
+for size in (fast.vocab_size, fast.vocab_size - 1, fast.vocab_size - 3):
+    cases = []
+    for where in (0, 3, 4, 21, size - 5, size - 1):
+        for bad in (np.nan, np.inf):
+            broken = (generator.standard_normal(size) * 2.0).astype(np.float32)
+            broken[where] = bad
+            cases.append((f"{bad} at {where}", broken))
+    cases.append(("all -inf", np.full(size, -np.inf, dtype=np.float32)))
+    for name, broken in cases:
+        for temperature, topp in ((0.7, 0.9), (0.7, 1.0), (1.3, 0.05), (0.0, 0.9)):
+            for draw in (fast.sample, numpy_sample):
+                assert refuses(draw, broken, temperature, topp), (size, name, temperature, topp, draw)
+    masked = (generator.standard_normal(size) * 2.0).astype(np.float32)
+    masked[::7] = -np.inf
+    for topp in (0.9, 1.0):
+        for value in (0.0, 0.5, 1.0 - 1e-12):
+            ours, theirs = fast.sample(masked, 0.7, topp, Fixed(value)), numpy_sample(masked, 0.7, topp, Fixed(value))
+            assert np.isfinite(masked[ours]) and (ours == theirs or abs(masked[ours] - masked[theirs]) < 1e-3), (size, topp, value, ours, theirs)
 history = [int(token) for token in generator.integers(0, fast.vocab_size, 100)] + [5, 5, 5]
 ours, theirs = logits.copy(), logits.copy()
 fast.penalize(ours, history, 1.3)
@@ -466,6 +497,40 @@ def kernel_pick(buffer, temperature, topp, value, history, penalty):
             throw new Error(`T178: sampleLikeCpu picked ${token}, the kernel ${theirs} of ${above} (top-p ${topp}, T ${temperature}, r ${value})`);
           }
         }
+      }
+    }
+  }
+  // T195: the logits the kernel and NumPy stop on (a NaN or +inf anywhere, all -inf), sampleLikeCpu stops on too; some
+  // -inf among finite logits it draws from as the kernel does
+  const spoilt = [];
+  for (const bad of [NaN, Infinity]) {
+    for (const where of [0, 5, vocab - 1]) {
+      const logits = new Float32Array(vocab).map(() => 4 * Math.random());
+      logits[where] = bad;
+      spoilt.push([`${bad} at ${where}`, logits]);
+    }
+  }
+  spoilt.push(["all -inf", new Float32Array(vocab).fill(-Infinity)]);
+  for (const [name, logits] of spoilt) {
+    for (const [temperature, topp] of [[0.7, 0.9], [0.7, 1], [0, 0.9]]) {
+      let threw = false;
+      try {
+        sampleLikeCpu(logits, temperature, topp, 0.5);
+      } catch {
+        threw = true;
+      }
+      if (!threw) throw new Error(`T195: sampleLikeCpu drew a token from logits with ${name} (T ${temperature}, top-p ${topp})`);
+    }
+  }
+  const masked = new Float32Array(vocab).map((_, i) => (i % 7 === 0 ? -Infinity : 4 * Math.random()));
+  for (const topp of [0.9, 1]) {
+    for (const value of [0, 0.5, 1 - 1e-12]) {
+      const result = pick(new Uint8Array(masked.buffer), 0.7, topp, value, [], 1);
+      const [theirs] = result.toJs();
+      result.destroy();
+      const token = sampleLikeCpu(masked, 0.7, topp, value);
+      if (!Number.isFinite(masked[token]) || (token !== theirs && !(Math.abs(masked[token] - masked[theirs]) < 1e-3))) {
+        throw new Error(`T195: sampleLikeCpu picked ${token}, the kernel ${theirs}, among -inf logits (top-p ${topp}, r ${value})`);
       }
     }
   }
