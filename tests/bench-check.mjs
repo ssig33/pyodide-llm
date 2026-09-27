@@ -10,10 +10,12 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as playwright from "playwright-core";
 
 // T180: the browsers' profiles, in the repository's .tmp/ (never $HOME or /tmp)
-const PROFILES = path.join(path.dirname(new URL(import.meta.url).pathname), "..", ".tmp", "bench-check-profiles");
+// fileURLToPath, not URL.pathname: on Windows the pathname is "/D:/a/…" and joined it made "D:\\D:\\a\\…" (T181)
+const PROFILES = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".tmp", "bench-check-profiles");
 
 const args = process.argv.slice(2);
 const option = (name, value) => {
@@ -69,6 +71,8 @@ function watchStages() {
 }
 
 let failed = false;
+// T181: a browser that does not start is passed over (a runner may lack Chrome or Edge), but none starting is no pass
+let started = 0;
 for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"]) {
   const branded = ["chrome", "msedge"].includes(engine);
   const type = branded ? playwright.chromium : playwright[engine];
@@ -86,6 +90,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
     console.log(`could not start: ${String(error.message).split("\n")[0]}\n`);
     continue;
   }
+  started++;
   const page = context.pages()[0] ?? await context.newPage();
   await page.addInitScript(watchStages);
   const errors = [];
@@ -144,4 +149,5 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   }
 }
 server?.close();
-process.exit(failed ? 1 : 0);
+if (!started) console.log("no browser started: nothing was measured");
+process.exit(failed || !started ? 1 : 0);
