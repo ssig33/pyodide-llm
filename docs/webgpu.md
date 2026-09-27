@@ -25,8 +25,9 @@ tokens, and the fixed cost is shared among them.
 3. It times whole blocks of 16 and 64 tokens on the GPU. The page times the CPU on real prompts. For each block, it
    runs on the GPU only if the GPU is expected to take less than 0.95 of the CPU's time. Short prompts stay on the
    CPU, because the GPU's fixed cost is not shared among enough tokens.
-4. The GPU writes the keys and values of each layer back into the CPU's cache (in float16), and the rest (the last
-   token of the prompt and everything the model writes) runs on the CPU.
+4. The GPU writes the keys and values of each layer back into the CPU's cache (in float16; widened to float32 where
+   the CPU keeps them so, for most models with grouped-query attention), and the rest (the last token of the prompt
+   and everything the model writes) runs on the CPU.
 5. Every 8 answers, the page measures the side it did not choose again, on part of a prompt, in case the device
    has warmed up or cooled down.
 

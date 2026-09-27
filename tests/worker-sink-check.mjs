@@ -82,6 +82,44 @@ assert.ok(forward.footprint(QWEN3, 600e6, { ...qwen3, dtype: "int8" }) > 1.5 * f
 opened(GPT2, { ...FORM, bias: true, arch: "gpt2" });
 assert.notEqual(forward.footprint(GPT2, 600e6, { ...FORM, arch: "gpt2", dtype: "int8" }), forward.footprint(GPT2, 600e6, { ...FORM, dtype: "int8" }));
 
+// T160 (the review): the type of the keys and values the worker sized the memory for (keysInHalf) is what it hands the
+// engine (external's halfKeys). Without it createForward takes float32 for every grouped-query model: the same answer
+// where float32 fits a 32-bit memory, and not for Qwen2.5 3B (3.82 GiB with float16, 4.03 with float32: out of memory
+// at the last growth of the cache, near position 2048) or Llama 3.2 3B (64-bit either way: 0.66 GB more). No other
+// test runs this path: forward-check and gpu-check make their engines themselves.
+{
+  const handed = [];
+  context.stand.forward.external = (args) => {
+    handed.push(args.halfKeys);
+    return {};
+  };
+  vm.runInContext("disabled = []; sharedKernels = {}; wideKernels = { plain: {}, shared: {} }; threadsRequest = undefined; " +
+    "llama2_numpy.Llama = { callKwargs: () => ({}) };", context);
+  const cases = [["llm-jp-3 150M", [512, 2048, 12, 8, 8, 99584, 4096], 160e6, {}, true],
+    ["Qwen2.5 0.5B", [896, 4864, 24, 14, 2, 151936, 4096], 555992604, { bias: true }, false],
+    ["Qwen2.5 3B", [2048, 11008, 36, 16, 2, 151936, 4096], 3472375836, { bias: true }, true],
+    ["Llama 3.2 3B", [3072, 8192, 28, 24, 8, 128256, 4096], 3614847004, {}, true]];
+  const handedFor = (header, size, form) => {
+    handed.length = 0;
+    const into = vm.runInContext("checkpointSink()", context);
+    into.sink.open(size, proxy(header), "int8", proxy({ ...FORM, ...form }));
+    into.weights.llama({}, {});
+    assert.equal(handed.length, 1, "the engine was not made through external()");
+    return handed[0];
+  };
+  for (const isolated of [true, false]) {
+    context.self.crossOriginIsolated = isolated;
+    for (const [name, header, size, form, half] of cases) {
+      const want = isolated && half;
+      assert.equal(handedFor(header, size, form), want,
+        `${name}${isolated ? "" : " (not isolated)"}: the worker hands the engine ${want ? "float16" : "float32"} keys and values`);
+    }
+  }
+  context.self.crossOriginIsolated = false;
+  vm.runInContext("sharedKernels = undefined; wideKernels = undefined; delete llama2_numpy.Llama;", context);
+  console.log("ok: the worker hands the engine the type of keys and values it sized the memory for");
+}
+
 // the Python buffer of ?without=kernels: let go once, by another open() (another tokenizer) or by release()
 vm.runInContext('disabled = ["kernels"];', context);
 const into = vm.runInContext("checkpointSink()", context);
