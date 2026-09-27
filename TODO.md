@@ -465,6 +465,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - 入れたもの: `/benchmark/` の GPU の節は、代わりのアダプタ（`isFallbackAdapter`）では「the adapter」と「the shaders against JavaScript」だけで、時間を測る段（帯域・トークン・層・生成・固定費・上限・プロンプト）は飛ばす。bench.yml と `bench-check.mjs` の既定のモデルを tiny-lm に戻す（ページの既定は T176 のまま llm-jp-3 150M）。models.yml の GPU の確認は小さいモデルで（頼みの形。ファイルは変えていない）。
 - 確かめ: build と `node tests/bench.mjs`。本番の bench.yml で GPU の節が突き合わせで ok になり、ジョブが短くなること。
 
+- **本番の確認（2026-09-27、6d022ad の後）**: bench.yml（36304688238）は 3 つの OS × 5 ブラウザで全部の節が通り、全体は 23.8 → 12.7 分（Windows 7.9 分、macOS 12.6 分）。macOS の Chromium 系の保存の節も通った（T180・T181 の後）。
 ### T181 [バグ] Windows の CI で bench-check のブラウザが 1 つも起動せず、それでも成功になる — 状態: **直した（2026-09-27）**（規模 小）
 - 根拠: T180 のプロファイルの場所を `new URL(import.meta.url).pathname` から作ったので、Windows では「/D:/a/…」が `D:\D:\a\…` になり、5 つのブラウザが全部「could not start: … ENOENT」（bench.yml 36301878917）。起動しないブラウザは飛ばす作り（ランナーに Chrome や Edge が無いこともある）なので、何も測らずにジョブは success だった。
 - 直し: パスは `fileURLToPath` で作る。ブラウザが 1 つも起動しなければ exit 1。
