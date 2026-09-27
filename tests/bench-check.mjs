@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as playwright from "playwright-core";
+import { pathTable } from "../src/bench.js";
 
 // T180: the browsers' profiles, in the repository's .tmp/ (never $HOME or /tmp)
 // fileURLToPath, not URL.pathname: on Windows the pathname is "/D:/a/…" and joined it made "D:\\D:\\a\\…" (T181)
@@ -113,6 +114,16 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
     console.log(`sections: ${statuses.join(", ")}`);
     for (const [name, result] of Object.entries(results)) {
       if (result.status === "wrong" || (result.status === "error" && OURS.includes(name))) failed = true;
+    }
+    // T184: the model page's own path, a line a row (CI's fallback adapter times the CPU sides only: the GPU's cells
+    // say why), and none at all, or no row of it, is a failure of the model section
+    if (results.model?.status === "ok") {
+      const paths = results.model.data?.paths;
+      for (const line of pathTable(paths).split("\n").filter((text) => text && !text.startsWith("|---"))) console.log(`model path: ${line}`);
+      if (!paths?.rows?.length) {
+        console.log("model path: FAILED, nothing timed");
+        failed = true;
+      }
     }
     const stages = await page.evaluate(() => window.__stages);
     for (const [name, result] of Object.entries(results)) {

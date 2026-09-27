@@ -135,7 +135,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 </style>
 
 <script>
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
+  import { FULL_ROUNDS, PATH_PROMPTS, ROUNDS, benchMarkdown, pathTable, cpuBaseline, cpuTable, environmentOf, generateTable, layerTable, matVecTable, noRatios, reportTooLong, tableCell, reportUrl, threadCounts, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
 
   declare const __BUILD__: string;
@@ -360,41 +360,56 @@ const BENCH_MODEL = "llm-jp-3-150m";
     }
   }
 
-  // the model page's worker itself (public/worker.js): the model loads, then the rounds of ?bench=1 (T45)
+  // the model page's worker itself (public/worker.js): the model loads, then the rounds of ?bench=1 (T45), then the
+  // model page's own path (T184: prompts and writing as the page chooses between the GPU and the CPU, and on each alone)
   // what the model section measured, under the name of the model it ran (the choice may change after)
-  let measured: { name: string; rows: any[]; pyodide: string } | undefined;
+  let measured: { name: string; rows: any[]; pyodide: string; paths?: string } | undefined;
   async function modelSection(): Promise<Result> {
     const entry = model();
     const w = worker("worker.js");
     const rounds = ($("full") as HTMLInputElement).checked ? FULL_ROUNDS : ROUNDS;
-    // T177: the load, then each round (loaded again and run: the worker says ready at the end of each round's load)
-    const stages = 1 + rounds.length;
-    let readies = 0;
+    // T177: the load, then each round (loaded again and run: the worker says ready at the end of each round's load),
+    // then the page's path (loaded once more, the GPU waited for, each side timed: the worker's words as the stage)
+    const stages = 2 + rounds.length;
+    let readies = 0, pathing = false;
     const round = (i: number) => staged("model", { stage: `round: ${rounds[i].name}`, at: 2 + i, of: stages });
+    const prompt = entry.prompt || "Once upon a time";
     try {
-      const answer: any = await new Promise((resolve) => {
+      const listen = (resolve: (value: any) => void) => {
         w.onmessage = ({ data }) => {
-          if (data.type === "status" && !readies) staged("model", { stage: data.text, at: 1, of: stages });
+          if (data.type === "status" && pathing) staged("model", { stage: `the page's path: ${data.text}`, at: stages, of: stages });
+          else if (data.type === "status" && !readies) staged("model", { stage: data.text, at: 1, of: stages });
           else if (data.type === "progress" && !readies) {
             staged("model", { stage: `the model: ${(data.received / 1e6 || 0).toFixed(1)} / ${(data.total / 1e6).toFixed(1)} MB`,
                               at: 1, of: stages, part: data.received / data.total || 0 });
-          } else if (data.type === "ready") {
+          } else if (data.type === "ready" && !pathing) {
             // the bench once: every round loads the model again and says ready too (T96)
-            if (!readies) w.postMessage({ type: "bench", model: entry, load: 1, rounds, prompt: entry.prompt || "Once upon a time", steps: 64 });
+            if (!readies) w.postMessage({ type: "bench", model: entry, load: 1, rounds, prompt, steps: 64 });
             round(Math.min(Math.max(readies - 1, 0), rounds.length - 1));
             readies++;
-          } else if (data.type === "bench") resolve(data);
+          } else if (data.type === "bench" || data.type === "paths") resolve(data);
           else if (data.type === "error") resolve({ error: data.message });
         };
         w.onerror = (event) => resolve({ error: `the worker failed: ${event.message ?? "error"}` });
+      };
+      const answer: any = await new Promise((resolve) => {
+        listen(resolve);
         w.postMessage({ type: "init", search: "", model: entry, load: 1,
           threads: { remembered: 0, hint: navigator.hardwareConcurrency || 1 } });
       });
       if (answer.error) return { status: "error", markdown: answer.error };
-      measured = { name: entry.name, rows: answer.rows, pyodide: answer.pyodide };
+      pathing = true;
+      staged("model", { stage: "the page's path", at: stages, of: stages });
+      const paths: any = await new Promise((resolve) => {
+        listen(resolve);
+        w.postMessage({ type: "paths", model: entry, load: 2, prompt, counts: PATH_PROMPTS, steps: 64 });
+      });
+      const table = pathTable(paths, entry.name);
+      measured = { name: entry.name, rows: answer.rows, pyodide: answer.pyodide, paths: table };
       const lines = ["| what ran | tok/s | ready | backend |", "|---|---|---|---|",
         ...answer.rows.map((row: any) => `| ${row.name} | ${fixed(row.speed)} | ${fixed(row.seconds)} s | ${row.backend} |`)];
-      return { status: "ok", data: answer.rows, markdown: `${entry.name} · Pyodide ${answer.pyodide}\n\n${lines.join("\n")}` };
+      return { status: "ok", data: { rows: answer.rows, paths },
+               markdown: `${entry.name} · Pyodide ${answer.pyodide}\n\n${lines.join("\n")}\n\n${table}` };
     } finally {
       w.terminate();
     }
@@ -651,7 +666,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
     // the model section's table is the one on top; the section itself only where it did not measure
     const sections = SECTIONS.filter((name) => results[name] && (name !== "model" || results[name]!.status !== "ok"))
       .map((name) => `#### ${TITLES[name]}${results[name]!.status === "ok" ? "" : ` (${STATE[results[name]!.status]})`}\n\n${results[name]!.markdown}`);
-    const markdown = [benchMarkdown(measured?.rows ?? [], environment), ...sections].join("\n\n");
+    // T184: the model page's own path right under the rounds' table (a table of its own: parseReport() reads the first)
+    const markdown = [benchMarkdown(measured?.rows ?? [], environment), ...(measured?.paths ? [measured.paths] : []), ...sections].join("\n\n");
     $("markdown").textContent = markdown;
     ($("issue") as HTMLAnchorElement).href = reportUrl(markdown, environment);
     $("long").hidden = !reportTooLong(markdown, environment);

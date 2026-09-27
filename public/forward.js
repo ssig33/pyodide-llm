@@ -26,7 +26,7 @@ const GPU_QUIET_MS = 200000;
 // T147: the most tokens of a prompt the GPU takes at once: the tokens of the largest tile (T146's 64 × 64), whose
 // sixteen blocks left three quarters of it idle. Python hands a prompt over this many at a time where the GPU is on
 // (promptBlock), BATCH where it is not: the worker answers nothing while one call runs (T108)
-const GPU_BLOCK = 64;
+export const GPU_BLOCK = 64;
 // T148: every this many generations after the first verdict, a part of a prompt goes to the side not chosen
 const GPU_RECHECK = 8;
 // T147: the number of the GPU's requests, for this worker and every model it loads (the memory and its control area
@@ -774,6 +774,9 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // block on the other side put a GPU faster from 17 to 64 tokens on blocks of 16, 1.47 times as long, and never
   // timed the CPU). written: the positions this generation has filled
   let gpuStatus = gpu ? null : undefined, recheck = null, sinceCheck = 0, written = 0;
+  // T184: why the prompts stay on the CPU (the model, the device, a failure), once it is known; and the side the
+  // benchmark puts every block of a prompt on ("cpu", "gpu"), or null: the choice above
+  let gpuReason = null, gpuSide = null;
   const times = promptTimes();
   const gpuNote = !gpu ? undefined : new Promise((resolve) => {
     settleGpu = (note) => {
@@ -781,7 +784,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuStatus = note;
       resolve(note);
     };
-    if (gpuWhyNot) settleGpu(`prompts on the CPU (${gpuWhyNot})`);
+    if (gpuWhyNot) settleGpu(`prompts on the CPU (${(gpuReason = gpuWhyNot)})`);
     else startGpu();
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
@@ -857,7 +860,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (ctl) Atomics.store(ctl, GPU_WANTED, 0);  // T147: a request still under way writes nothing now
     gpuWorker?.postMessage({ type: "stop" });
     gpuWorker = null;
-    const note = `prompts on the CPU (${why ?? "the model was let go"})`;
+    gpuReason = why ?? "the model was let go";
+    const note = `prompts on the CPU (${gpuReason})`;
     if (settleGpu) settleGpu(note);
     else if (gpu) gpuStatus = note;
   }
@@ -865,8 +869,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // and is faster for count tokens than the CPU on the threads in use now (promptTimes); and the first whole block of
   // a prompt where the GPU is to be timed again (recheck)
   function gpuTakes(count, pos0) {
-    if (!gpuOn || pos0 > gpuEnd) return false;
-    if (gpuForce.always) return true;
+    if (!gpuOn || pos0 > gpuEnd || gpuSide === "cpu") return false;
+    if (gpuForce.always || gpuSide === "gpu") return true;
     const known = times.of(count, threads);
     if (!known) return false;  // the CPU is timed first, on this prompt
     return known.faster || (recheck === "gpu" && pos0 === 0 && count === GPU_BLOCK);
@@ -1018,8 +1022,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
      * block (T148: where it is faster), else BATCH (a longer call keeps the worker from answering for longer, and the
      * CPU gains nothing from it) */
     get promptBlock() {
-      if (!gpuOn) return BATCH;
-      if (gpuForce.always) return GPU_BLOCK;
+      if (!gpuOn || gpuSide === "cpu") return BATCH;
+      if (gpuForce.always || gpuSide === "gpu") return GPU_BLOCK;
       const whole = times.of(GPU_BLOCK, threads);
       return whole && (whole.faster || (recheck === "gpu" && written === 0)) ? GPU_BLOCK : BATCH;
     },
@@ -1041,6 +1045,20 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     },
     get gpuReady() {
       return gpuOn ? gpuChosen : undefined;
+    },
+    /** T184: why the prompts stay on the CPU (no WebGPU, a fallback adapter, a model the GPU does not take yet, a
+     * failure), or null while none is known */
+    get gpuWhyNot() {
+      return gpu ? gpuReason : "no WebGPU in a worker here";
+    },
+    /** T184 (the benchmark's page path): every block of a prompt on "cpu" or on "gpu" (where the GPU is on and holds
+     * the keys and values before it, as gpuForce.always), or null: each where it is faster (promptTimes) */
+    set gpuSide(side) {
+      gpuSide = side === "cpu" || side === "gpu" ? side : null;
+    },
+    /** T184: the fewest tokens of a block the GPU takes now (GPU_BLOCK + 1: none), null until both sides are timed */
+    get gpuFrom() {
+      return times.threshold(GPU_BLOCK, threads);
     },
     /** T135: the tokens of a prompt that went through the GPU since the generation began */
     get gpuTokens() {

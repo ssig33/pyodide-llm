@@ -406,3 +406,48 @@ export function generateTable(step, check, gpu = {}) {
 // the ms of the sampling alone, with how many tokens were over the nucleus's floor (what SAMPLE gathers and reads each
 // round of its searches: T151)
 const samplingCell = (s) => `${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}`;
+
+/** T184: the prompts the model page's path is timed on: one block of the GPU's (forward.js's GPU_BLOCK) and four */
+export const PATH_PROMPTS = [64, 256];
+
+/** T184: why a GPU cell of the page path is empty, in a few words: "not here" (no WebGPU, no adapter), "not on a
+ * fallback adapter" (the CPU in a GPU's place: the page refuses it, T148, and CI's are all such, T182), else the words of
+ * forward.js (a model the GPU does not take yet, too little memory, a failure). */
+export function gpuSkipped(why = "") {
+  if (/no WebGPU|no GPU adapter/.test(why)) return "not here";
+  if (/fallback adapter/.test(why)) return "not on a fallback adapter";
+  return why || "not measured";
+}
+
+/** T184: the model page's own path on this device, as one table (the model section times it after its rounds,
+ * worker.js's timedPaths): prompts and writing as the page chooses between the GPU and the CPU (T148), on the CPU only
+ * and on the GPU only, and how many times faster the GPU is. paths: { threads, gpu: { seconds, matrices, attention } or
+ * { why }, from (the fewest tokens of a block the GPU takes; block + 1: none; null: unknown), block, rows: [{ what:
+ * "prompt" | "generation", tokens, chosen, cpu, gpu }] } where a cell is { speed, gpuTokens } or { skip }; or { error }.
+ * A GPU cell of the writing stays open for T152 (a token on the GPU): the same row, its speed where it has one. */
+export function pathTable(paths, name = "") {
+  const title = `**The model page's path**${name ? ` (${name})` : ""}`;
+  if (!paths || paths.error) return `${title}: failed: ${tableCell(paths?.error ?? "no answer")}`;
+  const { gpu = {}, from, block, rows = [] } = paths;
+  const facts = [paths.threads !== undefined && threadsOf({ threads: paths.threads, isolated: true }).replace(/ \(.*/, "")];
+  if (gpu.why !== undefined) facts.push(`WebGPU: ${tableCell(gpuSkipped(gpu.why))}`);
+  else {
+    facts.push(`WebGPU ready in ${number(gpu.seconds)} s`, `matrices by ${tableCell(gpu.matrices ?? "?")}`, `attention by ${tableCell(gpu.attention ?? "?")}`);
+    if (typeof from === "number") facts.push(from > block ? `the CPU for every block up to ${block} tokens` : `the GPU from ${from} tokens`);
+  }
+  // a cell the GPU did not run: the few words of gpuSkipped(), or "not used" where the line above has the reason
+  const skipped = (why) => (why === gpu.why && gpuSkipped(why) === why ? "not used" : tableCell(gpuSkipped(why)));
+  const speed = (cell) => (cell?.skip !== undefined ? skipped(cell.skip)
+    : cell ? `${number(cell.speed, cell.speed >= 100 ? 0 : 1)} tok/s` : "?");
+  // where the page's choice put the tokens: all on one side, or a part on the GPU (a GPU, then the CPU: T148)
+  const side = (cell, tokens) => (!cell || cell.gpuTokens === undefined ? "" : cell.gpuTokens >= tokens ? ", GPU"
+    : cell.gpuTokens > 0 ? `, GPU ${cell.gpuTokens} of ${tokens}` : ", CPU");
+  const lines = [`${title}: ${facts.filter(Boolean).join(" · ")}`, "",
+    "| the page | as chosen | CPU only | GPU only | GPU ÷ CPU |", "|---|---|---|---|---|",
+    ...rows.map((row) => {
+      const what = row.what === "prompt" ? `a prompt of ${row.tokens} tokens` : `writing ${row.tokens} tokens`;
+      const ratio = row.gpu?.speed && row.cpu?.speed ? times(row.gpu.speed / row.cpu.speed) : "";
+      return `| ${what} | ${speed(row.chosen)}${side(row.chosen, row.tokens)} | ${speed(row.cpu)} | ${speed(row.gpu)} | ${ratio} |`;
+    })];
+  return lines.join("\n");
+}

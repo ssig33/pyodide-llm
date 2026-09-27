@@ -622,7 +622,8 @@ function weightsBuffer(size, header, options) {
       llama: (tokenizer, options) => {
         // (not on the benchmark's page, ?bench=, T45: it times the CPU's combinations, which a GPU starting beside
         // them would slow down with its upload and compilation; its first load is one of them)
-        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage ? openGpu : undefined, gpuRoom,
+        // (nor under the rounds of /benchmark/'s model section, T184: the same; its page path starts the GPU after them)
+        outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage && !benching ? openGpu : undefined, gpuRoom,
           gpuRemembered: gpuRequest?.remembered, gpuForce });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
       },
@@ -1286,9 +1287,93 @@ function watchGpu(id) {
   return engine.gpuStatus;
 }
 
+// T45: a warm-up, then the measured run: the prompt, greedy, steps tokens (fewer where the model ends it first)
+function timedGeneration(prompt, steps) {
+  llama.generate.callKwargs(prompt, { steps: 8, temperature: 0 }).return();
+  const begin = performance.now();
+  const pieces = llama.generate.callKwargs(prompt, { steps, temperature: 0, echo: false });
+  let tokens = 0;
+  try {
+    while (!pieces.next().done) tokens += 1;
+  } finally {
+    pieces.destroy();
+  }
+  return { tokens, speed: tokens / ((performance.now() - begin) / 1000) };
+}
+
+// T184: the model page's own path on the model just loaded (src/bench.js's pathTable() writes it): prompts of counts
+// tokens through forwardMany() as the page chooses between the GPU and the CPU (T148), on the CPU only, and on the GPU
+// only (as ?gpuTest's always), and the writing of steps tokens. The GPU is waited for first (the page does not wait:
+// its first prompts go on the CPU meanwhile), then the threads' search is let finish on a few runs, so that every
+// side is timed on the same number of threads (the CPU's times, and so the choice, are per number of threads).
+// Each prompt: a warm-up, then the middle of PROMPT_RUNS. Generation on the GPU is T152's: said, not timed.
+const PROMPT_RUNS = 3, SEARCH_RUNS = 8;
+async function timedPaths({ prompt, counts, steps }) {
+  const engine = outsideNow?.engine;
+  if (!engine) return { error: `${llama.backend} runs this model here: the page's path is the NumPy engine's` };
+  if (engine.gpu) {
+    const began = performance.now();
+    const beat = setInterval(() => postMessage({ type: "status", text: `the GPU gets ready: ${Math.round(since(began))} s` }), 5000);
+    try {
+      await engine.gpu;
+    } finally {
+      clearInterval(beat);
+    }
+  }
+  const chosen = engine.gpuReady;
+  const gpu = chosen ? { seconds: chosen.seconds, matrices: chosen.matrices, attention: chosen.attention } : { why: engine.gpuWhyNot };
+  postMessage({ type: "status", text: "the software threads" });
+  for (let i = 0; i < SEARCH_RUNS && engine.searching; i++) timedGeneration(prompt, 64);
+  const threads = await engine.setThreads(engine.threads);  // the search ends here, where it has come to
+  const encoded = llama.tokenizer.encode(prompt);
+  const words = encoded.toJs();
+  encoded.destroy();
+  if (!words.length) words.push(llama.bos ?? 1);
+  const sides = { chosen: null, cpu: "cpu", gpu: "gpu" };
+  const rows = [];
+  try {
+    for (const count of counts.filter((n) => n <= llama.seq_len)) {
+      const tokens = Array.from({ length: count }, (_, i) => words[i % words.length]);
+      const row = { what: "prompt", tokens: count };
+      for (const [name, side] of Object.entries(sides)) {
+        if (side === "gpu" && !chosen) {
+          row[name] = { skip: gpu.why };
+          continue;
+        }
+        postMessage({ type: "status", text: `a prompt of ${count} tokens: ${name === "chosen" ? "as the page chooses" : `on the ${side.toUpperCase()} only`}` });
+        engine.gpuSide = side;
+        const runs = [];
+        for (let run = 0; run <= PROMPT_RUNS; run++) {
+          const before = engine.gpuTokens, began = performance.now();
+          engine.forwardMany(tokens, 0);
+          if (run) runs.push({ ms: performance.now() - began, gpuTokens: engine.gpuTokens - before });
+        }
+        const middle = runs.sort((a, b) => a.ms - b.ms)[runs.length >> 1];
+        row[name] = { speed: count / (middle.ms / 1000), gpuTokens: middle.gpuTokens };
+      }
+      rows.push(row);
+    }
+    const row = { what: "generation", tokens: steps };
+    for (const [name, side] of Object.entries(sides)) {
+      if (side === "gpu") {
+        row[name] = { skip: chosen ? "not on the GPU yet" : gpu.why };  // T152 puts a token on the GPU
+        continue;
+      }
+      postMessage({ type: "status", text: `writing ${steps} tokens: ${name === "chosen" ? "as the page chooses" : "on the CPU only"}` });
+      engine.gpuSide = side;
+      row[name] = timedGeneration(prompt, steps);
+    }
+    rows.push(row);
+  } finally {
+    engine.gpuSide = null;
+  }
+  return { threads, gpu, from: engine.gpuFrom, block: forwardModule.GPU_BLOCK, rows };
+}
+
 // the run that is going on, and whether the page asked it to stop
 let generating, stopped = false;
 let benching = false;  // the benchmark's rounds are running (T45); see the bench message
+let pathing = false;  // T184: the benchmark's page path is being timed; see the paths message
 
 // Hand the event loop a turn, so that a message sent meanwhile is delivered. setTimeout would cost 4ms per
 // call (the browsers clamp it), a MessageChannel comes back in the same millisecond.
@@ -1379,23 +1464,8 @@ self.onmessage = async ({ data }) => {
           unloaded = current.catch(() => {});
           await current;
           const ready = since(started);
-          // a warm-up, then the measured run: the same prompt, greedy, the same number of tokens
-          const settings = { prompt: data.prompt, steps: data.steps, temperature: 0, echo: false };
-          llama.generate.callKwargs(settings.prompt, { steps: 8, temperature: 0 }).return();
-          const begin = performance.now();
-          const pieces = llama.generate.callKwargs(settings.prompt, { steps: settings.steps, temperature: 0, echo: false });
-          let tokens = 0;
-          for (;;) {
-            const { done } = pieces.next();
-            if (done) {
-              break;
-            }
-            tokens += 1;
-          }
-          pieces.destroy();
-          const seconds = (performance.now() - begin) / 1000;
-          rows.push({ name: round.name, without: round.without, tokens, speed: tokens / seconds,
-                      backend: llama.backend, seconds: ready });
+          const { tokens, speed } = timedGeneration(data.prompt, data.steps);
+          rows.push({ name: round.name, without: round.without, tokens, speed, backend: llama.backend, seconds: ready });
         }
       } finally {
         // also when a round failed or a change of model cancelled it (the review of T76): the next model must not
@@ -1404,6 +1474,26 @@ self.onmessage = async ({ data }) => {
         benching = false;
       }
       postMessage({ type: "bench", load: data.load, rows, pyodide: pyodide.version });
+    } else if (data.type === "paths") {
+      // T184: after the rounds, the model loaded once more as the model page loads it (the GPU too), and its prompts
+      // and its writing timed as the page chooses, on the CPU only and on the GPU only
+      if (benching || pathing) {
+        return;
+      }
+      pathing = true;
+      try {
+        loading?.abort();
+        loading = new AbortController();
+        signal = loading.signal;
+        gpuRequest = undefined;  // chosen afresh: what a first visit does, the same on every run of the benchmark
+        const previous = unloaded;
+        const current = previous.then(() => generating?.catch(() => {})).then(() => load(data.model, signal, data.load));
+        unloaded = current.catch(() => {});
+        await current;
+        postMessage({ type: "paths", load: data.load, ...(await timedPaths(data)) });
+      } finally {
+        pathing = false;
+      }
     } else if (data.type === "generate") {
       if (!llama) {
         throw new Error("The model is not ready.");
