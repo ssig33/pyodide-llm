@@ -61,7 +61,8 @@
 // 0.98 give two tokens of NumPy's nucleus, not the same (the random numbers reach the GPU: where either lands is not
 // held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js); and 4
 // steps after the prompt went through the CPU while the GPU's own cache held the keys and values of other tokens
-// (a prompt of them through the GPU first): NumPy's ids, or a near tie (the CPU's keys and values went up).
+// (a prompt of them through the GPU first): the CPU's most likely token on its own keys and values, or a near tie of
+// its logits (the CPU's keys and values went up).
 //
 // T183: what a person reads to judge it, in the log of CI (the development machine does not run WebGPU's tests): E16,
 // how far NumPy's answer moves when nothing but its cache is rounded to float16 (answer(half=True), T153's review), and
@@ -440,7 +441,11 @@ try {
       engine.gpuSide = "cpu";
       engine.forwardMany(tokens.slice(0, -1), 0);
       engine.gpuSide = null;
-      out.uploaded = ask(tokens[n], n, [], 4);
+      // (the CPU's logits of the prompt's last token on the CPU's keys and values, the answer: NumPy's is not, the
+      // CPU's keys and values being up to 46% from NumPy's on the made-up models)
+      engine.forward(tokens[n], n);
+      out.uploadedLogits = b64(engine.logits().slice());
+      out.uploaded = ask(tokens[n], n, [], 1);
       return out;
     };
     const run = async (gpu, gpuForce, gpuRemembered, steps = false) => {
@@ -820,10 +825,12 @@ function stepsRight(c, steps, { e16, q8, kvDim, prompt }) {
   // (the keys and values of the second run's positions are not held to a line: they are the attention's over the
   // CPU's step between, its 7-bit activations, 1.02e-2 to 1.30e-2 on llm-jp-3 150M's float forms, run 36324147634)
   const first = run(steps.first, 0, 4), second = first === 4 ? run(steps.second, 5, 3, false) : 0;
-  // the steps after the prompt went through the CPU (the GPU's cache held another's): NumPy's, or a near tie
-  const uploaded = run(steps.uploaded, 0, 4, false);
+  // the step after the prompt went through the CPU (the GPU's cache held another's): the CPU's most likely token on
+  // the same keys and values, or a near tie of the CPU's logits
+  const cpuLogits = floats(steps.uploadedLogits ?? ""), cpuTop = argmax(cpuLogits), uploaded = steps.uploaded?.[0];
+  if (!cpuLogits.length || !near(cpuLogits, cpuTop, uploaded)) failures.push(`after a prompt on the CPU the step is ${uploaded}, the CPU's ${cpuTop}, and not a near tie`);
   said.push(`${first}${first === 4 ? ` and ${second}` : ""} greedy ids as NumPy's${first === 4 && second === 3 ? "" : " (then a near tie)"}` +
-    `, after a prompt on the CPU ${uploaded}` +
+    `, after a prompt on the CPU ${uploaded}${uploaded === cpuTop ? " as the CPU's" : ` (the CPU's ${cpuTop})`}` +
     (first === 4 ? `, the CPU's step between them ${steps.cpuStep === greedy[4] ? "NumPy's" : `${steps.cpuStep} (NumPy's ${greedy[4]})`}` : ""));
   // the keys and values the GPU wrote back of the positions whose inputs were NumPy's (not the CPU's step's: the CPU's)
   const layers = ref.header[2];
