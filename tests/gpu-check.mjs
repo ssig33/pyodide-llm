@@ -103,30 +103,38 @@ const COUNT = 150, KV_START = 8;
 // away (Qwen3 0.6B the most), llama.cpp's f16 0.9 to 3.2 and 5.5 (Qwen3 0.6B with the f16 attention), while a GPU that
 // reads layer 0's biases in every layer (synthetic-qwen2) is 13.9 E16 away on float32 and 14.4 on f16: K is 4 and 8.
 const GPU_LINE = 8e-3, HALF_LINE = 1.5e-2;
-const K = { float32: 4, f16: 8, packed: 8 };
+const K = { float32: 4, f16: 8 };
 // T187: none of the lines is a ratio to the CPU's error (T147 to T153 held DP4A to 0.75 of it and the logits to 1.5
 // times it: a correct DP4A went to 0.98 of its line on Qwen2.5 0.5B, one that read layer 0's biases in every layer
 // passed at 0.55, and GPT-2's logits went past 1.5 on keys and values that were NumPy's own; they moved wherever the
-// CPU's arithmetic did). Each is held to a yardstick of its own:
+// CPU's arithmetic did). Each is held to a yardstick of its own. The numbers are CI's Dawn on lavapipe (runs
+// 36314674862 and 36314674849, 149 tokens, the made-up models, Qwen2.5 0.5B, Qwen3 0.6B, llm-jp-3 150M, SmolLM2 360M,
+// and with T154 GPT-2 124M and Pythia 160M; TODO.md's T187):
 //   - the packed shaders (8-bit activations) to Q8: NumPy's answer with the inputs of the layers' matrices quantized
 //     as quantize_x does it (8 bits, 32 a group, half to even) and its cache in float16, which is ORT's DP4A's
-//     arithmetic. Their keys and values are held against Q8's as the f16 shaders' against NumPy's: every layer to
-//     HALF_LINE or K.packed × E16, the first layer to HALF_LINE, the scale to SCALE_LINE. (Against NumPy's they are
-//     as far as Q8 is, 19 to 60 E16, and a GPU that read layer 0's biases in every layer, or LayerNorm's mean over
-//     n − 1, stayed within 1.0 to 1.7 times Q8's distance: CI's first run of T187.)
-//   - the scale of the first layer's keys and values (T187: the norm's scale wrong by a little, as a mean or variance
-//     over n − 1 (1 + 1/2n: 7.8e-3 at dim 64, 8.7e-4 at 576) or a wrong epsilon, stays under the rows' lines, and the
-//     fused norm's quantized integers do not see it at all, T175): the least-squares factor s of the GPU's against
-//     NumPy's, sum(g·w) / sum(w·w), which the rounding of single values leaves at 1 within its noise over thousands
-//     of values. |s − 1| no more than SCALE_LINE.
+//     arithmetic. Their first layer against Q8's: 8.1e-5 to 2.9e-3 (Qwen3 0.6B the most), the line GPU_LINE (a
+//     LayerNorm's mean over n − 1: 1.57e-2 and 1.93e-2). Past the first layer the 8-bit roundings that fall on the
+//     other side of a boundary part them from Q8 as far as Q8 is from NumPy's (a GPU as it should be 0.25 to 2.6 Q8
+//     from Q8), so all their layers are held against NumPy's: 0.49 to 1.40 times Q8's distance from it (GPT-2 124M
+//     the most, its outlier channels), the line K_PACKED × that. A bias read from layer 0 in every layer stays under
+//     it on the made-up Qwen2 (0.98: its biases are near 1 in every layer, and the 8 bits' noise is larger), and goes
+//     1569 times past on Qwen2.5 0.5B; the float shaders catch it on both.
+//   - the scale of the first layer's keys and values (the norm's scale wrong by a little, as a mean of squares or a
+//     variance over n − 1 (1 + 1/2n: 7.8e-3 at dim 64, 5.2e-4 at 960) or a wrong epsilon, stays under the rows' lines,
+//     and the fused norm's quantized integers do not see it at all, T175): the least-squares factor s of the GPU's
+//     against NumPy's (the packed shaders' against Q8's, whose own scale moves by up to 4.4e-4), sum(g·w) / sum(w·w),
+//     which the rounding of single values leaves at 1 within its noise over thousands of values. |s − 1|: 3.8e-9 to
+//     3.3e-5 as it should be; RMSNorm over n − 1 5.2e-4 to 1.0e-2, LayerNorm's variance over n − 1 5.4e-4 to 7.4e-3.
+//     The line SCALE_LINE: n − 1 goes past it up to a dim of 5000.
 //   - the logits of the prompt's last token (on the CPU in every run, on the GPU's keys and values in the GPU's) by
-//     what sampling sees: the KL divergence of their softmax from NumPy's, no more than KL_LINE nats, and the most
-//     likely token NumPy's, or one NumPy gives at least half the probability of its most likely (a near tie: T147's
-//     stories15M at 149 tokens). Printed beside them: the largest difference of the logits of NumPy's ten most likely
-//     tokens over NumPy's largest |logit| (the old measure took all of them: GPT-2's went past on a token some 50
-//     logits below the top).
-// The numbers (CI's, TODO.md's T187): not yet measured; the lines below are provisional.
-const SCALE_LINE = 3e-4, KL_LINE = 1e-2, TIE = Math.LN2;
+//     what sampling sees: the KL divergence of their softmax from NumPy's, and the most likely token NumPy's, or one
+//     NumPy gives at least half the probability of its most likely (a near tie: T147's stories15M at 149 tokens). The
+//     CPU's own 7-bit last token is most of it (the CPU alone: 1.3e-6 to 1.5e-2), and a GPU as it should be is 1.8e-6
+//     to 2.2e-2 (the made-up Qwen2's flat logits the most, the real models 5.2e-4 at most); a wrong bias on Qwen2.5
+//     0.5B 9.3 to 11.7. The line KL_LINE (nats): a check of the whole, which the keys and values' lines make fine.
+//     Printed beside them: the largest difference of the logits of NumPy's ten most likely tokens over NumPy's largest
+//     |logit| (the old measure took all of them: GPT-2's went past on a token some 50 logits below the top).
+const K_PACKED = 2, SCALE_LINE = 1e-4, KL_LINE = 0.05, TIE = Math.LN2;
 
 // ---- Node: the plans and NumPy's answers
 const { pyodide: py } = await pyodideWithEngine();
@@ -630,19 +638,18 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const kind = /DP4A/.test(gpu.form ?? "") ? "packed" : /f16/.test(gpu.form ?? "") ? "f16" : "float32";
-    // T187: the packed shaders against Q8, their own arithmetic (their distance from NumPy's is Q8's, 19 to 60 E16,
-    // under which a wrong bias or norm hid), the others against NumPy's
-    const [yardstick, name] = kind === "packed" ? [eight, "Q8"] : [exact, "NumPy's"];
-    const shaderLine = kind === "float32" ? GPU_LINE : HALF_LINE;
-    const line = Math.max(shaderLine, K[kind] * e16);
-    const gpuKv = kv(gpu, yardstick), againKv = gpu.again ? kv(gpu.again, yardstick) : NaN, gpuFirst = firstKv(gpu, yardstick);
+    // T187: the packed shaders' first layer and scale against Q8, their own arithmetic, and all their layers against
+    // NumPy's by Q8's distance from it (see the lines); the others against NumPy's
+    const packed = kind === "packed", [firstStick, name] = packed ? [eight, "Q8"] : [exact, "NumPy's"];
+    const shaderLine = kind === "f16" ? HALF_LINE : GPU_LINE;
+    const line = packed ? K_PACKED * q8 : Math.max(shaderLine, K[kind] * e16);
+    const gpuKv = kv(gpu), againKv = gpu.again ? kv(gpu.again) : NaN, gpuFirst = firstKv(gpu, firstStick);
     gpu.line = line;
-    gpu.yardstick = yardstick;
     if (!(gpuKv <= line) || !(againKv <= line)) {
-      failures.push(`the keys and values of the GPU are ${gpuKv.toExponential(2)} and ${againKv.toExponential(2)} from ${name} (line ${line.toExponential(2)})`);
+      failures.push(`the keys and values of the GPU are ${gpuKv.toExponential(2)} and ${againKv.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
     }
     if (!(gpuFirst <= shaderLine)) failures.push(`the first layer's keys and values are ${gpuFirst.toExponential(2)} from ${name} (line ${shaderLine.toExponential(2)})`);
-    const gpuScale = scale(gpu, yardstick), againScale = gpu.again ? scale(gpu.again, yardstick) : NaN;
+    const gpuScale = scale(gpu, firstStick), againScale = gpu.again ? scale(gpu.again, firstStick) : NaN;
     if (!(Math.abs(gpuScale) <= SCALE_LINE) || !(Math.abs(againScale) <= SCALE_LINE)) {
       failures.push(`the first layer's keys and values are scaled by 1 + ${gpuScale.toExponential(2)} and 1 + ${againScale.toExponential(2)} of ${name} (line ${SCALE_LINE})`);
     }
@@ -651,8 +658,8 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       failures.push(`the logits on the GPU's keys and values are KL ${gpuLogits.kl.toExponential(2)} and ${againLogits.kl.toExponential(2)} from NumPy's (line ${KL_LINE})`);
     }
     if (!near(gpuLogits.token) || !near(againLogits.token)) failures.push(`another most likely token (${gpuLogits.token}, ${againLogits.token}) than NumPy's ${top}, and not a near tie`);
-    console.log(`  ${gpu.form ?? "no form"}, ${gpu.attention ?? "no attention"}: keys and values ${gpuKv.toExponential(2)} from ${name} (all at once ${againKv.toExponential(2)}, ` +
-      `the first layer ${gpuFirst.toExponential(2)}, the CPU's ${firstKv(cpu).toExponential(2)}; ${(gpuKv / e16).toFixed(1)} E16; from NumPy's ${kv(gpu).toExponential(2)}, ${(kv(gpu) / q8).toFixed(2)} Q8), ` +
+    console.log(`  ${gpu.form ?? "no form"}, ${gpu.attention ?? "no attention"}: keys and values ${gpuKv.toExponential(2)} (all at once ${againKv.toExponential(2)}, ` +
+      `the first layer ${gpuFirst.toExponential(2)} from ${name}, the CPU's ${firstKv(cpu).toExponential(2)}; ${(gpuKv / e16).toFixed(1)} E16, ${(gpuKv / q8).toFixed(2)} Q8), ` +
       `the first layer's scale ${gpuScale.toExponential(1)} (${againScale.toExponential(1)}), logits KL ${gpuLogits.kl.toExponential(2)} (${againLogits.kl.toExponential(2)}), ` +
       `the prompt ${(gpu.promptMs / n).toFixed(2)} ms a token (${gpu.note})` +
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
@@ -697,8 +704,7 @@ function layerTables(c, cpu, runs, { e16, q8, cpuLogits, logits, scale }) {
   console.log(`- CPU: forward.js on the CPU: ${e(all(cpu))}, ${(all(cpu) / e16).toFixed(1)} E16, ${(all(cpu) / q8).toFixed(2)} Q8, ` +
     `the first layer's scale ${e(scale(cpu))}, ${said(cpuLogits)}`);
   runs.forEach((run, i) => {
-    const against = (r) => Math.max(...byLayer(r, run.yardstick));
-    const worst = Math.max(against(run), run.again ? against(run.again) : 0);
+    const worst = Math.max(all(run), run.again ? all(run.again) : 0);
     console.log(`- ${letter(i)}: ${run.form ?? "no form"}, ${run.attention ?? "no attention"}: ${e(all(run))} ` +
       `(all at once ${run.again ? e(all(run.again)) : "-"}), line ${e(run.line)}, ${(worst / run.line).toFixed(2)} of the line, ` +
       `${(all(run) / e16).toFixed(1)} E16, ${(all(run) / q8).toFixed(2)} Q8, ${e(Math.max(...byLayer(run, half)))} from NumPy's with its cache in float16, ` +
