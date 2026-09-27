@@ -4,7 +4,8 @@
 // every position with several random numbers before anything is timed. Compiles each form's kernel.ts with
 // AssemblyScript into .tmp/sample-bench/ (needs `npm ci` and `make models kernels`).
 //
-//   node tests/sample-bench.mjs [model id ...] [--rounds 5] [--tokens 128] [--commits <sha>,<sha>]
+//   node tests/sample-bench.mjs [model id ...] [--rounds 5] [--tokens 128] [--commits <sha>,<sha>] [--stages]
+//   node tests/sample-bench.mjs --edges [--commits <sha>,<sha>]
 //
 // The logits: generate() as tests/overhead.mjs runs it, one position after another from BOS with the model's
 // temperature, top-p and repetition penalty (penalized, as sample() gets them), the tokens drawn by the page's kernel.
@@ -65,6 +66,81 @@ for (const [name, read] of Object.entries(forms)) {
   kernels[name] = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(dir + "plain.wasm")), { env: { memory } }).exports;
 }
 const names = Object.keys(kernels).filter((n) => n !== "stages");
+
+// --edges (T189's review): every form must draw main's token on logits made for the edges too, not only on a model's
+// (whose vocabularies are multiples of 16 and whose best token is seldom in the tails): each length from 1 to 80 and
+// some near 1000 (the tails of the fours, the eights and the sixteens), the best one in each place, ties at the best,
+// ties exactly at the floor and a float32 step either side, NaN, ±Infinity, -0, -3.4e38, two far above the rest
+// (where exp() is cut at 88), at temperatures, top-p and random numbers at their ends. Then it stops
+if (args.includes("--edges")) {
+  const f32 = Math.fround, MAX = 3.4028234663852886e38, V = 2048;
+  const logits = 65536, probs = logits + 4 * V + 64, index = probs + 4 * V + 64;
+  if (index + 4 * V > memory.buffer.byteLength) memory.grow(1);
+  let seed = 1;
+  const rand = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
+  const normal = () => Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+  const step = (x, up) => {  // the next float32 up or down
+    if (x === 0) return up ? 1.4e-45 : -1.4e-45;
+    const a = new Float32Array([x]), b = new Int32Array(a.buffer);
+    b[0] += (x > 0) === up ? 1 : -1;
+    return a[0];
+  };
+  const places = (n) => [...new Set([0, 1, 2, 3, 4, 5, 7, 8, 11, 12, 15, 16, 19, 20, 23, 35, 36, n - 16, n - 13, n - 9, n - 8, n - 5, n - 4, n - 3, n - 2, n - 1])].filter((k) => k >= 0 && k < n);
+  const sampled = (n) => Float32Array.from({ length: n }, () => normal() * 3);
+  function* patterns(n, t) {
+    for (const spread of [0.5, 4, 30]) yield [`spread ${spread}`, Float32Array.from({ length: n }, () => normal() * spread)];
+    for (const k of n <= 40 ? [...Array(n).keys()] : places(n)) {
+      const x = Float32Array.from({ length: n }, () => normal() * 2 - 10);
+      x[k] = 5;
+      yield [`the best at ${k}`, x];
+      const y = new Float32Array(n);
+      for (const gap of [1, 4, 16]) {
+        if (k + gap >= n) continue;
+        y.fill(0); y[k] = 300; y[k + gap] = 299;
+        yield [`300 at ${k}, 299 at ${k + gap}`, y.slice()];
+      }
+      for (const [name, value] of [["NaN", NaN], ["Infinity", Infinity], ["-Infinity", -Infinity], ["-3.4e38", -MAX]]) {
+        const z = sampled(n);
+        z[k] = value;
+        yield [`${name} at ${k}`, z];
+      }
+    }
+    const ties = sampled(n), top = Math.max(...ties) + 1;
+    for (let k = n % 5; k < n; k += 5) ties[k] = top;
+    yield ["ties at the best", ties];
+    const at = sampled(n);
+    const best = Math.max(...at), floor = f32(best - f32(f32(t) * f32(16.118095)));
+    for (let k = 0; k < n; k++) if (at[k] !== best) at[k] = [floor, step(floor, false), step(floor, true), at[k]][k % 4];
+    yield ["ties at the floor", at];
+    yield ["zeros and -0", Float32Array.from({ length: n }, (_, k) => (k % 3 ? -0 : 0))];
+    yield ["all -0", new Float32Array(n).fill(-0)];
+    yield ["all equal", new Float32Array(n).fill(1.25)];
+    yield ["all -Infinity", new Float32Array(n).fill(-Infinity)];
+  }
+  const F = new Float32Array(memory.buffer, logits, V);
+  let draws = 0, cases = 0;
+  for (const n of [...Array(80).keys()].map((k) => k + 1).concat([997, 1000, 1001, 1003, 1005, 1007, 1011, 1015])) {
+    for (const t of [0.05, 0.7, 1, 1.9]) {
+      for (const [name, x] of patterns(n, t)) {
+        F.fill(0);
+        F.set(x);
+        cases++;
+        for (const topp of [0, 1e-3, 0.5, 0.9, 0.9999, 1]) {
+          for (const r of [0, 1e-12, 0.25, 0.5, 0.6, 0.6180339887, 0.73, 0.999999, 1 - 2 ** -53]) {
+            const wanted = kernels.main.sample(logits, n, t, topp, r, probs, index);
+            for (const form of names) {
+              const token = kernels[form].sample(logits, n, t, topp, r, probs, index);
+              if (token !== wanted) throw new Error(`--edges: ${form} drew ${token} where main drew ${wanted}: ${n} logits, ${name}, temperature ${t}, top-p ${topp}, random ${r}`);
+            }
+            draws++;
+          }
+        }
+      }
+    }
+  }
+  console.log(`--edges: every form (${names.join(", ")}) drew main's token in ${draws} draws on ${cases} made logits`);
+  process.exit(0);
+}
 
 const { pyodide: py } = await pyodideWithEngine();
 const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
