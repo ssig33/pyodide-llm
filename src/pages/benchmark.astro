@@ -55,7 +55,8 @@ const BENCH_MODEL = "llm-jp-3-150m";
       <section data-section="model">
         <h2>Model</h2>
         <p class="about">The chosen model, with and without the SIMD kernels: the table of "Measure this browser" on the
-          model page.</p>
+          model page. Without the kernels the weights take four times the memory; a browser that does not say how much
+          memory the device has (Safari, Firefox) skips that round, and its row says so.</p>
       </section>
       <section data-section="gpu">
         <h2>GPU</h2>
@@ -152,7 +153,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
 </style>
 
 <script>
-  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, layerCheckNumbers, layerStepsTable, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
+  import { FULL_ROUNDS, PATH_PROMPTS, PATH_WRITES, ROUNDS, benchMarkdown, roundsHere, roundsTable, layerCheckNumbers, layerStepsTable, pathTable, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, generateTable, gpuSummary, layerTable, lineSummary,
     matVecTable, noRatios, reportTooLong, shortReport, storageSummary, tableCell, reportUrl, threadCounts, threadsKey, threadsOf, timesFaster, tokenTable } from "../bench.js";
   import { MODELS } from "../models.js";
   import { forgetMark, holdMemory, memoryLimit, memoryResult, memorySummary, readMark } from "../page-memory.js";
@@ -390,9 +391,11 @@ const BENCH_MODEL = "llm-jp-3-150m";
   async function modelSection(): Promise<Result> {
     const entry = model();
     const w = worker("worker.js");
-    const rounds = ($("full") as HTMLInputElement).checked ? FULL_ROUNDS : ROUNDS;
-    // T177: the load, the page's path (the worker's words as the stage), then each round (loaded again and run: the
-    // worker says ready at the end of each round's load)
+    // T214: where the browser does not say its memory, the round without the kernels is a row that says why
+    const asked = roundsHere(($("full") as HTMLInputElement).checked ? FULL_ROUNDS : ROUNDS, (navigator as any).deviceMemory);
+    // T177: the load, the page's path (the worker's words as the stage), then each round that runs (loaded again and
+    // run: the worker says ready at the end of each round's load; a skipped round loads nothing)
+    const rounds = asked.filter((round) => round.skip === undefined);
     const stages = 2 + rounds.length;
     let readies = 0, pathing = false;
     const prompt = entry.prompt || "Once upon a time";
@@ -441,12 +444,11 @@ const BENCH_MODEL = "llm-jp-3-150m";
       staged("model", { stage: "the page's path", at: 2, of: stages });
       const paths = await request({ type: "paths", load: 1, prompt, counts: PATH_PROMPTS, sampled: PATH_WRITES });
       pathing = false;
-      const answer = await request({ type: "bench", model: entry, load: 1, rounds, prompt, steps: 64 });
+      const answer = await request({ type: "bench", model: entry, load: 1, rounds: asked, prompt, steps: 64 });
       if (answer.error) return { status: "error", markdown: answer.error };
       const table = pathTable(paths, entry.name);
       measured = { name: entry.name, rows: answer.rows, pyodide: answer.pyodide, paths: table };
-      const lines = ["| what ran | tok/s | ready | backend |", "|---|---|---|---|",
-        ...answer.rows.map((row: any) => `| ${row.name} | ${fixed(row.speed)} | ${fixed(row.seconds)} s | ${row.backend} |`)];
+      const lines = roundsTable(answer.rows);
       return { status: "ok", data: { rows: answer.rows, paths },
                markdown: `${entry.name} · Pyodide ${answer.pyodide}\n\n${lines.join("\n")}\n\n${table}` };
     } finally {

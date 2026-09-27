@@ -2,9 +2,9 @@
 //
 //   node tests/bench.mjs
 import assert from "node:assert/strict";
-import { FULL_ROUNDS, PASTE, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, gpuSummary, lineSummary,
+import { FULL_ROUNDS, MEMORY_UNSAID, PASTE, QUESTIONS, REPORT_LIMIT, ROUNDS, TOO_LONG, benchMarkdown, cpuBaseline, cpuSummary, cpuTable, deviceSummary, environmentOf, gpuSummary, lineSummary,
          loginUrl, parseReport, reportBody, shortReport, storageSummary,
-         generateTable, gpuSkipped, layerCheckNumbers, layerStepsTable, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, tableCell, threadCounts, threadsKey, threadsLine, times, timesFaster, tokenTable } from "../src/bench.js";
+         generateTable, gpuSkipped, layerCheckNumbers, layerStepsTable, layerTable, matVecTable, PATH_PROMPTS, PATH_WRITES, pathTable, reportTooLong, reportUrl, reportsTable, roundsHere, roundsTable, tableCell, threadCounts, threadsKey, threadsLine, times, timesFaster, tokenTable } from "../src/bench.js";
 import fs from "node:fs";
 
 const rows = [
@@ -37,6 +37,37 @@ assert.ok(broken.includes("| everything | ? |"), broken);
 assert.equal(ROUNDS.length, 2, "?bench=1 runs with and without the kernels");
 assert.equal(FULL_ROUNDS.length, 6, "?bench=full walks the steps of T52, and T110's");
 assert.deepEqual(FULL_ROUNDS.at(-1).without, [], "the last step is everything switched on");
+// T214: a browser that does not say its memory (Safari, Firefox: no navigator.deviceMemory) skips the round without the
+// kernels (NumPy's float32 weights took an iPhone's tab down, T205's review), and its row says why; one that says runs all
+const quiet = roundsHere(ROUNDS, undefined);
+assert.deepEqual(quiet.map((round) => round.name), ROUNDS.map((round) => round.name), "every round keeps its row");
+assert.deepEqual(quiet.map((round) => round.skip), [undefined, MEMORY_UNSAID], "only the round without the kernels is skipped");
+assert.equal(ROUNDS[1].skip, undefined, "ROUNDS itself is left as it is");
+for (const memory of [8, 4, 0.5]) assert.deepEqual(roundsHere(ROUNDS, memory), ROUNDS, `a browser that says ${memory} GB runs every round`);
+assert.deepEqual(roundsHere(FULL_ROUNDS, undefined).filter((round) => round.skip).map((round) => round.name), ["NumPy only"], "?bench=full: NumPy only");
+assert.ok(/does not say how much memory/.test(MEMORY_UNSAID) && /float32/.test(MEMORY_UNSAID), MEMORY_UNSAID);
+// the worker's row for it (public/worker.js: nothing loaded, the reason carried), in the report and back out of it
+const iphoneRows = [rows[0], { name: "without the kernels", without: ["kernels"], skip: MEMORY_UNSAID }];
+const iphone = benchMarkdown(iphoneRows, environmentOf({ hardwareConcurrency: 6, userAgent: "Mozilla/5.0 (iPhone)" }, { model: "llm-jp-3 150M" }));
+const skippedLine = iphone.split("\n").find((line) => line.startsWith("| without the kernels |"));
+assert.equal(skippedLine, `| without the kernels | skipped |  | ${MEMORY_UNSAID} |`, iphone);
+assert.ok(!iphone.includes("NaN") && !iphone.includes("undefined") && !skippedLine.includes("?"), iphone);
+assert.deepEqual(roundsTable(iphoneRows), iphone.split("\n").filter((line) => line.startsWith("|")), "the model section writes the same table");
+const iphoneReport = parseReport(reportBody(iphone));
+assert.deepEqual(iphoneReport.rows.map((row) => row.name), ["everything", "without the kernels"]);
+assert.equal(iphoneReport.rows[1].skip, MEMORY_UNSAID, "parseReport() reads why");
+assert.ok(Number.isNaN(iphoneReport.rows[1].speed) && iphoneReport.rows[0].skip === undefined);
+assert.equal(reportsTable([{ number: 11, url: "u", body: reportBody(iphone) }]).split("\n")[2],
+  "| ? | ? | ? | llm-jp-3 150M | 6 | 334.6 | skipped | SIMD kernels, int8, relaxed SIMD | [#11](u) |");
+// a reason with a | in it stays one cell
+assert.equal(parseReport(benchMarkdown([{ name: "x", skip: "a | b" }], environmentOf({}, {}))).rows[0].skip, "a | b");
+// both pages ask for the rounds through roundsHere() with the browser's own deviceMemory, and the worker writes the row
+for (const page of ["index.astro", "benchmark.astro"]) {
+  assert.ok(/roundsHere\(.*\(navigator as any\)\.deviceMemory\)/.test(fs.readFileSync(new URL(`../src/pages/${page}`, import.meta.url), "utf8")),
+    `${page} asks for the rounds through roundsHere()`);
+}
+assert.ok(/if \(round\.skip !== undefined\) \{\s*rows\.push\(\{ name: round\.name, without: round\.without, skip: round\.skip \}\);\s*continue;/
+  .test(fs.readFileSync(new URL("../public/worker.js", import.meta.url), "utf8")), "the worker writes a skipped round's row and loads nothing");
 // T91: the issue the page opens, and the table the issues make
 const url = new URL(reportUrl(markdown, environment));
 assert.equal(url.searchParams.get("template"), "benchmark.md");

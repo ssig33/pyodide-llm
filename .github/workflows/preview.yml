@@ -67,6 +67,13 @@ jobs:
           QUERY: ${{ inputs.query }}
         run: node tests/bench-check.mjs --dist chromium --model "$MODEL" --size 64 --query "$QUERY" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # T214: the model section where the browser does not say its memory (Safari, Firefox): the round without the
+      # kernels is a row that says why, and never loads
+      - name: The benchmark's model section without deviceMemory
+        if: always()
+        shell: bash
+        run: node tests/bench-check.mjs --dist chromium --model stories260K --size 64 --run model --unsaid | tee -a "$GITHUB_STEP_SUMMARY"
+
       # T173: the page-memory section, on a limit the runner holds well below its own, and a tab ended in the middle of
       # it played by loading the page again (never Run all: it may end a phone's tab)
       - name: The benchmark's page memory

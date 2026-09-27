@@ -1530,6 +1530,12 @@ self.onmessage = async ({ data }) => {
       const rows = [];
       try {
         for (const round of data.rounds) {
+          // T214: a round the page skips (src/bench.js's roundsHere(): NumPy's float32 weights where the browser does
+          // not say its memory) is a row that says why, with nothing loaded
+          if (round.skip !== undefined) {
+            rows.push({ name: round.name, without: round.without, skip: round.skip });
+            continue;
+          }
           // every round is a load of its own, and it cancels whatever went before, exactly like a change of model
           loading?.abort();
           loading = new AbortController();

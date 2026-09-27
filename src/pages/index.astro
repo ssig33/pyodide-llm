@@ -303,7 +303,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
 
 <script>
   import { GROUPS, MODELS, filled, memoryFailure, memoryWarning, weightsFor } from "../models.js";
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, environmentOf, reportUrl, threadsKey as sharedThreadsKey } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, roundsHere, environmentOf, reportUrl, threadsKey as sharedThreadsKey } from "../bench.js";
 
   declare const __BUILD__: string;
   const $ = (id: string) => document.getElementById(id)!;
@@ -647,7 +647,8 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     const body = table.createTBody();
     for (const row of benchRows) {
       const line = body.insertRow();
-      for (const text of [row.name, Number.isFinite(row.speed) ? row.speed.toFixed(1) : "?", row.backend ?? ""]) {
+      const skipped = row.skip !== undefined;  // T214: its speed is "skipped", and the last column says why
+      for (const text of [row.name, skipped ? "skipped" : Number.isFinite(row.speed) ? row.speed.toFixed(1) : "?", skipped ? row.skip : row.backend ?? ""]) {
         line.insertCell().textContent = text;
       }
     }
@@ -812,7 +813,8 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
         statusText.textContent = `${model.name} · benchmarking...`;
         benchAsked = benchmarking = true;
         worker.postMessage({ type: "bench", model: weighed(model), load: loads,
-          rounds: benchmark === "full" ? FULL_ROUNDS : ROUNDS, prompt: model.prompt || "Once upon a time", steps: 64 });
+          // T214: where the browser does not say its memory, the round without the kernels is a row that says why
+          rounds: roundsHere(benchmark === "full" ? FULL_ROUNDS : ROUNDS, (navigator as any).deviceMemory), prompt: model.prompt || "Once upon a time", steps: 64 });
       }
       longest = data.seq_len;
       showSettings();

@@ -7,6 +7,7 @@
 //     engines: chromium firefox webkit chrome msedge (default: the first three)
 //     --dist serves dist/ (npm run build) itself, as tests/screenshots.mjs does: a branch before it goes out
 //     --run the page's ?run= (default all; "gpu" alone: the GPU section takes minutes on SwiftShader, T146)
+//     --unsaid hides navigator.deviceMemory from the page (T214: the model section skips its NumPy round)
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +27,9 @@ const option = (name, value) => {
 const model = option("--model", "tiny-lm"), size = option("--size", "256"), sections = option("--run", "all");
 // T184: more of the page's query, e.g. --query gpuTest=on (CI's fallback adapter taken as a GPU in the model section)
 const query = option("--query", "");
+// T214: --unsaid hides navigator.deviceMemory from the page (as Safari and Firefox do not say it): the model section's
+// round without the kernels must be a row that says why, and never load
+const unsaid = args.includes("--unsaid") ? args.splice(args.indexOf("--unsaid"), 1) : null;
 const dist = args.includes("--dist") ? args.splice(args.indexOf("--dist"), 1) : null;
 let [site = "https://takano32.github.io/pyodide-llm/", ...engines] = dist ? [undefined, ...args] : args;
 let server;
@@ -96,6 +100,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   started++;
   const page = context.pages()[0] ?? await context.newPage();
   await page.addInitScript(watchStages);
+  if (unsaid) await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "deviceMemory", { get: () => undefined, configurable: true }));
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error.message)));
   try {
@@ -128,6 +133,22 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
       }
     }
     const stages = await page.evaluate(() => window.__stages);
+    // T214: where the page is not told the memory, the round without the kernels is skipped in words and never loads
+    if (unsaid && results.model?.status === "ok") {
+      const rows = results.model.data?.rows ?? [];
+      const plain = rows.find((row) => row.name === "without the kernels");
+      const loadedIt = (stages.model ?? []).some((text) => text.includes("round: without the kernels"));
+      console.log(`model without deviceMemory: ${plain?.skip !== undefined ? `skipped (${plain.skip})` : "ran"}` +
+        `${loadedIt ? ", and its load was staged" : ""}; the rounds' rows: ${rows.map((row) => row.name).join(", ")}`);
+      if (!/does not say how much memory/.test(plain?.skip ?? "") || plain.speed !== undefined || loadedIt ||
+          !results.model.markdown.includes("| without the kernels | skipped |") || !(rows.find((row) => row.name === "everything")?.speed > 0)) {
+        console.log("model without deviceMemory: FAILED, the round without the kernels was not skipped in words");
+        failed = true;
+      }
+    } else if (unsaid) {
+      console.log(`model without deviceMemory: FAILED, the section is ${results.model?.status ?? "missing"}`);
+      failed = true;
+    }
     for (const [name, result] of Object.entries(results)) {
       const shown = stages[name] ?? [];
       console.log(`${name} stages on the page: ${shown.join(" → ") || "none"}`);

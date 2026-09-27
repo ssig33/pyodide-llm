@@ -103,10 +103,21 @@ for (const [width, viewport] of Object.entries(widths)) {
   // 4. the benchmark's bubble (T76)
   await context.close();
   ({ context, page } = await fresh(viewport));
+  // T214: at the phone's width the browser does not say its memory, as an iPhone's Safari does not: the round without
+  // the kernels must be a row that says why (and nothing measured), where the desktop's runs both
+  const unsaid = width === "phone";
+  if (unsaid) await page.addInitScript(() => Object.defineProperty(Navigator.prototype, "deviceMemory", { get: () => undefined, configurable: true }));
   await page.goto(`${site}?model=stories260K&bench=1`);
   await acrossReload(() => page.waitForFunction(() => window.__bench || document.querySelector(".error"), null, { timeout: 600000 }));
   await page.waitForTimeout(300);
   await shot(page, "bench", width);
+  const benched = await page.evaluate(() => window.__bench?.rows ?? []);
+  console.log(`${width}: ?bench=1${unsaid ? " without deviceMemory" : ""}: ${benched.map((row) => `${row.name} ${row.skip !== undefined ? `skipped (${row.skip})` : `${row.speed?.toFixed(1)} tok/s`}`).join(", ")}`);
+  const [all, plain] = benched;
+  if (!(all?.speed > 0) || all.skip !== undefined || !plain || (plain.skip !== undefined) !== unsaid ||
+      (unsaid ? !/does not say how much memory/.test(plain.skip) || plain.speed !== undefined : !(plain.speed > 0))) {
+    throw new Error(`${width}: ?bench=1 did not ${unsaid ? "skip the round without the kernels, in words" : "run both rounds"}`);
+  }
 
   // 5. a repository the converter refuses, in words (T88)
   await context.close();

@@ -17,6 +17,21 @@ export const FULL_ROUNDS = [
   { name: "float16 keys and values", without: [] },
 ];
 
+/** T214: why a round that widens the weights is skipped where the browser does not say how much memory the device has
+ * (navigator.deviceMemory: Safari and Firefox never say). Without the kernels NumPy widens every weight to float32
+ * (four bytes a weight, where the kernels keep one): with llm-jp-3 150M the worker's Pyodide grew to 958 MB and the
+ * renderer by 0.81 GB in CI's Chromium, and an iPhone's tab went down in that round (T205's review). A page that is
+ * not told the memory cannot tell whether it fits (the owner, 2026-09-27: such a device skips the NumPy round). */
+export const MEMORY_UNSAID = "this browser does not say how much memory the device has, and without the kernels " +
+  "NumPy widens every weight to float32 (four bytes a weight: about 1.2 GB in all with llm-jp-3 150M), which took an iPhone's tab down";
+
+/** The rounds as this device runs them (T214): a round without the kernels carries skip (the words of its row) where
+ * deviceMemory is not a number. The page decides (both ?bench= and /benchmark/), and the worker writes the row. */
+export function roundsHere(rounds, deviceMemory) {
+  const unsaid = typeof deviceMemory !== "number";
+  return rounds.map((round) => (unsaid && round.without.includes("kernels") ? { ...round, skip: MEMORY_UNSAID } : round));
+}
+
 const number = (value, digits = 1) => (typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "?");
 
 /** The environment the page can see. Whatever a browser does not tell is left out, never guessed. */
@@ -46,11 +61,18 @@ export function benchMarkdown(rows, environment) {
     environment.site,
   ].filter(Boolean).join(" · ");
   // no rounds, no table: a /benchmark/ report without its model section (T134) is no row of reportsTable()
-  const table = rows.length ? ["| what ran | tok/s | ready | backend |", "|---|---|---|---|", ...rows.map((row) => {
+  const table = rows.length ? [...roundsTable(rows), ""] : [];
+  return [`### Pyodide LLM benchmark`, "", machine, "", ...table, `<sub>${environment.userAgent}</sub>`].join("\n");
+}
+
+/** The rounds' table (its lines): a row per round; a skipped round (T214) says "skipped" for its speed, and why in
+ * the last column. benchMarkdown() and /benchmark/'s model section both write it. */
+export function roundsTable(rows) {
+  return ["| what ran | tok/s | ready | backend |", "|---|---|---|---|", ...rows.map((row) => {
+    if (row.skip !== undefined) return `| ${row.name} | skipped |  | ${tableCell(row.skip)} |`;
     const ready = row.seconds === undefined ? "" : `${number(row.seconds)} s`;
     return `| ${row.name} | ${number(row.speed)} | ${ready} | ${row.backend ?? ""} |`;
-  }), ""] : [];
-  return [`### Pyodide LLM benchmark`, "", machine, "", ...table, `<sub>${environment.userAgent}</sub>`].join("\n");
+  })];
 }
 
 // T91: where a visitor sends the result, and the one table the results make.
@@ -107,7 +129,8 @@ export function shortReport(head, lines) {
   return [head, "#### Summary", lines.map((line) => `- ${line}`).join("\n"), PASTE].filter(Boolean).join("\n\n");
 }
 
-const cells = (line) => line.split("|").slice(1, -1).map((cell) => cell.trim());
+// a | that tableCell() escaped stays in its cell (T214: a skipped round's reason is the words of a cell)
+const cells = (line) => line.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim().replace(/\\\|/g, "|"));
 
 /** What one issue says: the answers, the model, the logical cores, and the rows of its table. undefined when the body
  * has no table of the page's. */
@@ -124,7 +147,8 @@ export function parseReport(body) {
   for (const line of lines.slice(head + 2)) {
     if (!line.startsWith("|")) break;
     const [name, speed, ready, backend] = cells(line);
-    rows.push({ name, speed: Number(speed), ready, backend });
+    // T214: a skipped round has no speed, and its last column is why
+    rows.push(speed === "skipped" ? { name, speed: NaN, ready, backend: "", skip: backend } : { name, speed: Number(speed), ready, backend });
   }
   const machine = lines.find((line) => line.startsWith("**") && line.includes(" · ") && !line.includes("**:")) ?? "";
   return { device: answer("Device"), os: answer("OS"), browser: answer("Browser"),
@@ -142,7 +166,7 @@ export function reportsTable(issues) {
     const row = (name) => report.rows.find((r) => r.name === name);
     const all = row("everything") ?? report.rows.at(-1), plain = row("without the kernels") ?? row("NumPy only");
     out.push(`| ${report.device || "?"} | ${report.os || "?"} | ${report.browser || "?"} | ${report.model || "?"} | ` +
-             `${report.cores || "?"} | ${number(all?.speed)} | ${number(plain?.speed)} | ${all?.backend ?? ""} | [#${id}](${url}) |`);
+             `${report.cores || "?"} | ${number(all?.speed)} | ${plain?.skip !== undefined ? "skipped" : number(plain?.speed)} | ${all?.backend ?? ""} | [#${id}](${url}) |`);
   }
   return out.join("\n");
 }
