@@ -10,10 +10,11 @@
 # T183: real= takes models of src/models.js from Hugging Face (as the page does, at the revisions the list pins:
 # tests/hf_fetch.py), converts them to int8 as the page converts them (tests/perplexity_prepare.py) and checks them too;
 # NumPy's answer is then the native Python's (Pyodide has no room for Qwen3 0.6B in float32, T153). With real= and no
-# models=, only those. The log has, for every model, tables of the keys and values by layer against NumPy's and E16
-# (against NumPy's with a float16 cache), each run's line and ratio, and the seconds of every step. SwiftShader takes a
-# real model slowly (every form, 150 tokens; T147: 10 to 90 s to compile a tiled shader): give forms= there. A branch's
-# tests with --ref, the way the development machine runs them (AGENTS.md: WebGPU's tests run in CI, not there):
+# models=, only those. The log has, for every model, E16 (how far NumPy's answer moves with its cache in float16),
+# tables of the keys and values by layer against NumPy's and against NumPy's with its cache in float16, each run's line
+# and ratio, and the seconds of every step. SwiftShader takes a real model slowly (every form, 150 tokens; T147: 10 to
+# 90 s to compile a tiled shader): give forms= there. A branch's tests with --ref (AGENTS.md: WebGPU's tests run in CI,
+# not on the development machine):
 #
 #   gh workflow run gpu-prompt.yml [-f models="synthetic tiny-lm"] [-f real="hf-qwen3-0.6b"] [-f forms="TF.js"] [--ref <branch>]
 #   node tests/ci.mjs run gpu-prompt.yml real=hf-qwen2.5-0.5b-instruct --ref <branch>
