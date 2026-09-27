@@ -352,19 +352,52 @@ export const placer = (holes) => (offset) => holes.reduce((at, [start, end]) => 
  * step where it is faster), where both fit half of what the device says it has; else the GPU alone where the model can
  * be (eligible: a Llama the GPU's steps take, T152) and it fits; else the CPU (and the prompts on the GPU where the
  * layers alone fit, gpuRoom, as before). deviceMemory: navigator.deviceMemory, 4 where the browser does not say
- * (Safari, Firefox); Chromium says 8 for 8 GB or more: both are then held to 4 GB (the double copy of Qwen2.5 3B, 7.2
- * GB, on an 8 GB phone, T153's risk), and the GPU alone to nothing, as the CPU alone is (a 7B's 9.2 GB runs on the CPU
- * there, T132: the GPU alone takes about as much as the CPU alone, the matrices once either way).
+ * (Safari, Firefox); Chromium says 8 for 8 GB or more: both are then held to BOTH_ON_8 (6 GiB, the owner's choice,
+ * 2026-09-27: up to llm-jp-3.1 1.8B both as before, 3B and larger (Qwen2.5 3B's 7.2 GB, T153's risk on an 8 GB phone)
+ * not), and the GPU alone to nothing, as the CPU alone is (a 7B's 9.2 GB runs on the CPU there, T132: the GPU alone
+ * takes about as much as the CPU alone, the matrices once either way).
  * cpu: the checkpoint and what the forward pass puts after it (footprint); gpuOnly: the checkpoint without the
  * matrices and what the forward pass puts after that (footprint with direct); gpu: gpuBytes. Returns { mode: "both" |
  * "gpu" | "cpu", gpuRoom } */
+export const BOTH_ON_8 = 6 * 2 ** 30;
 export function weightsPlace({ cpu, gpuOnly, gpu, deviceMemory = 4, eligible = false, forced = false }) {
-  const room = (deviceMemory * 2 ** 30) / 2;
+  const room = deviceMemory >= 8 ? BOTH_ON_8 : (deviceMemory * 2 ** 30) / 2;
   if (forced && eligible) return { mode: "gpu" };
   if (cpu + gpu <= room) return { mode: "both", gpuRoom: room - cpu };
   if (eligible && (deviceMemory >= 8 || gpuOnly + gpu <= room)) return { mode: "gpu" };
   return { mode: "cpu", gpuRoom: room - cpu };
 }
+
+/** T156: the multiply-adds of a Llama's layers a token of a prompt makes (every weight of its seven matrices once) */
+export function layerWeightsOf(header, { head_dim = 0 } = {}) {
+  const [dim, hidden, layers, heads, kvHeads] = header;
+  const headSize = head_dim || dim / heads, qDim = heads * headSize, kvDim = kvHeads * headSize;
+  return layers * (2 * qDim * dim + 2 * kvDim * dim + 3 * hidden * dim);
+}
+// T156 (the owner, 2026-09-27: the prompt counts too): the tokens of a prompt against the tokens written, where the
+// page has not kept how they are used here yet: as many (a chat's question with its template and an answer of about
+// the same length; no measurement of the site's visitors says otherwise)
+export const USAGE_UNKNOWN = { prompt: 1, written: 1 };
+/** T156: whether the CPU would be faster than the GPU for a model on the GPU alone (then it is loaded again on the
+ * CPU), by the time of what the page does: usage.prompt tokens of prompts and usage.written tokens written (the page's
+ * recent use, decayed, or USAGE_UNKNOWN). The CPU's side is /benchmark/'s CPU section (cpu: { GBps, promptGMACs }): a
+ * token written reads the checkpoint once (size bytes at GBps, T157), a prompt's token makes layerWeights multiply-adds
+ * at promptGMACs (its model is two layers as wide as Llama 3.2 1B; a narrower model runs slower than that says,
+ * T157's review: 1.09 to 1.21 on llm-jp-3 150M's shape). The GPU's side is its own (gpu: { stepMs, promptMs }: a step
+ * of a run of GPU_TOKENS, a token of a block of GPU_BLOCK, as gpu.js timed them as it started). A side not known on
+ * either leaves its part out; nothing known of the CPU: the GPU stays. Returns { cpuFaster, cpu, gpu } (ms of that use) */
+export function aloneVerdict({ size, layerWeights, cpu = {}, gpu = {}, usage = USAGE_UNKNOWN }) {
+  const parts = [];
+  if (cpu.GBps > 0 && gpu.stepMs > 0) parts.push([usage.written, size / (cpu.GBps * 1e6), gpu.stepMs]);
+  if (cpu.promptGMACs > 0 && gpu.promptMs > 0) parts.push([usage.prompt, layerWeights / (cpu.promptGMACs * 1e6), gpu.promptMs]);
+  const onCpu = parts.reduce((sum, [n, ms]) => sum + n * ms, 0), onGpu = parts.reduce((sum, [n, , ms]) => sum + n * ms, 0);
+  return { cpuFaster: parts.length > 0 && onCpu < BETTER * onGpu, cpu: onCpu, gpu: onGpu };
+}
+/** T156: whether a verdict the page kept (alone: { key, cpu }, the device's key and /benchmark/'s CPU then) still holds:
+ * the same device, browser and shaders (the key, T148's), and the same CPU reading of /benchmark/ (a new run of its
+ * CPU section, or none now, asks again) */
+export const aloneHolds = (alone, key, cpu) => Boolean(alone && key && alone.key === key && cpu &&
+  alone.cpu?.GBps === cpu.GBps && alone.cpu?.promptGMACs === cpu.promptGMACs);
 
 /** T156: why a model cannot go on the GPU alone, from its header, dtype and form before its bytes come, and the
  * adapter the worker asked for ({ fallback, limits }); null where it can. A Llama whose steps the GPU takes (T152: no
@@ -1250,9 +1283,16 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         // step (the checkpoint read once at the CPU section's fastest, T157's estimate) must not be faster by more
         // than BETTER's margin (the owner's B: the CPU's side estimated, not measured, for a model that does not fit twice)
         if (direct && !data.tokens) return stopGpu(data.tokensWhy ?? tokensReason ?? "the GPU did not take the steps");
-        const cpuMs = direct?.cpuGBps > 0 ? direct.size / (direct.cpuGBps * 1e6) : NaN;
-        if (cpuMs < BETTER * data.tokens?.ms) {
-          return stopGpu(`a step ${data.tokens.ms.toFixed(1)} ms on the GPU, and ${cpuMs.toFixed(1)} ms on the CPU as /benchmark/ measured it (${direct.cpuGBps.toFixed(1)} GB/s)`);
+        // (the owner, 2026-09-27: the prompts as well, which the GPU runs about five times as fast, weighed by use)
+        if (direct) {
+          const block = data.blocks.find((b) => b.count === GPU_BLOCK);
+          const verdict = aloneVerdict({ size: direct.size, layerWeights: direct.layerWeights, cpu: direct.cpu, usage: direct.usage,
+            gpu: { stepMs: data.tokens.ms, promptMs: block ? block.ms / block.count : undefined } });
+          if (verdict.cpuFaster) {
+            direct.verdict = { key: data.key, cpu: direct.cpu };  // the page keeps it: the next load goes on the CPU at once
+            return stopGpu(`the CPU as /benchmark/ measured it (${direct.cpu.GBps?.toFixed(1)} GB/s): ${verdict.cpu.toFixed(0)} ms ` +
+              `against the GPU's ${verdict.gpu.toFixed(0)} ms for ${direct.usage.prompt.toFixed(0)} tokens of prompts and ${direct.usage.written.toFixed(0)} written`);
+          }
         }
         settleGpu?.(always ? PROMPTS_GPU : PROMPTS_UNTIMED);
       } else if (data.type === "unusable") {

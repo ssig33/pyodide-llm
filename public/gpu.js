@@ -126,7 +126,7 @@ async function openDevice(plan, say = unusable) {
     device.lost.then((info) => { lost = `the GPU was lost (${info.reason}${info.message ? `: ${info.message}` : ""})`; });
     // T148: what the page keeps of an earlier visit counts only for the same adapter and browser
     // (and the shaders of this deployment: a site whose shaders changed chooses anew, the review of T148)
-    const key = `${adapterKey(adapter)}|${shadersKey(wgsl, candidates({ device, wgsl }))}`;
+    const key = wgsl.deviceKey(adapter, device);
     const remembered = plan.remembered?.key === key ? plan.remembered : null;
     model = { device, plan, wgsl, owned: [], limit, info, fallback, remembered, adapter, key };
     if (stopping) return end();
@@ -287,25 +287,8 @@ function describe(adapter) {
 }
 // T148: the adapter and the browser whose shaders the page remembers: another GPU, driver architecture or browser
 // version chooses anew (the user agent carries the browser's version)
-const adapterKey = (adapter) => {
-  const info = adapter.info ?? {};
-  return [info.vendor, info.architecture, info.device, info.description, self.navigator?.userAgent].map((part) => part ?? "").join("|");
-};
-// the shaders' own text (the tiled ones this device can make, and the small steps'), as a short hash (FNV-1a)
-function shadersKey(wgsl, forms) {
-  let hash = 0x811c9dc5;
-  // (T152: and a token's)
-  for (const text of [...forms.map((form) => `${form.name}${form.code ?? form.none}`), wgsl.RMSNORM, wgsl.HEAD_NORM, wgsl.ADD, wgsl.ROPE,
-    wgsl.SWIGLU, wgsl.QUANTIZE, String(wgsl.flashTile), wgsl.LAYER_NORM, wgsl.GELU, wgsl.EMBED, wgsl.SAMPLE, wgsl.NORM_QUANTIZE,
-    String(wgsl.fusedMatVec), String(wgsl.fusedDp4aMatVec)]) {
-    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
-  }
-  return (hash >>> 0).toString(16);
-}
 // the tiled shaders of T146 this device can make (shaders.js's promptForms)
-const candidates = ({ device, wgsl }) => wgsl.promptForms({ half: device.features.has("shader-f16"), subgroups: device.features.has("subgroups"),
-  packed: Boolean(navigator.gpu.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product")),
-  memory: device.limits.maxComputeWorkgroupStorageSize, threads: threadsOf(device) });
+const candidates = ({ device, wgsl }) => wgsl.devicePromptForms(device);
 
 function unusable(reason) {
   postMessage({ type: "unusable", reason });

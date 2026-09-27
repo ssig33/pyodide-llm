@@ -254,6 +254,12 @@ export function cpuTable(r) {
  * threads }) for the model page, which holds a model on the GPU alone against it (the same estimate as the GPU
  * section's GPU ÷ CPU, T157) */
 export const CPU_SPEED_KEY = "benchmark:cpu";
+/** T156: where the model page keeps how it is used (the tokens of prompts and written, each generation adding its own
+ * to four fifths of what was there: the last few count most), which a model on the GPU alone is weighed by */
+export const USAGE_KEY = "gpu:usage";
+export const USAGE_DECAY = 0.8;
+/** T156: the use kept (USAGE_KEY's value, or nothing) after a generation of prompt tokens and written ones */
+export const usedAfter = (kept, prompt, written) => ({ prompt: (kept?.prompt ?? 0) * USAGE_DECAY + prompt, written: (kept?.written ?? 0) * USAGE_DECAY + written });
 export function cpuBaseline(section) {
   if (!section) return { why: "run the CPU section for it" };
   if (section.status !== "ok") return { why: `the CPU section ${STATES[section.status] ?? section.status}` };

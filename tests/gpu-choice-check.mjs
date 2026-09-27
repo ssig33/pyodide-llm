@@ -2,9 +2,10 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, placer, PROMPTS_CPU, PROMPTS_GPU, PROMPTS_UNTIMED,
-  promptTimes, tokenTimes, weightsPlace } from "../public/forward.js";
-import { halvesOf } from "../public/shaders.js";
+import { aloneHolds, aloneVerdict, gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, layerWeightsOf, placer, PROMPTS_CPU,
+  PROMPTS_GPU, PROMPTS_UNTIMED, promptTimes, tokenTimes, USAGE_UNKNOWN, weightsPlace } from "../public/forward.js";
+import { deviceKey, halvesOf } from "../public/shaders.js";
+import { usedAfter } from "../src/bench.js";
 
 // a GPU with a fixed cost of 40 ms a block and 0.5 ms a token (16 tokens 48 ms, 64 tokens 72 ms)
 const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
@@ -138,11 +139,14 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
 // both), else the GPU alone where the model can be and fits (8: no limit, as the CPU alone has none), else the CPU
 {
   const GB = 2 ** 30;
-  assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 2.5 * GB }, "Llama 3.2 1B on 8: both");
+  // (the owner, 2026-09-27: both up to 6 GiB on a device that says 8: llm-jp-3.1 1.8B, about 2.3 + 2.4 GB, as before)
+  assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 4.5 * GB }, "Llama 3.2 1B on 8: both");
+  assert.equal(weightsPlace({ cpu: 2.3 * GB, gpuOnly: 0.6 * GB, gpu: 2.4 * GB, deviceMemory: 8, eligible: true }).mode, "both", "1.8B on 8: both");
+  assert.equal(weightsPlace({ cpu: 3.1 * GB, gpuOnly: 0.6 * GB, gpu: 3.0 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "6.1 GiB: past 6");
   assert.equal(weightsPlace({ cpu: 4.4 * GB, gpuOnly: 1.2 * GB, gpu: 4.1 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "3B on 8: the GPU alone");
   assert.equal(weightsPlace({ cpu: 9.2 * GB, gpuOnly: 1.5 * GB, gpu: 8 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "7B on 8: no limit");
   const notEligible = weightsPlace({ cpu: 4.4 * GB, gpu: 4.1 * GB, deviceMemory: 8 });
-  assert.ok(notEligible.mode === "cpu" && Math.abs(notEligible.gpuRoom + 0.4 * GB) < 1, "not eligible: the CPU, no room for the GPU");
+  assert.ok(notEligible.mode === "cpu" && Math.abs(notEligible.gpuRoom - 1.6 * GB) < 1, "not eligible: the CPU, 1.6 GiB for the GPU's layers");
   assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.7 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "cpu", "1B on 4 GB: 2.1 GB past 2");
   assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.3 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "gpu", "within 2 GB: the GPU alone");
   assert.equal(weightsPlace({ cpu: 0.1 * GB, gpuOnly: 0.05 * GB, gpu: 0.1 * GB, deviceMemory: 8, eligible: true, forced: true }).mode, "gpu", "?gpuTest=only");
@@ -215,5 +219,42 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   // what gpu.js opens with: each layer's values and scales where they start in the checkpoint
   const plan = gpuOnlyPlan([64, 96, 2, 4, 2, 100, 32], tensors);
   assert.deepEqual(plan.matrices.w2.layers[1], [tensors.w2.offset + 64 * 96, tensors.w2.scales + (64 * 96 / 32) * 4]);
+}
+
+// T156 (the owner, 2026-09-27): a model on the GPU alone weighed on the prompts too, by the page's use, and the verdict
+// kept for the device and /benchmark/'s CPU reading
+{
+  // Llama 3.2 3B (dim 3072, hidden 8192, 28 layers, 24 heads, 8 of keys and values): 2.8 G multiply-adds a token
+  const header = [3072, 8192, 28, 24, 8, 128256, 4096], weights = layerWeightsOf(header);
+  assert.equal(weights, 28 * (2 * 3072 * 3072 + 2 * 1024 * 3072 + 3 * 8192 * 3072));
+  const size = 3.6e9, cpu = { GBps: 28.7, promptGMACs: 40 };
+  // the CPU's step 125 ms (3.6 GB at 28.7 GB/s), its prompt's token 70.6 ms (2.8 G at 40 G MAC/s)
+  const slowStep = { stepMs: 160, promptMs: 14 };
+  // the answers alone: the CPU faster (125 < 0.95 × 160)
+  assert.equal(aloneVerdict({ size, layerWeights: weights, cpu: { GBps: 28.7 }, gpu: slowStep }).cpuFaster, true, "the steps alone: the CPU");
+  // with the prompts, as many tokens: 125 + 70.6 against 160 + 14: the CPU still (195.6 < 165.3? no): the GPU
+  const even = aloneVerdict({ size, layerWeights: weights, cpu, gpu: slowStep, usage: USAGE_UNKNOWN });
+  assert.equal(even.cpuFaster, false, `as many prompt tokens as written: the GPU (${even.cpu} against ${even.gpu})`);
+  // mostly writing (1 prompt token to 10 written): the CPU
+  assert.equal(aloneVerdict({ size, layerWeights: weights, cpu, gpu: slowStep, usage: { prompt: 1, written: 10 } }).cpuFaster, true, "writing: the CPU");
+  // nothing known of the CPU: the GPU stays
+  assert.equal(aloneVerdict({ size, layerWeights: weights, cpu: {}, gpu: slowStep }).cpuFaster, false, "no /benchmark/: the GPU");
+  // the use kept: each generation's added to four fifths of what was there
+  assert.deepEqual(usedAfter(usedAfter(undefined, 100, 50), 20, 200), { prompt: 100 * 0.8 + 20, written: 50 * 0.8 + 200 });
+  // the key: the adapter as the device made of it (the same features and limits), another description another key;
+  // the verdict holds for the same key and the same reading of /benchmark/'s CPU, and for nothing else
+  const adapter = { info: { vendor: "arm", architecture: "valhall", device: "", description: "Mali-G615" },
+    features: new Set(["shader-f16", "subgroups"]), limits: { maxComputeWorkgroupStorageSize: 32768, maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256 } };
+  const device = { features: new Set(adapter.features), limits: { ...adapter.limits } };
+  const key = deviceKey(adapter);
+  assert.equal(deviceKey(adapter, device), key, "the worker's key is gpu.js's");
+  assert.notEqual(deviceKey({ ...adapter, info: { ...adapter.info, description: "Mali-G715" } }), key, "another GPU");
+  assert.notEqual(deviceKey({ ...adapter, features: new Set(["subgroups"]) }), key, "other shaders");
+  const alone = { key, cpu };
+  assert.equal(aloneHolds(alone, key, { ...cpu, threads: 4 }), true);
+  assert.equal(aloneHolds(alone, key + "x", cpu), false, "another device, browser or shaders");
+  assert.equal(aloneHolds(alone, key, { ...cpu, GBps: 30.1 }), false, "/benchmark/'s CPU measured again");
+  assert.equal(aloneHolds(alone, key, undefined), false, "no /benchmark/ now");
+  assert.equal(aloneHolds(undefined, key, cpu), false);
 }
 console.log("ok");

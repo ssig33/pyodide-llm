@@ -317,12 +317,19 @@ let gpuForce = {};
 // T156: the adapter, asked for before a model is loaded ({ fallback, limits } or null): whether a model the device
 // cannot hold twice goes on the GPU alone is decided before its bytes come (forward.js's weightsPlace, gpuOnlyUnfit)
 let gpuAdapter = null;
-const adapterAsked = !hasWebGpu ? Promise.resolve() : navigator.gpu.requestAdapter().then((adapter) => {
+// (and its key, T148's: what the page kept of the model on this device holds only for the same, shaders.js's deviceKey)
+const adapterAsked = !hasWebGpu ? Promise.resolve() : navigator.gpu.requestAdapter().then(async (adapter) => {
   if (!adapter) return;
   const { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } = adapter.limits;
   gpuAdapter = { fallback: Boolean(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter),
     limits: { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } };
-}, () => {});
+  try {
+    const wgsl = await import(new URL(`shaders.js${self.location.search}`, import.meta.url));
+    gpuAdapter.key = wgsl.deviceKey(adapter);
+  } catch {
+    // no key: nothing the page kept of this device holds (a model on the GPU alone is weighed again)
+  }
+}).catch(() => {});
 // T156: the models whose GPU failed while they were on it alone, loaded again on the CPU from then on (this visit)
 const cpuOnly = new Set();
 const modelKey = (model) => model.hf ? `hf:${model.hf.repo}@${model.hf.revision}` : model.id ?? model.name;
@@ -679,7 +686,9 @@ function weightsBuffer(size, header, options, keep) {
 // (cpuOnly). convert() asks it too before it opens a file to keep a conversion in as it comes (the review of T156)
 const gpuOnlyPossible = () => hasWebGpu && self.navigator?.deviceMemory !== undefined && !benchPage && !benching && sharedWanted() &&
   Boolean(wideKernels?.shared) && !disabled.includes("int8") && !cpuOnly.has(loadingKey) &&
-  Boolean(gpuAdapter) && (!gpuAdapter.fallback || Boolean(gpuForce.fallback));
+  Boolean(gpuAdapter) && (!gpuAdapter.fallback || Boolean(gpuForce.fallback)) &&
+  // (the owner, 2026-09-27: a CPU found faster here before, as the page kept it, loads on the CPU at once)
+  !forwardModule.aloneHolds(gpuRequest?.remembered?.alone, gpuAdapter.key, gpuRequest?.cpu);
 // T156: where a model goes ({ mode: "both" | "gpu" | "cpu", gpuRoom }, forward.js's weightsPlace): the GPU alone only
 // for a Llama of int8 the GPU's steps take (gpuOnlyUnfit), where the page and the device may (gpuOnlyPossible)
 function gpuOnlyWeightsFor(size, header, options, after, deviceMemory) {
@@ -726,8 +735,10 @@ function gpuOnlyBuffer(size, header, options, { tensors, stored, gpuOnly }, keep
   };
   const weights = forwardModule.gpuOnlyWeights({ memory, base, size, tensors, worker });
   worker.postMessage({ type: "open", plan: forwardModule.gpuOnlyPlan(header, tensors, gpuForce, gpuRequest?.remembered), flow: weights.flow });
-  // (T156: the checkpoint's size and /benchmark/'s CPU reading, for the estimate the GPU's step is held against)
-  const direct = gpuOnlyNow = { worker, lost: null, stored, size, cpuGBps: gpuRequest?.cpu?.GBps, place: weights.place,
+  // (T156: the checkpoint's size, its layers' multiply-adds, /benchmark/'s CPU reading and the page's use, for the
+  // estimate the GPU is held against: forward.js's aloneVerdict)
+  const direct = gpuOnlyNow = { worker, lost: null, stored, size, place: weights.place,
+    layerWeights: forwardModule.layerWeightsOf(header, options), cpu: gpuRequest?.cpu, usage: gpuRequest?.usage ?? forwardModule.USAGE_UNKNOWN,
     room: weights.room, drained: weights.drained, onLost: (why) => { direct.lost = why; }, end };
   weightsNow = memory;
   const kernels = wide ? wideKernels.shared : sharedKernels;
@@ -771,6 +782,8 @@ async function gpuOnlyReady(model) {
   if (!direct.lost) return true;
   console.warn(`gpu: ${direct.lost}: the model was on the GPU alone, and is loaded again on the CPU`);
   cpuOnly.add(modelKey(model));
+  // (the CPU was faster: the page keeps it for this model and device, and the next visit loads on the CPU at once)
+  if (direct.verdict) postMessage({ type: "gpu-alone", model: model.id, alone: direct.verdict });
   // (the GPU's worker let go of its device: stopped by forward.js where it started it, and here where it did not, as a
   // model whose GPU forward.js gave up as the engine was built, before start(): its release() has no "ended" to wait
   // for then. The review of T156: the load on the CPU begins after it, T205)

@@ -3328,3 +3328,25 @@ export function walkLikeCpu(logits, temperature, topp) {
   }
   return { tokens, cumulative, mass: sum };
 }
+
+// ---- T148: the key of what the page remembers of a device (the shaders it chose, T156: that the CPU was faster than a
+// model on the GPU alone): the adapter and the browser, and the text of the shaders this device can make as a short
+// hash (FNV-1a): a deployment whose shaders changed chooses anew. adapter's info; device: the device made of it, or the
+// adapter itself (the worker, before any device: gpu.js asks the device for the adapter's features and these limits,
+// so the two give the same key)
+/** the tiled shaders of T146 a device can make (promptForms) */
+export const devicePromptForms = (device) => promptForms({ half: device.features.has("shader-f16"), subgroups: device.features.has("subgroups"),
+  packed: Boolean(globalThis.navigator?.gpu?.wgslLanguageFeatures?.has("packed_4x8_integer_dot_product")),
+  memory: device.limits.maxComputeWorkgroupStorageSize,
+  threads: Math.min(device.limits.maxComputeInvocationsPerWorkgroup, device.limits.maxComputeWorkgroupSizeX) });
+export function deviceKey(adapter, device = adapter) {
+  const info = adapter.info ?? {};
+  const named = [info.vendor, info.architecture, info.device, info.description, globalThis.navigator?.userAgent].map((part) => part ?? "").join("|");
+  let hash = 0x811c9dc5;
+  // (T152: and a token's)
+  for (const text of [...devicePromptForms(device).map((form) => `${form.name}${form.code ?? form.none}`), RMSNORM, HEAD_NORM, ADD, ROPE,
+    SWIGLU, QUANTIZE, String(flashTile), LAYER_NORM, GELU, EMBED, SAMPLE, NORM_QUANTIZE, String(fusedMatVec), String(fusedDp4aMatVec)]) {
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  }
+  return `${named}|${(hash >>> 0).toString(16)}`;
+}

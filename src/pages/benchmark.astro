@@ -821,7 +821,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
       const speed = name === "cpu" ? cpuBaseline(result).token : undefined;
       if (speed?.isolated) {
         try {
-          localStorage.setItem(CPU_SPEED_KEY, JSON.stringify({ GBps: speed.GBps, threads: speed.threads }));
+          // (and a prompt's G MAC/s at its fastest: its model's layers' multiply-adds a token, over its ms)
+          const prompt = cpuBaseline(result).prompt, layerWeights = result.data?.layerWeights;
+          const promptGMACs = prompt && layerWeights ? layerWeights / (prompt.msPerToken / 1000) / 1e9 : undefined;
+          localStorage.setItem(CPU_SPEED_KEY, JSON.stringify({ GBps: speed.GBps, threads: speed.threads, promptGMACs }));
         } catch {
           // no storage here: a model on the GPU alone stays there
         }

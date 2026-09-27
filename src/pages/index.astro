@@ -303,7 +303,7 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
 
 <script>
   import { GROUPS, MODELS, filled, memoryFailure, memoryWarning, weightsFor } from "../models.js";
-  import { FULL_ROUNDS, ROUNDS, benchMarkdown, roundsHere, environmentOf, reportUrl, threadsKey as sharedThreadsKey, CPU_SPEED_KEY } from "../bench.js";
+  import { FULL_ROUNDS, ROUNDS, benchMarkdown, roundsHere, environmentOf, reportUrl, threadsKey as sharedThreadsKey, CPU_SPEED_KEY, USAGE_KEY, usedAfter } from "../bench.js";
 
   declare const __BUILD__: string;
   const $ = (id: string) => document.getElementById(id)!;
@@ -407,7 +407,8 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
     try {
       // (T156: and the CPU's reading of the weights /benchmark/ measured here, which a model on the GPU alone is held against)
       return { remembered: JSON.parse(localStorage.getItem(gpuKey(entry)) ?? "null") ?? undefined,
-        cpu: JSON.parse(localStorage.getItem(CPU_SPEED_KEY) ?? "null") ?? undefined };
+        cpu: JSON.parse(localStorage.getItem(CPU_SPEED_KEY) ?? "null") ?? undefined,
+        usage: JSON.parse(localStorage.getItem(USAGE_KEY) ?? "null") ?? undefined };
     } catch {
       return {};  // no storage here, or something else under the name: choose again
     }
@@ -847,10 +848,21 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
         }));
         try {
           // (T152: and the layer of a token)
-          localStorage.setItem(gpuKey(model), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention, tokens: data.tokens }));
+          // (T156: with what it kept of a model on the GPU alone: its own key says when it no longer holds)
+          const alone = JSON.parse(localStorage.getItem(gpuKey(model)) ?? "null")?.alone;
+          localStorage.setItem(gpuKey(model), JSON.stringify({ key: data.key, matrices: data.matrices, attention: data.attention, tokens: data.tokens, alone }));
         } catch {
           // no storage here: the next visit times them again
         }
+      }
+    } else if (data.type === "gpu-alone") {
+      // T156: the CPU is faster here than the GPU for this model on the GPU alone: kept, and the next load goes on
+      // the CPU at once (forward.js's aloneHolds says when it no longer holds)
+      try {
+        const kept = JSON.parse(localStorage.getItem(gpuKey(model)) ?? "null") ?? {};
+        localStorage.setItem(gpuKey(model), JSON.stringify({ ...kept, alone: data.alone }));
+      } catch {
+        // no storage here: the next visit weighs the two again
       }
     } else if (data.type === "threads-compared") {
       // T114: how the worker chose the number of threads, one line per comparison (medians in ms per token)
@@ -875,7 +887,14 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
         chat.scrollTop = chat.scrollHeight;
       }
     } else if (data.type === "done") {
-      showStatus(data.gpu);  // T148: the prompts timed on either side may have moved the GPU's verdict
+      showStatus(data.gpu);
+      // T156: how the page is used, for a model on the GPU alone
+      try {
+        const kept = JSON.parse(localStorage.getItem(USAGE_KEY) ?? "null");
+        localStorage.setItem(USAGE_KEY, JSON.stringify(usedAfter(kept, data.prompt_tokens, data.tokens - data.prompt_tokens)));
+      } catch {
+        // no storage here: the tokens are weighed as many
+      }  // T148: the prompts timed on either side may have moved the GPU's verdict
       // the settings this very answer was written with: with the seed the same text can be asked for again
       const how = used.temperature ? `temp ${used.temperature}` : "greedy";
       meta(answer!, `${model.name} · ${data.tokens} tokens · ${data.tokens_per_second.toFixed(1)} tok/s${data.threads > 1 ? ` · ${data.threads} threads` : ""} · ${how}`, [

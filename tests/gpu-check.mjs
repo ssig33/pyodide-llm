@@ -378,7 +378,7 @@ function caseOf(id, options, reference, bytes) {
 // ---- the browser: a page that is cross-origin isolated (its own headers), a worker that runs forward.js
 const HARNESS = /* js */ `
 const search = "?v=gpu-check";
-const { compileKernels, createForward, weightsMemory, footprint, external, gpuOnlyWeights, gpuOnlyPlan } = await import("/public/forward.js" + search);
+const { compileKernels, createForward, weightsMemory, footprint, external, gpuOnlyWeights, gpuOnlyPlan, layerWeightsOf } = await import("/public/forward.js" + search);
 const { GPU_DONE, GPU_FAILED, GPU_BEAT, GPU_WANTED } = await import("/public/jobs.js" + search);
 const fetched = async (url) => new Uint8Array(await (await fetch(url)).arrayBuffer());
 const b64 = (floats) => {
@@ -540,8 +540,10 @@ try {
     // layers' matrices to the GPU's worker and the rest into memory packed without them. The prompt and 4 greedy steps
     // (none on the CPU); then a step on the CPU, which must throw (the weights are not here). And a GPU that fails as
     // it opens (pieces of 4096 bytes, fewer than the device's alignment of rows: gpu.js's piecesOf refuses): the bytes
-    // still counted as taken, the GPU lost with the reason as the engine starts, a step on the CPU throws
-    const direct = async (force) => {
+    // still counted as taken, the GPU lost with the reason as the engine starts, a step on the CPU throws. cpu (the made-up
+    // model only): /benchmark/'s CPU reading made up, far slower than the GPU (it stays) or far faster (the GPU is given
+    // up as it is ready, and the verdict to keep has the device's key)
+    const direct = async (force, cpu) => {
       const worker = openGpu();
       const weights = gpuOnlyWeights({ memory, base, size, tensors: c.places, worker });
       worker.postMessage({ type: "open", plan: gpuOnlyPlan(c.reference.header, c.places, force), flow: weights.flow });
@@ -552,8 +554,9 @@ try {
       }
       await weights.drained();
       let lostWhy = null;
-      const outside = external({ memory, base, size, kernels, gpu: () => worker, gpuForce: force, halfKeys: true,
-        direct: { place: weights.place, stored: weights.stored, onLost: (why) => { lostWhy = why; } } });
+      const told = { place: weights.place, stored: weights.stored, onLost: (why) => { lostWhy = why; }, size, cpu,
+        layerWeights: layerWeightsOf(c.reference.header, { head_dim: c.headDim }), usage: { prompt: 1, written: 1 } };
+      const outside = external({ memory, base, size, kernels, gpu: () => worker, gpuForce: force, halfKeys: true, direct: told });
       const engine = outside.start(structuredClone(plan));
       const note = await engine.gpu;
       const out = { note, stored: weights.stored };
@@ -564,6 +567,7 @@ try {
           first: engine.generateMany(tokens[n], n, tokens.slice(-64), tokens.length, 4, 0, 0.9, 1, [], []) });
       }
       out.lost = lostWhy;  // (before the step on the CPU below, which loses the GPU: the worker would load it again)
+      out.verdict = told.verdict;
       try {
         engine.forward(tokens[n], n);
       } catch (error) {
@@ -608,7 +612,11 @@ try {
     const tokenRun = gpu.find((r) => r.steps?.forced === tokenForms[0] && r.steps?.first);
     if (c.places && tokenRun && !c.wide && !c.force) {
       const force = { ...TESTS, matrices: forms[0], quick: true, tokens: tokenForms[0], pieceBytes: Infinity, tablePieceBytes: Math.ceil((plan.vocab_size * plan.dim) / 3) };
-      alone = { right: await direct(force), pieces: await direct({ ...force, pieceBytes: 4096 }), keys: tokenRun.keys, values: tokenRun.values, first: tokenRun.steps.first };
+      const synthetic = c.id === "synthetic";
+      alone = { right: await direct(force, synthetic ? { GBps: 1e-6, promptGMACs: 1e-6 } : undefined), pieces: await direct({ ...force, pieceBytes: 4096 }),
+        // (timed: the GPU's step and block are what the verdict weighs, which the tests' quick leaves untimed)
+        ...(synthetic ? { cpuFaster: await direct({ ...force, quick: false }, { GBps: 1e9, promptGMACs: 1e9 }), key: adapter && wgsl.deviceKey(adapter) } : {}),
+        keys: tokenRun.keys, values: tokenRun.values, first: tokenRun.steps.first };
     }
     results.push({ id: c.id, cpu, gpu, late: lateRun, refused, remembered, alone });
   }
@@ -832,11 +840,14 @@ for (const { id, cpu, gpu: runs, late, refused, remembered, alone } of outcome.r
     const same = r.keys === alone.keys && r.values === alone.values && JSON.stringify(r.first) === JSON.stringify(alone.first);
     const good = !r.lost && r.gpuTokens === n && same && /^prompts and answers on WebGPU/.test(r.status ?? "") && /on it alone/.test(r.threw ?? "")
       && Boolean(p.lost) && /on it alone/.test(p.threw ?? "");
+    // (the made-up model: a CPU far faster than the GPU is taken, and what the page keeps has the device's key)
+    const f = alone.cpuFaster, cpuRight = !f || (/the CPU as \/benchmark\/ measured it/.test(f.lost ?? "") && f.verdict?.key === alone.key && /on it alone/.test(f.threw ?? ""));
     console.log(`  on the GPU alone (${(r.stored / 1e6).toFixed(2)} MB here): ${r.lost ? `lost (${r.lost})` : `${r.gpuTokens} tokens of the prompt, keys and values ` +
       `${r.keys === alone.keys && r.values === alone.values ? "the same to the bit" : "NOT the same"} as with the weights here, steps ${JSON.stringify(r.first)} ` +
       `(${JSON.stringify(alone.first)}), "${r.status}", a step on the CPU ${r.threw ? "threw" : "ran"}`}; a GPU that fails as it opens: ${p.lost ? `lost (${p.lost})` : "not lost"}, ` +
-      `a step on the CPU ${p.threw ? "threw" : "ran"}${good ? "" : " — FAILED"}`);
-    failed ||= !good;
+      `a step on the CPU ${p.threw ? "threw" : "ran"}${f ? `; a CPU far faster: ${f.lost ? `lost (${f.lost})` : "not lost"}, the verdict ${f.verdict?.key === alone.key ? "with the device's key" : "WITHOUT the device's key"}` : ""}` +
+      `${good && cpuRight ? "" : " — FAILED"}`);
+    failed ||= !good || !cpuRight;
   }
   if (remembered) {
     const right = remembered.same?.remembered === true && remembered.other?.remembered === false;
