@@ -2414,6 +2414,7 @@ ${fusedWrite(output)}
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 // Adapted from MLC LLM, python/mlc_llm/op/top_p_pivot.py and python/mlc_llm/compiler_pass/attach_logit_processor.py
+// (and, for T191's sampling in chunks below, python/mlc_llm/compiler_pass/attach_softmax_with_temperature.py)
 // (https://github.com/mlc-ai/mlc-llm, commit 9fa644f5, 2026-08-17), and from the sampling of WebLLM
 // (https://github.com/mlc-ai/web-llm, src/llm_chat.ts) and Apache TVM (python/tvm/relax/frontend/nn/op.py,
 // https://github.com/apache/tvm, commit e0ed4aad), under the Apache License, Version 2.0. Changed as described above.
@@ -2534,20 +2535,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }`;
 
-// The penalty, softmax, top-p and the draw of one token, in one workgroup: see above. Bindings: 0 the logits (the
-// penalty is applied to them in place, as the CPU does), 1 and 2 scratch of the vocabulary's size (probabilities and
-// the indices of those gathered), 3 the state, 4 chosen, 5 the random numbers, 6 the settings.
-export const SAMPLE = /* wgsl */ `
+// What SAMPLE and the stages of the sampling in chunks (T191, below) share: the constants, the workgroup's memory of
+// the reductions, and cumsum.wgsl's scan
+const SAMPLER_COMMON = /* wgsl */ `
 ${STATE}
 ${SAMPLING}
-@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
-@group(0) @binding(1) var<storage, read_write> probs: array<f32>;
-@group(0) @binding(2) var<storage, read_write> order: array<u32>;
-@group(0) @binding(3) var<storage, read_write> state: State;
-@group(0) @binding(4) var<storage, read_write> chosen: array<u32>;
-@group(0) @binding(5) var<storage, read> randoms: array<f32>;
-@group(0) @binding(6) var<uniform> settings: Sampling;
-
 const WG_SIZE = 256u;
 const WINDOW = ${REPETITION_WINDOW}u;
 // MLC's num_pivots: three pivots a round, the fourth lane of the sums unused
@@ -2563,13 +2555,7 @@ const NONE = 0xFFFFFFFFu;
 var<workgroup> best_value: array<f32, WG_SIZE>;
 var<workgroup> best_index: array<u32, WG_SIZE>;
 var<workgroup> shared_sum: array<f32, WG_SIZE>;
-var<workgroup> shared_sums: array<vec4<f32>, WG_SIZE>;
 var<workgroup> uniform_word: u32;
-// the search's bounds, in bits, and the sum at lo: thread 0 writes them, every thread reads them by one
-// workgroupUniformLoad a round (a barrier, and the value uniform for the loop's own barriers)
-struct Bound { lo: u32, hi: u32, sum: f32 }
-var<workgroup> bound: Bound;
-var<workgroup> found: atomic<u32>;
 
 // cumsum.wgsl's scan: (the sum of the values of the threads before t, the sum of all), in the same order every run
 fn scan(value: f32, t: u32) -> vec2<f32> {
@@ -2608,6 +2594,43 @@ fn scan(value: f32, t: u32) -> vec2<f32> {
     workgroupBarrier();
     return vec2<f32>(before, all);
 }
+
+// argmax.wgsl's pairs, reduced in the workgroup's memory: the largest value and its first index (of two equal, the
+// smaller index)
+struct Best { value: f32, at: u32 }
+fn best_of(value: f32, at: u32, t: u32) -> Best {
+    best_value[t] = value;
+    best_index[t] = at;
+    workgroupBarrier();
+    var offset = WG_SIZE / 2u;
+    while (offset > 0u) {
+        if (t < offset) {
+            let b = best_value[t + offset];
+            let bi = best_index[t + offset];
+            if (b > best_value[t] || (b == best_value[t] && bi < best_index[t])) {
+                best_value[t] = b;
+                best_index[t] = bi;
+            }
+        }
+        workgroupBarrier();
+        offset >>= 1u;
+    }
+    let best = Best(best_value[0], best_index[0]);
+    workgroupBarrier();
+    return best;
+}
+`;
+
+// The nucleus and the draw from the probabilities gathered over the floor (probs[0 .. count), their tokens in order[]
+// in the order of their index), and the token into chosen and the state: SAMPLE's and the chunks' last stage's. The
+// shader that takes it binds probs, order, state (read_write), chosen and settings
+const SAMPLER_DRAW = /* wgsl */ `
+var<workgroup> shared_sums: array<vec4<f32>, WG_SIZE>;
+// the search's bounds, in bits, and the sum at lo: thread 0 writes them, every thread reads them by one
+// workgroupUniformLoad a round (a barrier, and the value uniform for the loop's own barriers)
+struct Bound { lo: u32, hi: u32, sum: f32 }
+var<workgroup> bound: Bound;
+var<workgroup> found: atomic<u32>;
 
 // soft_max.wgsl's tree, four sums at once (a pivot's each)
 fn total4(value: vec4<f32>, t: u32) -> vec4<f32> {
@@ -2686,6 +2709,67 @@ fn finish(token: u32) {
     }
 }
 
+// the nucleus of the count gathered (total: the mass of all over the floor), the draw in it for the random number r,
+// and the token into chosen and the state (argmax where no token was found)
+fn draw_nucleus(count: u32, total: f32, r: f32, argmax: u32, t: u32) {
+    // the nucleus: the smallest probability p whose tokens at or over it hold topp of the mass
+    let limit = settings.topp * total;
+    let nucleus_found = pivot(0u, total, limit, false, count, t);
+    let mass = nucleus_found.y;
+    // the draw: the largest probability whose tokens at or over it hold more than r × the nucleus's mass
+    let goal = r * mass;
+    let drawn = pivot(bitcast<u32>(nucleus_found.x), mass, goal, true, count, t);
+    let w = drawn.x;
+
+    // the tokens of probability w, the mass over it, and which of the equal ones: the order of their index
+    let run = (count + WG_SIZE - 1u) / WG_SIZE;
+    let first = min(t * run, count);
+    let last = min(first + run, count);
+    var equal = 0u;
+    var over = 0.0;
+    for (var k = first; k < last; k++) {
+        let p = probs[k];
+        if (p == w) {
+            equal++;
+        } else if (p > w) {
+            over += p;
+        }
+    }
+    let equals = scan(f32(equal), t);
+    let above = scan(over, t).y;
+    let ties = u32(equals.y);
+    let nth = min(u32(max(floor((goal - above) / w), 0.0)), max(ties, 1u) - 1u);
+    var rank = u32(equals.x);
+    for (var k = first; k < last; k++) {
+        if (probs[k] == w) {
+            if (rank == nth) {
+                atomicStore(&found, order[k]);
+            }
+            rank++;
+        }
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        let hit = atomicLoad(&found);
+        finish(select(hit, argmax, hit == NONE));
+    }
+}
+`;
+
+// The penalty, softmax, top-p and the draw of one token, in one workgroup: see above. Bindings: 0 the logits (the
+// penalty is applied to them in place, as the CPU does), 1 and 2 scratch of the vocabulary's size (probabilities and
+// the indices of those gathered), 3 the state, 4 chosen, 5 the random numbers, 6 the settings.
+export const SAMPLE = /* wgsl */ `
+${SAMPLER_COMMON}
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> probs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> order: array<u32>;
+@group(0) @binding(3) var<storage, read_write> state: State;
+@group(0) @binding(4) var<storage, read_write> chosen: array<u32>;
+@group(0) @binding(5) var<storage, read> randoms: array<f32>;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+${SAMPLER_DRAW}
+
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let t = lid.x;
@@ -2727,24 +2811,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             at = i;
         }
     }
-    best_value[t] = value;
-    best_index[t] = at;
-    workgroupBarrier();
-    var offset = WG_SIZE / 2u;
-    while (offset > 0u) {
-        if (t < offset) {
-            let b = best_value[t + offset];
-            let bi = best_index[t + offset];
-            if (b > best_value[t] || (b == best_value[t] && bi < best_index[t])) {
-                best_value[t] = b;
-                best_index[t] = bi;
-            }
-        }
-        workgroupBarrier();
-        offset >>= 1u;
-    }
-    let best = best_value[0];
-    let argmax = best_index[0];
+    let largest = best_of(value, at, t);
+    let best = largest.value;
+    let argmax = largest.at;
 
     if (settings.temperature == 0.0) {
         if (t == 0u) {
@@ -2811,49 +2880,355 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         probs[k] = exp((logits[order[k]] - best) * inverse);
     }
     storageBarrier();
+    draw_nucleus(count, total, r, argmax, t);
+}`;
 
-    // the nucleus: the smallest probability p whose tokens at or over it hold topp of the mass
-    let limit = settings.topp * total;
-    let nucleus_found = pivot(0u, total, limit, false, count, t);
-    let mass = nucleus_found.y;
-    // the draw: the largest probability whose tokens at or over it hold more than r × the nucleus's mass
-    let goal = r * mass;
-    let drawn = pivot(bitcast<u32>(nucleus_found.x), mass, goal, true, count, t);
-    let w = drawn.x;
+// ---- T191: the sampling in chunks of the vocabulary, many workgroups. SAMPLE's one workgroup reads the vocabulary on
+// one of the GPU's cores (the owner's Android: 5.9 ms of 11 a token of the CPU section's model, Llama 3's 128256
+// tokens), and each of its threads a run of 501 consecutive logits. Here a workgroup a chunk of SAMPLE_CHUNK tokens,
+// four consecutive ones a thread (a subgroup's loads side by side), in four dispatches: SAMPLE_MAX (the penalty on the
+// window's tokens in the chunk, the chunk's largest logit and its first index), SAMPLE_SUM (every workgroup reduces
+// the chunks' largest to the vocabulary's, then its chunk's softmax sum and how many tokens are over the floor; without
+// a nucleus its probabilities into probs), SAMPLE_GATHER (with a nucleus: the chunk's tokens over the floor into
+// order and probs, after those of the chunks before it, so in the order of the index as SAMPLE gathers them), and
+// SAMPLE_PICK (one workgroup: SAMPLE's nucleus and draw on what was gathered, SAMPLER_DRAW; without a nucleus the draw
+// in the order of the index, the chunk first by the chunks' sums, then the token in it). The same random number picks
+// the same token as SAMPLE and the CPU (sampleLikeCpu) but where a float32 sum in another order moves a border.
+// Their forms:
+//   - the chunks, and each workgroup reducing all the chunks' partial results again before its own chunk: MLC LLM's
+//     two-stage softmax (mlc_llm/compiler_pass/attach_softmax_with_temperature.py, Apache-2.0, above: chunk_lse, the
+//     max and sum of each chunk of 4096, and softmax_with_chunked_sum, which merges the chunks' in every block), here
+//     with the max of the vocabulary merged before the sums (SAMPLE's exp(value - max) and floor, whose max is the
+//     vocabulary's) where MLC merges the sums' log-sum-exp
+//   - the largest and its first index: argmax.wgsl's pairs, over a chunk and over the chunks; the sums, the counts and
+//     the order of the index: soft_max.wgsl's tree and cumsum.wgsl's scan, as SAMPLE's
+// This project's: where a chunk's tokens go in order[] (the tokens over the floor of the chunks before it, summed by
+// every workgroup), the penalty applied by the workgroup whose chunk holds the token, and the draw without a nucleus in
+// two steps (the chunk whose running sum passes, then the token in it; where the rounding of the two scans leaves none
+// passing in that chunk, its last token).
+// Bindings, of the same numbers as SAMPLE's (each stage binds those it reads: samplerStages): 0 the logits, 1 probs, 2
+// order, 3 the state, 4 chosen, 5 the random numbers, 6 the settings, and 7 the chunks' partial results
+// (samplePartsBytes: CHUNKS_COMMON's counted()).
+export const SAMPLE_CHUNK = 1024;
+export const sampleChunks = (vocab) => Math.ceil(vocab / SAMPLE_CHUNK);
+export const samplePartsBytes = (vocab) => 8 * (1 + 2 * sampleChunks(vocab));
+const CHUNKS_COMMON = /* wgsl */ `
+${SAMPLER_COMMON}
+const CHUNK = ${SAMPLE_CHUNK}u;
+const EACH = CHUNK / WG_SIZE;
 
-    // the tokens of probability w, the mass over it, and which of the equal ones: the order of their index
-    let run = (count + WG_SIZE - 1u) / WG_SIZE;
-    let first = min(t * run, count);
-    let last = min(first + run, count);
-    var equal = 0u;
-    var over = 0.0;
-    for (var k = first; k < last; k++) {
-        let p = probs[k];
-        if (p == w) {
-            equal++;
-        } else if (p > w) {
-            over += p;
-        }
-    }
-    let equals = scan(f32(equal), t);
-    let above = scan(over, t).y;
-    let ties = u32(equals.y);
-    let nth = min(u32(max(floor((goal - above) / w), 0.0)), max(ties, 1u) - 1u);
-    var rank = u32(equals.x);
-    for (var k = first; k < last; k++) {
-        if (probs[k] == w) {
-            if (rank == nth) {
-                atomicStore(&found, order[k]);
-            }
-            rank++;
-        }
-    }
-    workgroupBarrier();
+// a run that stopped changes nothing more (the state's word read by all: a barrier, and uniform)
+fn stopped(t: u32) -> bool {
     if (t == 0u) {
-        let hit = atomicLoad(&found);
-        finish(select(hit, argmax, hit == NONE));
+        uniform_word = state.stopped;
+    }
+    return workgroupUniformLoad(&uniform_word) != 0u;
+}
+
+fn chunk_count() -> u32 {
+    return (settings.vocab + CHUNK - 1u) / CHUNK;
+}
+// the partial results: [0] the vocabulary's largest logit and the floor (SAMPLE_SUM's), [1 + j] chunk j's largest logit
+// and its index (SAMPLE_MAX's), [1 + chunks + j] how many of its tokens are over the floor and their sum (SAMPLE_SUM's)
+fn counted(j: u32) -> vec2<u32> {
+    return parts[1u + chunk_count() + j];
+}
+
+// the vocabulary's largest logit and its first index, from the chunks' (SAMPLE_MAX's)
+fn largest(t: u32) -> Best {
+    let chunks = chunk_count();
+    var value = -3.4e38;
+    var at = NONE;
+    for (var j = t; j < chunks; j += WG_SIZE) {
+        let part = parts[1u + j];
+        let v = bitcast<f32>(part.x);
+        if (v > value) {
+            value = v;
+            at = part.y;
+        }
+    }
+    return best_of(value, at, t);
+}
+
+// soft_max.wgsl's tree: the sum of all the threads' values
+fn sum_all(value: f32, t: u32) -> f32 {
+    shared_sum[t] = value;
+    workgroupBarrier();
+    var offset = WG_SIZE / 2u;
+    while (offset > 0u) {
+        if (t < offset) {
+            shared_sum[t] += shared_sum[t + offset];
+        }
+        offset = offset / 2u;
+        workgroupBarrier();
+    }
+    let all = shared_sum[0];
+    workgroupBarrier();
+    return all;
+}
+`;
+const CHUNK_MAIN = "@compute @workgroup_size(WG_SIZE)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>)";
+export const SAMPLE_MAX = /* wgsl */ `
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(3) var<storage, read> state: State;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+@group(0) @binding(7) var<storage, read_write> parts: array<vec2<u32>>;
+${CHUNKS_COMMON}
+${CHUNK_MAIN} {
+    let t = lid.x;
+    if (stopped(t)) {
+        return;
+    }
+    let begin = wid.x * CHUNK;
+    let end = min(begin + CHUNK, settings.vocab);
+    // the repetition penalty (apply_penalty_inplace's thread a token) on the window's tokens in this chunk: each
+    // distinct token once, by the one workgroup whose chunk holds it
+    let window = min(state.history, WINDOW);
+    if (settings.penalty != 1.0 && t < window) {
+        let token = state.recent[t];
+        if (token >= begin && token < end) {
+            var seen = false;
+            for (var j = 0u; j < t; j++) {
+                seen = seen || state.recent[j] == token;
+            }
+            if (!seen) {
+                let value = logits[token];
+                logits[token] = select(value * settings.penalty, value / settings.penalty, value > 0.0);
+            }
+        }
+    }
+    storageBarrier();
+    let first = min(begin + t * EACH, end);
+    let last = min(first + EACH, end);
+    var value = -3.4e38;
+    var at = NONE;
+    for (var i = first; i < last; i++) {
+        let v = logits[i];
+        if (v > value) {
+            value = v;
+            at = i;
+        }
+    }
+    let best = best_of(value, at, t);
+    if (t == 0u) {
+        parts[1u + wid.x] = vec2<u32>(bitcast<u32>(best.value), best.at);
     }
 }`;
+export const SAMPLE_SUM = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> probs: array<f32>;
+@group(0) @binding(3) var<storage, read> state: State;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+@group(0) @binding(7) var<storage, read_write> parts: array<vec2<u32>>;
+${CHUNKS_COMMON}
+${CHUNK_MAIN} {
+    let t = lid.x;
+    if (stopped(t)) {
+        return;
+    }
+    if (settings.temperature == 0.0) {
+        return;
+    }
+    let best = largest(t).value;
+    // SAMPLE's softmax: exp(value - max), at the temperature; with a nucleus only over the floor (kernel.ts)
+    let nucleus = settings.topp > 0.0 && settings.topp < 1.0;
+    let inverse = 1.0 / settings.temperature;
+    let lowest = select(-3.4e38, best - settings.temperature * NUCLEUS_FLOOR, nucleus);
+    let begin = wid.x * CHUNK;
+    let end = min(begin + CHUNK, settings.vocab);
+    let first = min(begin + t * EACH, end);
+    let last = min(first + EACH, end);
+    var sum = 0.0;
+    var kept = 0u;
+    for (var i = first; i < last; i++) {
+        let v = logits[i];
+        if (v >= lowest) {
+            let p = exp((v - best) * inverse);
+            kept++;
+            sum += p;
+            if (!nucleus) {
+                probs[i] = p;
+            }
+        } else if (!nucleus) {
+            probs[i] = 0.0;
+        }
+    }
+    // the chunk's sum by the scan SAMPLE_PICK sums its probabilities with, in the same order
+    let chunk_sum = scan(sum, t).y;
+    let chunk_kept = sum_all(f32(kept), t);
+    if (t == 0u) {
+        parts[1u + chunk_count() + wid.x] = vec2<u32>(u32(chunk_kept), bitcast<u32>(chunk_sum));
+        if (wid.x == 0u) {
+            parts[0] = vec2<u32>(bitcast<u32>(best), bitcast<u32>(lowest));
+        }
+    }
+}`;
+export const SAMPLE_GATHER = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> probs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> order: array<u32>;
+@group(0) @binding(3) var<storage, read> state: State;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+@group(0) @binding(7) var<storage, read> parts: array<vec2<u32>>;
+${CHUNKS_COMMON}
+${CHUNK_MAIN} {
+    let t = lid.x;
+    if (stopped(t)) {
+        return;
+    }
+    let nucleus = settings.topp > 0.0 && settings.topp < 1.0;
+    if (settings.temperature == 0.0 || !nucleus) {
+        return;
+    }
+    // the largest and the floor as SAMPLE_SUM counted the chunks by
+    let head = parts[0];
+    let best = bitcast<f32>(head.x);
+    let lowest = bitcast<f32>(head.y);
+    let inverse = 1.0 / settings.temperature;
+    // where this chunk's go: after the tokens over the floor of the chunks before it
+    var before = 0.0;
+    for (var j = t; j < wid.x; j += WG_SIZE) {
+        before += f32(counted(j).x);
+    }
+    let offset = u32(sum_all(before, t));
+    let begin = wid.x * CHUNK;
+    let end = min(begin + CHUNK, settings.vocab);
+    let first = min(begin + t * EACH, end);
+    let last = min(first + EACH, end);
+    var kept = 0u;
+    for (var i = first; i < last; i++) {
+        if (logits[i] >= lowest) {
+            kept++;
+        }
+    }
+    var into = offset + u32(scan(f32(kept), t).x);
+    for (var i = first; i < last; i++) {
+        let v = logits[i];
+        if (v >= lowest) {
+            order[into] = i;
+            probs[into] = exp((v - best) * inverse);
+            into++;
+        }
+    }
+}`;
+export const SAMPLE_PICK = /* wgsl */ `
+@group(0) @binding(1) var<storage, read> probs: array<f32>;
+@group(0) @binding(2) var<storage, read> order: array<u32>;
+@group(0) @binding(3) var<storage, read_write> state: State;
+@group(0) @binding(4) var<storage, read_write> chosen: array<u32>;
+@group(0) @binding(5) var<storage, read> randoms: array<f32>;
+@group(0) @binding(6) var<uniform> settings: Sampling;
+@group(0) @binding(7) var<storage, read> parts: array<vec2<u32>>;
+${CHUNKS_COMMON}
+${SAMPLER_DRAW}
+var<workgroup> found_chunk: atomic<u32>;
+var<workgroup> chunk_before: f32;
+
+@compute @workgroup_size(WG_SIZE)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    if (t == 0u) {
+        atomicStore(&found, NONE);
+        atomicStore(&found_chunk, NONE);
+    }
+    if (stopped(t)) {
+        return;
+    }
+    let vocab = settings.vocab;
+    let chunks = (vocab + CHUNK - 1u) / CHUNK;
+    let argmax = largest(t).at;
+    if (settings.temperature == 0.0) {
+        if (t == 0u) {
+            finish(argmax);
+        }
+        return;
+    }
+    let nucleus = settings.topp > 0.0 && settings.topp < 1.0;
+    let r = min(randoms[state.sampled], BELOW_ONE);
+
+    if (!nucleus) {
+        // the draw in the order of the index: the chunk whose running sum passes r × total (a run of consecutive
+        // chunks a thread, their sums scanned), then the token in it whose does, else the last
+        let run = (chunks + WG_SIZE - 1u) / WG_SIZE;
+        let lo_chunk = min(t * run, chunks);
+        let hi_chunk = min(lo_chunk + run, chunks);
+        var own = 0.0;
+        for (var j = lo_chunk; j < hi_chunk; j++) {
+            own += bitcast<f32>(counted(j).y);
+        }
+        let sums = scan(own, t);
+        let goal = r * sums.y;
+        var running = sums.x;
+        for (var j = lo_chunk; j < hi_chunk; j++) {
+            running += bitcast<f32>(counted(j).y);
+            if (running > goal) {
+                atomicMin(&found_chunk, j);
+                break;
+            }
+        }
+        workgroupBarrier();
+        if (t == 0u) {
+            uniform_word = atomicLoad(&found_chunk);
+        }
+        let c = workgroupUniformLoad(&uniform_word);
+        if (c == NONE) {
+            if (t == 0u) {
+                finish(vocab - 1u);
+            }
+            return;
+        }
+        // the sum of the chunks before it, from the thread whose run holds it
+        if (c >= lo_chunk && c < hi_chunk) {
+            var prefix = sums.x;
+            for (var j = lo_chunk; j < c; j++) {
+                prefix += bitcast<f32>(counted(j).y);
+            }
+            chunk_before = prefix;
+        }
+        let prefix = workgroupUniformLoad(&chunk_before);
+        let begin = c * CHUNK;
+        let end = min(begin + CHUNK, vocab);
+        let first = min(begin + t * EACH, end);
+        let last = min(first + EACH, end);
+        var mine = 0.0;
+        for (var i = first; i < last; i++) {
+            mine += probs[i];
+        }
+        var inside = prefix + scan(mine, t).x;
+        for (var i = first; i < last; i++) {
+            inside += probs[i];
+            if (inside > goal) {
+                atomicMin(&found, i);
+                break;
+            }
+        }
+        workgroupBarrier();
+        if (t == 0u) {
+            let hit = atomicLoad(&found);
+            finish(select(hit, end - 1u, hit == NONE));
+        }
+        return;
+    }
+
+    // how many tokens the chunks gathered over the floor, and their mass
+    var kept = 0.0;
+    var mass = 0.0;
+    for (var j = t; j < chunks; j += WG_SIZE) {
+        let part = counted(j);
+        kept += f32(part.x);
+        mass += bitcast<f32>(part.y);
+    }
+    let count = u32(sum_all(kept, t));
+    draw_nucleus(count, sum_all(mass, t), r, argmax, t);
+}`;
+/** The sampling in chunks (T191): its four stages in order, each with the bindings it takes (of SAMPLE's numbers and
+ * 7 the partial results) and whether it runs a workgroup a chunk (else one workgroup) */
+export const SAMPLER_STAGES = [
+  { name: "max", code: SAMPLE_MAX, bindings: [0, 3, 6, 7], chunks: true },
+  { name: "sum", code: SAMPLE_SUM, bindings: [0, 1, 3, 6, 7], chunks: true },
+  { name: "gather", code: SAMPLE_GATHER, bindings: [0, 1, 2, 3, 6, 7], chunks: true },
+  { name: "pick", code: SAMPLE_PICK, bindings: [1, 2, 3, 4, 5, 6, 7], chunks: false },
+];
 
 // The CPU's sampling in JavaScript (kernels/kernel.ts's penalize() and sample(), as the engine's generate() calls
 // them): what SAMPLE is held to (/benchmark/'s check), and itself held to the kernel (tests/smoke.mjs). logits: a

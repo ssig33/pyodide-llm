@@ -17,7 +17,9 @@
 //                                         T175: the same on ORT's DP4A for small M (fusedDp4aMatVec), its vector
 //                                         quantized before each matrix
 //   { step: "generate" }                  T151: tokens generated on the GPU (the sampling too), each read back as it
-//                                         comes against 4, 8 and 16 a submission read back once, ms a token
+//                                         comes against 4, 8 and 16 a submission read back once, ms a token; T191:
+//                                         each also with the sampling in chunks (many workgroups), and the sampling
+//                                         alone both ways
 //   { step: "overhead" }                  what a token costs besides the weights: 240 empty dispatches, a submission
 //                                         with and without waiting for it, reading back 4 bytes and all the logits
 //   { step: "prompt", counts }            the tokens of a prompt through the matrices all at once (matrix × matrix,
@@ -347,6 +349,7 @@ async function check() {
   verdicts.argmax = await checkArgmax();
   Object.assign(verdicts, await checkLayer());
   verdicts.sampling = await checkSampling();
+  verdicts["sampling in chunks"] = await checkSampling("chunks");
   Object.assign(verdicts, await checkGeneration());
   return verdicts;
 }
@@ -1268,11 +1271,34 @@ async function generationPipes(headSize, form) {
   if (flash.none) throw new Error(flash.none);
   const pipes = {};
   const classifier = form.dp4a ? WGSL.fusedDp4aMatVec({ output: "write" }) : WGSL.fusedMatVec({ input: "norm", output: "write", subgroups: false });
-  for (const [key, code] of [["embed", WGSL.EMBED], ["sample", WGSL.SAMPLE], ["flash", WGSL.flashTile(flash)], ...layerCodes(form), ["classifier", classifier]]) {
+  for (const [key, code] of [["embed", WGSL.EMBED], ["flash", WGSL.flashTile(flash)], ...layerCodes(form), ["classifier", classifier]]) {
     pipes[key] = await compiled(code);
     postMessage({ alive: true });
   }
+  pipes.sampler = await samplerPipes();
   return pipes;
+}
+// T191: the two ways of sampling a token on the GPU, measured side by side: SAMPLE's one workgroup (T151) and the
+// sampling in chunks of the vocabulary (shaders.js's SAMPLER_STAGES, a workgroup a chunk)
+const SAMPLERS = ["one", "chunks"];
+async function samplerPipes() {
+  const pipes = { one: await compiled(WGSL.SAMPLE), chunks: [] };
+  postMessage({ alive: true });
+  for (const stage of WGSL.SAMPLER_STAGES) {
+    pipes.chunks.push({ ...stage, pipeline: await compiled(stage.code) });
+    postMessage({ alive: true });
+  }
+  return pipes;
+}
+// a sampler's dispatches, [pipeline, bind group, x, y] each: b holds the buffers by SAMPLE's binding numbers (0 the
+// logits, 1 probs, 2 order, 3 the state, 4 chosen, 5 the random numbers, 6 the settings) and 7 the chunks' partial
+// results (WGSL.samplePartsBytes of the vocabulary)
+function samplerDispatches(kind, pipes, b, vocab) {
+  const group = (pipeline, bindings) => device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+    entries: bindings.map((binding) => ({ binding, resource: { buffer: b[binding] } })) });
+  if (kind === "one") return [[pipes.one, group(pipes.one, [0, 1, 2, 3, 4, 5, 6]), 1, 1]];
+  const chunks = WGSL.sampleChunks(vocab);
+  return pipes.chunks.map((stage) => [stage.pipeline, group(stage.pipeline, stage.bindings), stage.chunks ? chunks : 1, 1]);
 }
 // A model on the GPU for a run of tokens: its layers (T150's four matrices each, the cache of its own), the norms
 // (two a layer, then the final one), the classifier (the embedding too: tied, as Llama 3.2 1B's), RoPE's table of
@@ -1323,7 +1349,7 @@ function generationParts(model, form, pipes, positions, owned, data) {
   const sizes = [...[...Array(layers)].flatMap(() => [dim, dim, dim, hidden]), dim];
   const quantizedAll = kept ? sizes.map(pair) : Array(sizes.length).fill(pair(Math.max(dim, hidden)));
   const v = { h: make(dim * 4), q: make(dim * 4), att: make(dim * 4), g: make(hidden * 4), logits: make(vocab * 4),
-    probs: make(vocab * 4), order: make(vocab * 4), norms: make((2 * layers + 1) * dim * 4), angles: make(positions * headSize * 4),
+    probs: make(vocab * 4), order: make(vocab * 4), parts: make(WGSL.samplePartsBytes(vocab)), norms: make((2 * layers + 1) * dim * 4), angles: make(positions * headSize * 4),
     state: make(WGSL.STATE_BYTES), chosen: make(Math.max(positions, 4) * 4), randoms: make(positions * 4),
     step: make(16, UNIFORM | COPY_DST), settings: make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST) };
   device.queue.writeBuffer(v.norms, 0, data?.norms ?? new Float32Array((2 * layers + 1) * dim).map(() => 0.5 + Math.random()));
@@ -1365,8 +1391,11 @@ function generationParts(model, form, pipes, positions, owned, data) {
   } else {
     dispatches.push([pipes.classifier, group(pipes.classifier, [[0, classifier.w], [1, classifier.s], [2, v.h], [3, u.classifier], [4, v.norms], [5, v.logits]]), across, Math.ceil(rows / across)]);
   }
-  dispatches.push(
-    [pipes.sample, group(pipes.sample, [[0, v.logits], [1, v.probs], [2, v.order], [3, v.state], [4, v.chosen], [5, v.randoms], [6, v.settings]]), 1, 1]);
+  // the token's sampling: SAMPLE's one workgroup, or in chunks (T191), as use() says
+  const samplerBuffers = { 0: v.logits, 1: v.probs, 2: v.order, 3: v.state, 4: v.chosen, 5: v.randoms, 6: v.settings, 7: v.parts };
+  const samplers = Object.fromEntries(SAMPLERS.map((kind) => [kind, samplerDispatches(kind, pipes.sampler, samplerBuffers, vocab)]));
+  let sampling = samplers.one;
+  const use = (kind) => (sampling = samplers[kind]);
   // the check's record of the quantized vectors: a token's are perToken bytes, each xq then its xs
   const perToken = kept ? quantizedAll.reduce((sum, { n }) => sum + n + (n / GROUP) * 4, 0) : 0;
   const record = kept ? make(positions * perToken) : undefined;
@@ -1374,6 +1403,7 @@ function generationParts(model, form, pipes, positions, owned, data) {
   const encode = (encoder) => {
     const pass = encoder.beginComputePass();
     dispatches.forEach((d) => run(pass, d));
+    sampling.forEach((d) => run(pass, d));
     pass.end();
     // the Step of the next token: the state's first four words (a uniform is not a shader's to write)
     encoder.copyBufferToBuffer(v.state, 0, v.step, 0, 16);
@@ -1405,7 +1435,8 @@ function generationParts(model, form, pipes, positions, owned, data) {
     if (settings) device.queue.writeBuffer(v.settings, 0, settings);
   };
   const bytes = layers * Object.values(shape.matrices).reduce((sum, matrix) => sum + matrixBytes(matrix), 0) + matrixBytes([vocab, dim]);
-  return { vectors: v, encode, reset, dispatches: dispatches.length, bytes, ...(record ? { record, recording: positions * perToken, recorded } : {}) };
+  return { vectors: v, encode, reset, use, dispatches: dispatches.length + samplers.one.length, chunkDispatches: dispatches.length + samplers.chunks.length,
+    bytes, ...(record ? { record, recording: positions * perToken, recorded } : {}) };
 }
 // what submitting the tokens of a run and reading back their ids and the state costs: count tokens, per of them a
 // submission (each read back before the next is submitted, as a token's text is shown), from the state given. Returns
@@ -1450,38 +1481,48 @@ async function generate() {
     const targets = new Map(counts.map((per) => [per, buffer(per * 4 + WGSL.STATE_BYTES, MAP_READ | COPY_DST)]));
     owned.push(...targets.values());
     postMessage({ alive: true });
-    // the ms of a run of `tokens` from the start, per of them a submission
-    const timed = async (per) => {
+    // the ms of a run of `tokens` from the start, per of them a submission, sampled the sampler's way (T191)
+    const timed = async (per, kind) => {
+      parts.use(kind);
       parts.reset(start);
       return (await generationRun(parts, tokens, per, targets.get(per))).ms;
     };
-    // the work of a token without the reading back: n tokens in one submission against 2n (paired(): T168's)
-    let work;
+    // the work of a token without the reading back: n tokens in one submission against 2n (T168's), each sampler's,
+    // the samplers in turn (interleaved(): T150's review)
+    const works = {};
     if (!fallback) {
-      const r = await paired(async (n) => {
+      const found = await interleaved(SAMPLERS.map((kind) => async (n) => {
+        parts.use(kind);
         parts.reset(start);
         return (await generationRun(parts, n, n)).ms;
-      }, GENERATE_MOST);
-      work = { ms: r.ms / r.dispatches, tokens: r.dispatches, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
+      }), GENERATE_MOST);
+      SAMPLERS.forEach((kind, k) => {
+        const r = found[k];
+        if (!r.error) works[kind] = { ms: r.ms / r.dispatches, tokens: r.dispatches, ratio: r.ratio, ...(r.unsteady ? { unsteady: true } : {}) };
+      });
     }
     postMessage({ alive: true });
-    // the forms in turn (T150's review), each a run of `tokens`, after one run each to warm up
-    const rounds = fallback ? 1 : GENERATE_ROUNDS, times = counts.map(() => []);
-    if (!fallback) for (const per of counts) await timed(per);
+    // the forms and the samplers in turn (T150's review), each a run of `tokens`, after one run each to warm up
+    const rounds = fallback ? 1 : GENERATE_ROUNDS, times = SAMPLERS.map(() => counts.map(() => []));
+    if (!fallback) for (const per of counts) for (const kind of SAMPLERS) await timed(per, kind);
     for (let round = 0; round < rounds; round++) {
-      for (let i = 0; i < counts.length; i++) times[i].push(await timed(counts[i]));
+      for (let i = 0; i < counts.length; i++) {
+        for (let k = 0; k < SAMPLERS.length; k++) times[k][i].push(await timed(counts[i], SAMPLERS[k]));
+      }
       postMessage({ alive: true });
     }
+    const work = works.one;
     const rows = counts.map((per, i) => {
-      const msPerToken = middle(times[i]) / tokens;
+      const msPerToken = middle(times[0][i]) / tokens;
       // what a submission costs besides its tokens' work: the submission, the wait and the ids read back
       const fixed = work && !work.unsteady ? msPerToken * per - work.ms * per : undefined;
-      return { perSubmission: per, msPerToken, ...(fixed === undefined ? {} : { fixedMs: fixed }) };
+      return { perSubmission: per, msPerToken, ...(fixed === undefined ? {} : { fixedMs: fixed }), chunks: middle(times[1][i]) / tokens };
     });
     // the sampling alone, on Llama 3's vocabulary: logits as a model's, and flat ones (every token over the floor)
     const sampling = fallback ? undefined : await samplingAlone();
     return { model: fallback ? "the check's small model" : "Llama 3.2 1B's width", layer: form.name, layers: model.layers, vocab: model.vocab,
-      GB: parts.bytes / 1e9, dispatches: parts.dispatches, tokens, settings: GENERATE_SETTINGS, work, rows, sampling };
+      GB: parts.bytes / 1e9, dispatches: parts.dispatches, chunkDispatches: parts.chunkDispatches, tokens, settings: GENERATE_SETTINGS, work,
+      ...(works.chunks ? { chunkWork: works.chunks } : {}), rows, sampling };
   });
 }
 // the sampling alone (paired(): T168's n and 2n) on Llama 3's vocabulary, twice: on logits as a model's (madeUpLogits:
@@ -1491,32 +1532,35 @@ async function generate() {
 async function samplingAlone() {
   const vocab = MODELS["Llama 3.2 1B"].vocab, positions = 2 * GENERATE_MOST + 2;
   return scoped(async (owned) => {
-    const sample = await compiled(WGSL.SAMPLE);
+    const pipes = await samplerPipes();
     const make = (bytes, usage = STORAGE | COPY_DST) => {
       const b = buffer(bytes, usage);
       owned.push(b);
       return b;
     };
     const logits = make(vocab * 4), probs = make(vocab * 4), order = make(vocab * 4), state = make(WGSL.STATE_BYTES),
-      chosen = make(positions * 4), randoms = make(positions * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST);
+      chosen = make(positions * 4), randoms = make(positions * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST),
+      parts = make(WGSL.samplePartsBytes(vocab));
     device.queue.writeBuffer(randoms, 0, randomsOf(positions));
     device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab, ...GENERATE_SETTINGS }));
     const history = [...Array(64)].map(() => (Math.random() * vocab) | 0), start = WGSL.samplingState({ token: history[63], pos: 0, history });
-    const group = device.createBindGroup({ layout: sample.getBindGroupLayout(0),
-      entries: [logits, probs, order, state, chosen, randoms, settings].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+    const b = { 0: logits, 1: probs, 2: order, 3: state, 4: chosen, 5: randoms, 6: settings, 7: parts };
+    // T191: SAMPLE's one workgroup and the sampling in chunks, in turn (interleaved(): T150's review)
+    const lists = SAMPLERS.map((kind) => samplerDispatches(kind, pipes, b, vocab));
     const timed = async (values) => {
       device.queue.writeBuffer(logits, 0, values);
-      const r = await paired(async (n) => {
+      const found = await interleaved(lists.map((list) => async (n) => {
         device.queue.writeBuffer(state, 0, start);
         const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-        for (let i = 0; i < n; i++) run(pass, [sample, group, 1, 1]);
+        for (let i = 0; i < n; i++) list.forEach((d) => run(pass, d));
         pass.end();
         const began = performance.now();
         device.queue.submit([encoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         return performance.now() - began;
-      }, GENERATE_MOST);
-      return { msEach: r.ms / r.dispatches, over: overTheFloor(values, GENERATE_SETTINGS.temperature), ...(r.unsteady ? { unsteady: true } : {}) };
+      }), GENERATE_MOST);
+      const [one, chunks] = found.map((r) => (r.error ? { error: r.error } : { msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) }));
+      return { ...one, over: overTheFloor(values, GENERATE_SETTINGS.temperature), chunks };
     };
     const peaked = await timed(madeUpLogits(vocab, 2)), flat = await timed(madeUpLogits(vocab, 1, 0));
     return { vocab, ...peaked, flat };
@@ -1535,14 +1579,17 @@ function overTheFloor(logits, temperature) {
 // first index, 100, is the most likely), a run of 20 at TIED_RUN (a fifth of the top's probability each at temperature
 // 0.7, their indices descending as written so the order of the index is not the order written), and a tail of 200
 // distinct values below (a fiftieth each, rising by the index) that a nucleus of top-p 0.9 reaches into: no equal
-// logits at its border, where SAMPLE takes every equal token and the CPU's sort takes some (a different mass)
+// logits at its border, where SAMPLE takes every equal token and the CPU's sort takes some (a different mass).
+// T191: past one chunk of the sampling in chunks (WGSL.SAMPLE_CHUNK), the same spread over the chunks: the second of the
+// top at 64000, the run at multiples of 3000 (from 60000 down), the tail at odd indices from 1001 (so that the order
+// of equal ones and of the nucleus crosses the chunks)
 const TIED_RUN = Math.fround(8.87);
 function tiedLogits(vocab) {
-  const logits = new Float32Array(vocab);
-  logits[700] = 10;
+  const logits = new Float32Array(vocab), wide = vocab > 64 * WGSL.SAMPLE_CHUNK;
+  logits[wide ? 64000 : 700] = 10;
   logits[100] = 10;
-  for (let i = 0; i < 20; i++) logits[900 - 3 * i] = TIED_RUN;
-  for (let i = 0; i < 200; i++) logits[200 + i] = 7.26 + i * 1e-3;
+  for (let i = 0; i < 20; i++) logits[wide ? 60000 - 3000 * i : 900 - 3 * i] = TIED_RUN;
+  for (let i = 0; i < 200; i++) logits[wide ? 1001 + 618 * i : 200 + i] = 7.26 + i * 1e-3;
   return logits;
 }
 // logits as a model's look (a few tokens far above the rest), made up: a normal spread and `peaks` tokens 8 to 14 over it
@@ -1590,9 +1637,8 @@ function acceptable(logits, { temperature, topp }, random, band = 0) {
 // the index, as SAMPLE takes them and walkLikeCpu walks them). Then runs of four tokens in one submission (the i-th
 // random number for the i-th token, the logits penalized again each time as the CPU's would be), and a run with a stop
 // token: it is written, the state stops and nothing after it changes.
-async function checkSampling() {
-  const pipeline = await compiled(WGSL.SAMPLE);
-  postMessage({ alive: true });
+async function checkSampling(kind = "one") {
+  const pipes = await samplerPipes();
   const cases = [];
   for (const vocab of [1003, 128256]) {
     // (a fallback adapter takes a second or so for each of the big vocabulary's: one spread there)
@@ -1608,9 +1654,12 @@ async function checkSampling() {
   for (const spread of [0.5, 2, 6]) for (let i = 0; i < 3; i++) cases.push({ vocab: 1003, spread, topp: 0.9, temperature: 0.7, penalty: 1.3, random: Math.random(), short: true });
   // equal logits (tiedLogits): the draw on the first of the two at the top, on the fifth of the run of 20, and the most
   // likely token (temperature 0)
-  cases.push({ vocab: 1003, topp: 0.9, temperature: 0.7, penalty: 1, random: 0.05, ties: true });
-  cases.push({ vocab: 1003, topp: 0.9, temperature: 0.7, penalty: 1, random: "fifth", ties: true });
-  cases.push({ vocab: 1003, topp: 0.9, temperature: 0, penalty: 1, random: 0.3, ties: true });
+  // (and over Llama 3's vocabulary, where they cross the chunks of the sampling in chunks: T191)
+  for (const vocab of [1003, 128256]) {
+    cases.push({ vocab, topp: 0.9, temperature: 0.7, penalty: 1, random: 0.05, ties: true });
+    cases.push({ vocab, topp: 0.9, temperature: 0.7, penalty: 1, random: "fifth", ties: true });
+    cases.push({ vocab, topp: 0.9, temperature: 0, penalty: 1, random: 0.3, ties: true });
+  }
   const most = 128256, owned = [];
   let wrong = 0, edge = 0, checked = 0;
   const problems = [];
@@ -1622,9 +1671,12 @@ async function checkSampling() {
         return b;
       };
       const logitsBuffer = make(most * 4), probs = make(most * 4), order = make(most * 4), state = make(WGSL.STATE_BYTES),
-        chosen = make(16 * 4), randoms = make(16 * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST);
-      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
-        entries: [logitsBuffer, probs, order, state, chosen, randoms, settings].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+        chosen = make(16 * 4), randoms = make(16 * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST),
+        parts = make(WGSL.samplePartsBytes(most));
+      const b = { 0: logitsBuffer, 1: probs, 2: order, 3: state, 4: chosen, 5: randoms, 6: settings, 7: parts };
+      // the sampler's dispatches for a vocabulary (the chunks' count is the vocabulary's)
+      const lists = new Map();
+      const listOf = (vocab) => lists.get(vocab) ?? lists.set(vocab, samplerDispatches(kind, pipes, b, vocab)).get(vocab);
       const back = make(16 * 4 + WGSL.STATE_BYTES, MAP_READ | COPY_DST);
       // steps SAMPLE dispatches in one submission, from the case's history; the ids and the state back
       const sampled = async (c, logits, history, draws, steps, stops = []) => {
@@ -1634,7 +1686,8 @@ async function checkSampling() {
         device.queue.writeBuffer(randoms, 0, new Float32Array(draws));
         device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab: c.vocab, temperature: c.temperature, topp: c.topp, penalty: c.penalty, stops }));
         const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-        for (let i = 0; i < steps; i++) run(pass, [pipeline, group, 1, 1]);
+        const list = listOf(c.vocab);
+        for (let i = 0; i < steps; i++) list.forEach((d) => run(pass, d));
         pass.end();
         encoder.copyBufferToBuffer(chosen, 0, back, 0, 16 * 4);
         encoder.copyBufferToBuffer(state, 0, back, 16 * 4, WGSL.STATE_BYTES);

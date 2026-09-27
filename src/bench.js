@@ -417,9 +417,11 @@ export function layerTable(step, check, ceilings, gpu = {}) {
 /**
  * T151: the GPU section's table of tokens generated on the GPU (public/shaders.js's EMBED, fusedMatVec and SAMPLE: the
  * sampling on the GPU too, the state carried from token to token there). step: {name, result: {model, layers, vocab,
- * GB, dispatches, tokens, settings, work: {ms, unsteady}, rows: [{perSubmission, msPerToken, fixedMs}], sampling:
- * {vocab, msEach, over, unsteady, flat: {msEach, over, unsteady}}}} or {name, error}; check: the shaders against
- * JavaScript ("sampling" and "tokens on the GPU"); gpu: { fallback, lost }. A row a way of submitting: one token a submission, each read back as it comes, and
+ * GB, dispatches, chunkDispatches, tokens, settings, work: {ms, unsteady}, chunkWork, rows: [{perSubmission, msPerToken,
+ * fixedMs, chunks}], sampling: {vocab, msEach, over, unsteady, chunks: {msEach, unsteady} or {error}, flat: {msEach,
+ * over, unsteady, chunks}}}} or {name, error}; check: the shaders against JavaScript ("sampling", "sampling in chunks"
+ * and "tokens on the GPU"); gpu: { fallback, lost }. T191: each row also the ms a token with the sampling in chunks
+ * (shaders.js's SAMPLER_STAGES, many workgroups) where the rest is SAMPLE's one workgroup. A row a way of submitting: one token a submission, each read back as it comes, and
  * several in one submission, read back once. "A submission besides its tokens" (F) is what a submission costs past its
  * tokens' work (the wait and the reading back: a row's ms a token times its tokens, less a token's work, the
  * difference of 2n tokens in one submission and n), "of it a token" F over the row's tokens (what is left of F a
@@ -433,28 +435,36 @@ export function generateTable(step, check, gpu = {}) {
   if (step.error || !step.result) return [`**Tokens generated on the GPU**: ${tableCell(step.error ?? "not measured")}`];
   const r = step.result, none = noRatios(gpu);
   const wrong = ["sampling", "tokens on the GPU"].some((key) => check?.[key] && !check[key].ok);
+  const chunksWrong = check?.["sampling in chunks"] && !check["sampling in chunks"].ok;
   const derived = !none && !wrong;
   const one = r.rows.find((row) => row.perSubmission === 1);
   // a submission's cost besides its tokens, or its share a token (what N tokens a submission leave of it: F / N)
   const fixed = (row, ms) => (derived && Number.isFinite(ms) ? (ms < 0 ? "under the noise" : number(ms, 2)) : "");
   const s = r.settings ?? {};
   return [`**Tokens generated on the GPU** (${tableCell(r.model)}: ${r.layers} layers, a vocabulary of ${r.vocab}, ${number(r.GB, 2)} GB of weights a token; ` +
-    `a token is ${r.dispatches} dispatches: its row of the embedding, the layers as ${r.layer ? `the layer table's "${tableCell(r.layer)}"` : "T150's fused"}, the classifier, and the sampling on the GPU, ` +
+    `a token is ${r.dispatches} dispatches: its row of the embedding, the layers as ${r.layer ? `the layer table's "${tableCell(r.layer)}"` : "T150's fused"}, the classifier, and the sampling on the GPU in one workgroup (T151), ` +
     `penalty ${s.penalty}, temperature ${s.temperature}, top-p ${s.topp}). The same ${r.tokens} tokens each way, the ways in turn; ` +
     "a token's work alone is a submission of 2n tokens less one of n. A submission besides its tokens: what it costs past their work (submitting, waiting, reading the ids back)." +
-    `${wrong ? " The check found the sampling on the GPU WRONG." : ""}`,
+    " With the sampling in chunks: the same tokens sampled by a workgroup a chunk of the vocabulary" +
+    `${r.chunkDispatches ? ` (${r.chunkDispatches} dispatches a token)` : ""}, the ways and the samplers in turn (T191).` +
+    `${wrong ? " The check found the sampling on the GPU WRONG." : ""}${chunksWrong ? " The check found the sampling in chunks WRONG." : ""}`,
     ...(none ? [`Besides its tokens and faster: ${none}.`] : []), "",
-    "| tokens a submission | GPU ms a token | a submission besides its tokens, ms | of it a token, ms | faster than one a submission |", "|---|---:|---:|---:|---:|",
+    "| tokens a submission | GPU ms a token | with the sampling in chunks, ms | a submission besides its tokens, ms | of it a token, ms | faster than one a submission |",
+    "|---|---:|---:|---:|---:|---:|",
     ...r.rows.map((row) => `| ${row.perSubmission === 1 ? "1, each read back as it comes" : `${row.perSubmission}, read back once`}${wrong ? " (WRONG in the check)" : ""} | ` +
-      `${number(row.msPerToken, 2)} | ${fixed(row, row.fixedMs)} | ${fixed(row, row.fixedMs / row.perSubmission)} | ` +
+      `${number(row.msPerToken, 2)} | ${Number.isFinite(row.chunks) ? `${number(row.chunks, 2)}${chunksWrong ? " (WRONG in the check)" : ""}` : ""} | ` +
+      `${fixed(row, row.fixedMs)} | ${fixed(row, row.fixedMs / row.perSubmission)} | ` +
       `${derived && row !== one && one ? times(one.msPerToken / row.msPerToken) : ""} |`),
-    "", `A token's work: ${r.work ? `${r.work.unsteady ? "unsteady: " : ""}${number(r.work.ms, 2)} ms` : "not measured here"}; ` +
+    "", `A token's work: ${r.work ? `${r.work.unsteady ? "unsteady: " : ""}${number(r.work.ms, 2)} ms` : "not measured here"}` +
+    `${r.chunkWork ? ` (with the sampling in chunks ${r.chunkWork.unsteady ? "unsteady: " : ""}${number(r.chunkWork.ms, 2)} ms)` : ""}; ` +
     `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens): ${r.sampling ? samplingCell(r.sampling) : "not measured here"}` +
     `${r.sampling?.flat ? `; on flat logits, ${samplingCell(r.sampling.flat)}` : ""}.`];
 }
 // the ms of the sampling alone, with how many tokens were over the nucleus's floor (what SAMPLE gathers and reads each
-// round of its searches: T151)
-const samplingCell = (s) => `${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}`;
+// round of its searches: T151), in one workgroup and (T191) in chunks
+const samplingCell = (s) => `${s.chunks ? "one workgroup " : ""}${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms` +
+  `${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}` +
+  `${s.chunks ? `, in chunks ${s.chunks.error ? `failed: ${tableCell(s.chunks.error)}` : `${s.chunks.unsteady ? "unsteady: " : ""}${number(s.chunks.msEach, 3)} ms`}` : ""}`;
 
 /** T93: where the model page remembers the number of threads it found for a model on this device (localStorage).
  * T190: /benchmark/ reads the same, so that the page path is timed on the model page's count. nav: the navigator */
