@@ -11,10 +11,12 @@
 #
 #   gh workflow run gguf.yml -f candidates="hf-tinyllama-1.1b-chat=TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF@<commit>/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
 #
-# T145: every GGUF the list takes, again (the nine above with only empty, and the 19 of stage 2 with listed, each against
+# T145: every GGUF the list takes, again (the nine above with only=all, and the 19 of stage 2 with listed, each against
 # the original of its vocabulary), for the tighter line of gguf_check.py (a GGUF past it: the old line stays):
 #
-#   gh workflow run gguf.yml -f only= -f listed=true
+#   gh workflow run gguf.yml -f only=all -f listed=true
+#
+# (T192: an empty only is not "all": the dispatch left empty takes the default, and only the 3B and the 7B ran)
 #
 # What comes from an input or the matrix reaches the shell through env, never written into run: (T145: a candidate
 # of "$(...)" in its file name would have run).
@@ -24,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'the model ids to check, separated by commas; all eight when empty'
+        description: 'the model ids to check, separated by commas; all nine with all'
         default: 'hf-qwen2.5-3b-instruct,hf-qwen2.5-7b-instruct'
       candidates:
         description: 'stage 2: <id>=<repo>@<revision>/<file> of GGUFs not in the list yet, separated by spaces or commas'
@@ -57,13 +59,13 @@ jobs:
           - { id: hf-smollm2-135m-instruct, original: HuggingFaceTB/SmolLM2-135M-Instruct@12fd25f77366fa6b3b4b768ec3050bf629380bac, gguf: bartowski/SmolLM2-135M-Instruct-GGUF@09816acd5d99df7be770d85ea30822623dab342c/SmolLM2-135M-Instruct-Q8_0.gguf }
     steps:
       - name: Checkout
-        if: inputs.only == '' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
+        if: inputs.only == 'all' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
         uses: actions/checkout@v7
 
       # the matrix cannot be chosen from an input: the jobs not asked for skip their steps. /mnt has the room (the
       # 7B's originals and its GGUF are 23 GB; / has about 14 GB free)
       - name: Fetch the original and the GGUF, and check
-        if: inputs.only == '' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
+        if: inputs.only == 'all' || contains(format(',{0},', inputs.only), format(',{0},', matrix.id))
         shell: bash
         env:
           ID: ${{ matrix.id }}
