@@ -683,6 +683,16 @@ function sortNucleus(probs: usize, index: usize, lo: i32, hi: i32): void {
   intoNucleus(probs, lo, hi);
 }
 
+// Writes value and token at probs[count] and index[count], and counts them when past is 1: a list that keeps some of
+// a sequence in its order without a branch on each (T189: whether a token stays is not predictable). count must be
+// at most the position read from, so that nothing not yet read is written over
+// @ts-ignore: decorator
+@inline function kept(probs: usize, index: usize, count: i32, value: f32, token: i32, past: i32): i32 {
+  store<f32>(probs + (<usize>count << 2), value);
+  store<i32>(index + (<usize>count << 2), token);
+  return count + past;
+}
+
 // Draws a token from softmax(logits / temperature), restricted to the nucleus when 0 < topp < 1.
 // random: one number in [0, 1) from Python's generator, so that a seed reproduces. probs and index: scratch of n each.
 export function sample(logits: usize, n: i32, temperature: f32, topp: f32, random: f64, probs: usize, index: usize): i32 {
@@ -698,14 +708,23 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
   // With a nucleus, tokens less than a ten millionth as probable as the best one cannot matter (ln 1e-7 = -16.118):
   // they are left out before exp(), which is the expensive part
   const floor: f32 = nucleus ? best - temperature * <f32>16.118095 : -f32.MAX_VALUE;
+  // T189: four at a time. Four that all stay below the floor (most of the vocabulary) cost one comparison; of the
+  // others each is written and only those past the floor are counted, in their order, without a branch each
+  const floors = f32x4.splat(floor), shift = f32x4.splat(best);
   let count = 0;
-  for (i = 0; i < n; i++) {
+  for (i = 0; i + 4 <= n; i += 4) {
+    const v = v128.load(logits + (<usize>i << 2));
+    const past = i32x4.bitmask(f32x4.ge(v, floors));
+    if (past == 0) continue;
+    const d = f32x4.sub(v, shift);
+    count = kept(probs, index, count, f32x4.extract_lane(d, 0), i, past & 1);
+    count = kept(probs, index, count, f32x4.extract_lane(d, 1), i + 1, (past >> 1) & 1);
+    count = kept(probs, index, count, f32x4.extract_lane(d, 2), i + 2, (past >> 2) & 1);
+    count = kept(probs, index, count, f32x4.extract_lane(d, 3), i + 3, past >> 3);
+  }
+  for (; i < n; i++) {
     const v = load<f32>(logits + (<usize>i << 2));
-    if (v >= floor) {
-      store<f32>(probs + (<usize>count << 2), v - best);
-      store<i32>(index + (<usize>count << 2), i);
-      count++;
-    }
+    count = kept(probs, index, count, v - best, i, <i32>(v >= floor));
   }
   const inverse = f32x4.splat(<f32>1.0 / temperature);
   for (i = 0; i + 4 <= count; i += 4) {
@@ -733,11 +752,7 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
     let likely = 0;
     for (let k = 0; k < count; k++) {
       const p = load<f32>(probs + (<usize>k << 2));
-      if (<f64>p >= cutoff) {
-        store<f32>(probs + (<usize>likely << 2), p);
-        store<i32>(index + (<usize>likely << 2), load<i32>(index + (<usize>k << 2)));
-        likely++;
-      }
+      likely = kept(probs, index, likely, p, load<i32>(index + (<usize>k << 2)), <i32>(<f64>p >= cutoff));
     }
     // the most probable tokens whose probabilities add up to topp
     nucleusMass = 0;

@@ -189,6 +189,16 @@ for spread in (0.5, 2.0, 6.0, 12.0):
 lonely = np.full(fast.vocab_size, -100.0, dtype=np.float32)
 lonely[123] = 50.0
 assert fast.sample(lonely, 0.7, 0.9, generator) == 123 and 0 <= fast.sample(np.zeros_like(lonely), 0.7, 0.9, generator) < lonely.size
+# T189: the kernel takes the logits four at a time; a vocabulary that is no multiple of 4 ends on the tail, where the
+# best token is put
+for size in (fast.vocab_size - 1, fast.vocab_size - 3):
+    for spread in (2.0, 12.0):
+        logits = (generator.standard_normal(size) * spread).astype(np.float32)
+        logits[-1] = logits.max() + 0.5
+        for topp in (0.9, 1.0):
+            for value in (0.0, generator.random(), 1.0 - 1e-12):
+                ours, theirs = fast.sample(logits, 0.7, topp, Fixed(value)), llama2_numpy.Llama.sample(fast, logits, 0.7, topp, Fixed(value))
+                assert ours == theirs or abs(logits[ours] - logits[theirs]) < 1e-3, (size, spread, topp, value, ours, theirs)
 # T178: a few tokens above the floor and a low top-p (count * topp < 1): llama2.c's cutoff (1 - topp) / (count - 1)
 # was above all of them, and the kernel drew a word from outside the vocabulary, NumPy an IndexError. The nucleus is
 # the most probable token alone (the others add up to less than 1 - topp)
