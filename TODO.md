@@ -963,6 +963,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - **やったこと（2026-09-27）**: `tests/fixed_outputs.py` の `MODELS` に rinna japanese-gpt2 small（`hf-japanese-gpt2-small`、454 MB）を足した。NeoX の small（663 MB）ではなく GPT-2 を選んだ訳: 小さい、`transformer.` の付く名前（GGUF の GPT-2 と openai-community/gpt2 は付かない）と Conv1D を流れのまま転置する読みは safetensors の GPT-2 にしか無い、rinna の NeoX は並列残差が偽で回すのは head 全体（Pythia の GGUF の固定値が並列残差と一部の回転を見ている）。壊し方を 1 つのモデルに当てる `--only=<id>` を足した（`--write` とは併せない）。
 - **固定した文**（CI の tests.yml の `extra=`、run 36337952177、float32、greedy の 16 トークン）: 「これからの流行りは」→「、おしゃれなデザインの服がたくさんあるので、 ファッション」。壊れた文ではないと読んだ（「、 ファッション」の空白は rinna の語彙の「▁ファッション」）。**人が読んでから `--write` の決まりなので、レビューで読んでほしい。** ほかの 5 つは同じ run で ok。
 - **わざと壊して（同じ run、`--only=hf-japanese-gpt2-small`）**: 4 つとも落ちた。`c_proj` を転置しない（「、お客層雲南房総半島先端技術の効果音程 ...」）、`c_attn` の q と k を入れ替える（「流行は流行は流行は…」）、q と k の bias を入れ替える（「いません。」）、並列残差にする（「、お肌の乾燥が気になる季節です。乾燥肌の人は、」: まともな文でも固定値と違うので落ちる）。
+- **固定した後の確かめ**（run 36338229848、tests.yml の `extra=`）: 6 つとも ok。
 - **CI で回すもの**: browsers.yml の huggingface の small（固定値の段は small のジョブだけ。取得が 454 MB 増える）。
 - 段 ③ で固定値（`tests/fixed_outputs.py`）の GPT-2 と NeoX が GGUF の道だけになり、safetensors の道（一覧では rinna の 3 つ）の固定値が無くなった。rinna の小さいもの 1 つ（japanese-gpt-neox-small か japanese-gpt2-small）を固定値に足す。わざと壊して（転置や並列残差を外す）落ちることを見る。
 
