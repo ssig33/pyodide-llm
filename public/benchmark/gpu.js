@@ -725,27 +725,38 @@ const layerShape = ({ dim, hidden, heads, kvHeads }) => {
 // the matrices with T150's writes, RMSNORM and QUANTIZE apart) and fused (nine: the norm with the quantizer,
 // NORM_QUANTIZE). Where a device has no packed int8 dot, those rows say so. llama.cpp's rows stay beside them.
 // base: whose matrix × vector; fused: the matrices with T150's writes (fusedMatVec, fusedDp4aMatVec); normApart: the
-// norms dispatches of their own. T150's llama.cpp form with the norms apart is gone (the owner's Android: 0.93× the
-// separate steps, T150): the DP4A one stands for what folding the norm saves.
+// norms dispatches of their own. T150's llama.cpp form with the norms apart runs only where DP4A cannot (withoutDp4a:
+// T175's review): there it is the layer a device without the packed int8 dot chooses from (the owner's Android on
+// llama.cpp's matrix: separate 9.27 ms, the norms apart 9.92, fused 10.61, T150); elsewhere the DP4A one stands for what
+// folding the norm saves.
 const LAYER_KINDS = [{ name: "llama.cpp, separate steps", base: "llama.cpp", fused: false },
+  { name: "llama.cpp, fused (T150), the norms apart", base: "llama.cpp", fused: true, normApart: true, withoutDp4a: true },
   { name: "llama.cpp, fused (T150)", base: "llama.cpp", fused: true },
   { name: "DP4A, separate steps", base: "DP4A", dp4a: true, fused: false },
   { name: "DP4A, fused (T175), the norms apart", base: "DP4A", dp4a: true, fused: true, normApart: true },
   { name: "DP4A, fused (T175)", base: "DP4A", dp4a: true, fused: true }];
 const layerForms = () => {
   const subgroups = device.features.has("subgroups") && (navigator.gpu.wgslLanguageFeatures?.has("subgroup_id") ?? false);
-  const llama = LAYER_KINDS.filter((kind) => !kind.dp4a), dp4a = LAYER_KINDS.filter((kind) => kind.dp4a);
+  const llama = LAYER_KINDS.filter((kind) => !kind.dp4a && !(kind.withoutDp4a && packed)), dp4a = LAYER_KINDS.filter((kind) => kind.dp4a);
   return [...(subgroups ? [false, true] : [false]).flatMap((withSubgroups) => llama.map((kind) =>
     ({ ...kind, name: `${kind.name}${withSubgroups ? ", subgroups" : ""}`, subgroups: withSubgroups }))),
     ...dp4a.map((kind) => ({ ...kind, subgroups: false, ...(packed ? {} : { none: "no packed int8 dot here" }) }))];
 };
-// the layer a token runs on the GPU (generate(), T151): T175's fused DP4A where the packed int8 dot is, else T150's
-const tokenForm = () => ({ ...LAYER_KINDS.find((kind) => kind.fused && !kind.normApart && Boolean(kind.dp4a) === packed), subgroups: false });
+// the layer a token runs on the GPU (generate(), T151): T175's fused DP4A where the check found it right (checkLayer
+// ran in this worker and its verdict is ok: T175's review), else T150's fused one (generate() builds the fused forms
+// only; which is fastest on the device is the layer table's, and the engine's choice is T152's)
+let layerVerdicts;
+const DP4A_TOKEN = "DP4A, fused (T175)";
+const tokenForm = () => {
+  const dp4a = packed && layerVerdicts?.[`a layer, ${DP4A_TOKEN}`]?.ok === true;
+  return { ...LAYER_KINDS.find((kind) => (dp4a ? kind.name === DP4A_TOKEN : kind.name === "llama.cpp, fused (T150)")), subgroups: false };
+};
 // what a form of the layer dispatches besides the attention, [key, WGSL] each (layer() and generate())
 const layerCodes = ({ dp4a, fused, normApart, subgroups }) => {
   if (!dp4a) {
-    return fused ? [["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups })], ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })],
-      ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })]]
+    const input = normApart ? "plain" : "norm";
+    return fused ? [...(normApart ? [["norm", WGSL.RMSNORM]] : []), ["qkv", WGSL.fusedMatVec({ input, output: "rope", subgroups })],
+      ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })], ["glu", WGSL.fusedMatVec({ input, output: "swiglu", subgroups })]]
       : [["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["product", WGSL.mulMatVec({ packed: false, subgroups })]];
   }
   if (!fused) return [["quantize", WGSL.QUANTIZE], ["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["product", WGSL.ortDp4aMatVec]];
@@ -764,17 +775,21 @@ const quantizing = (pipes, group, x, into, uniform, n, step) => [pipes.quantize,
 function fusedLayer(form, pipes, { dim, hidden, heads }, m, cache, v, u, group) {
   const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, cache.keys], [2, cache.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
   const rope = [[5, v.q], [6, cache.keys], [7, cache.values], [8, v.angles], [9, u.step]];
+  // RMSNORM of the stream into xb (the forms with the norms apart)
+  const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
   if (!form.dp4a) {
     const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
-    return [[pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], ...rope]), groups(m.qkv.rows), 1],
+    // the matrices read the stream and norm it, or (the norms apart) read xb
+    const input = form.normApart ? [[2, v.xb]] : [[2, v.h], [4, v.norms]];
+    return [...(form.normApart ? [norm(u.attentionNorm)] : []), [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], ...input, [3, u.qkv], ...rope]), groups(m.qkv.rows), 1],
       attention,
       [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
-      [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.h], [3, u.gateUp], [4, v.norms], [5, v.g]]), groups(hidden), 1],
+      ...(form.normApart ? [norm(u.ffnNorm)] : []), [pipes.glu, group(pipes.glu, [[0, m.gateUp.w], [1, m.gateUp.s], ...input, [3, u.gateUp], [5, v.g]]), groups(hidden), 1],
       [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
   }
   const [qkvIn, oIn, gluIn, downIn] = v.quantized;
   const normed = (params, into) => (form.normApart
-    ? [[pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1], quantizing(pipes, group, v.xb, into, u.quantize[0], dim, u.step)]
+    ? [norm(params), quantizing(pipes, group, v.xb, into, u.quantize[0], dim, u.step)]
     : [[pipes.normQuantize, group(pipes.normQuantize, [[0, v.h], [1, v.norms], [2, into.xq], [3, into.xs], [4, params], [5, u.step]]), 1, 1]]);
   // a matrix by its quantized input: rows its workgroups take (gate's, where up's go beside them)
   const product = (pipeline, { w, s }, into, params, rows, output) => [pipeline, group(pipeline, [[0, w], [1, s], [2, into.xq], [3, params], [4, into.xs], ...output]),
@@ -967,18 +982,24 @@ function dequantized(xq, xs) {
 // T175: how a vector the GPU quantized (xq, xs) holds to quantize_x of x, the reference's values where it was made
 // (from the GPU's own inputs before it: they differ as float32 and float64 sums in another order, about 1e-6, and a
 // key or value of the position rounded the other way in float16 moves the attention's output by up to about 1e-4 of
-// itself): each scale within QUANTIZED_SCALE_LINE of the reference's (a scale of another group, a norm left out or
-// read from the wrong weights is off by far more), each value within 1, and no more than 1% of them off by 1 (a value
-// on a rounding's edge goes either way: about 1e-4 of them). Returns { wrong: why or null, scale: the worst relative
-// difference of a scale, apart: the values off by 1, of: how many }
-const QUANTIZED_SCALE_LINE = 1e-3;
-function quantizedOff(x, xq, xs) {
+// itself): each scale within `line` of the reference's (a scale of another group, a norm left out or read from the
+// wrong weights is off by far more), each value within 1, and no more than 1% of them off by 1 (a value on a
+// rounding's edge goes either way: about 1e-4 of them). The lines (T175's review): where a norm made the vector (q, k
+// and v's; gate and up's) NORMED_SCALE_LINE, for the reference's float64 norm and the GPU's float32 differ by a few ulp
+// (1.1e-7 to 4.1e-7 on lavapipe, 2026-09-27) and a mean over n - 1 in place of n moves the scales by 2.4e-4 (the
+// stream stays within 3e-7: the quantized integers do not depend on the norm's scale, only the group's scale does);
+// elsewhere (o's, down's) QUANTIZED_SCALE_LINE, for the attention's output moves by up to about 1e-4 with a key or value
+// rounded the other way in float16. Returns { wrong: why or null, scale: the worst relative difference of a scale,
+// apart: the values off by 1, of: how many }
+const QUANTIZED_SCALE_LINE = 1e-3, NORMED_SCALE_LINE = 3e-5;
+const scaleLine = (point) => (point === "qkv" || point === "ffn" ? NORMED_SCALE_LINE : QUANTIZED_SCALE_LINE);
+function quantizedOff(x, xq, xs, line) {
   const mine = WGSL.quantizedLikeCpu(Float32Array.from(x));
   let far = false, apart = 0, scale = 0;
   mine.xs.forEach((want, g) => {
     const off = want > 0 ? Math.abs(xs[g] - want) / want : xs[g] === 0 ? 0 : Infinity;
     scale = Math.max(scale, off);
-    far ||= !(off <= QUANTIZED_SCALE_LINE);
+    far ||= !(off <= line);
   });
   mine.xq.forEach((value, i) => {
     far ||= Math.abs(xq[i] - value) > 1;
@@ -1057,10 +1078,15 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
 // before q, k and v) has a group whose scale is 0 (NORM_QUANTIZE's and QUANTIZE's select of 1 / scale: a division by
 // 0 there makes NaN, which quantizedOff holds to quantize_x's 0). And the two DP4A fused forms, which differ only in
 // NORM_QUANTIZE against RMSNORM then QUANTIZE (the same expressions weight × (s × x), the largest / 127 and the
-// rounding, in one dispatch or two), must agree to the bit in everything they leave (the stream, the position's keys
-// and values, the four quantized vectors): a rounding that differs between them (a product reassociated, a tie
-// rounded up) is under quantizedOff's lines (1e-3 of a scale, 1% of the values off by 1) and shows here alone
+// rounding, in one dispatch or two), must agree within a few ulp (sameAsNormsApart): the scales of their quantized
+// vectors within NORMS_APART_ULPS, the values within 1 (no more than 1% of them off by 1), and where every value is the
+// same, the stream within 1e-6 of what the layer added. Not to the bit (T175's review): WGSL lets an implementation
+// reassociate operations and fuse them where the result is at least as accurate, and a division is within 2.5 ulp
+// (§15.7.5), so a device that compiles the two shaders differently (Metal's fast math, gpuweb #2076) may round a scale
+// by an ulp or two and a value on an edge the other way, and still be right. Whether they agreed to the bit goes into
+// the verdict as a fact. A mean over n - 1 in NORM_QUANTIZE alone moves its scales by 2.4e-4, far past a few ulp
 const LAYER_CHECK = { dim: 2112, hidden: 2080, heads: 33, kvHeads: 3 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
+const NORMS_APART_ULPS = 4, NORMS_APART_STREAM = 1e-6;
 const LAYER_CHECK_OUTLIERS = Math.round((3 * LAYER_CHECK.dim) / 256), LAYER_CHECK_OUTLIER = 30, LAYER_CHECK_EPS = 1;
 async function checkLayer() {
   const shape = layerShape(LAYER_CHECK), pos = LAYER_CHECK_POS, verdicts = {};
@@ -1072,14 +1098,33 @@ async function checkLayer() {
   for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
     data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01 * Math.sqrt(256 / n)) };
   }
-  // what the DP4A fused form with the norms apart left, for the fused form to be held to (bit for bit)
+  // what the DP4A fused form with the norms apart left, for the fused form to be held to (within a few ulp)
   let normsApart;
   const sameBytes = (a, b) => {
     const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
     return x.length === y.length && x.every((byte, i) => byte === y[i]);
   };
-  const sameAs = (got, other) => sameBytes(got.h, other.h) && sameBytes(got.keys, other.keys) && sameBytes(got.values, other.values)
-    && got.quantized.every((q, i) => sameBytes(q.xq, other.quantized[i].xq) && sameBytes(q.xs, other.quantized[i].xs));
+  // { ok, bitForBit, ulps: the most a scale is apart, apart: the values off by 1, stream: the stream's difference over
+  // what the layer added (where every value is the same) }
+  const sameAs = (got, other, added) => {
+    let ulps = 0, apart = 0, far = false, values = 0;
+    got.quantized.forEach((q, i) => {
+      const bits = new Int32Array(q.xs.buffer, q.xs.byteOffset, q.xs.length), otherBits = new Int32Array(other.quantized[i].xs.buffer, other.quantized[i].xs.byteOffset, q.xs.length);
+      // the scales are 0 or more: their bits are in the order of their values
+      bits.forEach((b, g) => (ulps = Math.max(ulps, Math.abs(b - otherBits[g]))));
+      q.xq.forEach((value, k) => {
+        far ||= Math.abs(value - other.quantized[i].xq[k]) > 1;
+        apart += value !== other.quantized[i].xq[k];
+      });
+      values += q.xq.length;
+    });
+    let stream = 0;
+    got.h.forEach((value, k) => (stream = Math.max(stream, Math.abs(value - other.h[k]) / added)));
+    const bitForBit = sameBytes(got.h, other.h) && sameBytes(got.keys, other.keys) && sameBytes(got.values, other.values)
+      && got.quantized.every((q, i) => sameBytes(q.xq, other.quantized[i].xq) && sameBytes(q.xs, other.quantized[i].xs));
+    const ok = ulps <= NORMS_APART_ULPS && !far && apart <= 0.01 * values && (apart > 0 || stream <= NORMS_APART_STREAM);
+    return { ok, bitForBit, ulps, apart, stream };
+  };
   for (const form of layerForms()) {
     if (form.none) continue;
     try {
@@ -1111,7 +1156,7 @@ async function checkLayer() {
         made[i] = x;
         return dequantized(got.quantized[i].xq, got.quantized[i].xs);
       } : undefined);
-      const quantizing = form.dp4a ? INPUTS.map((point, i) => [point, quantizedOff(made[i], got.quantized[i].xq, got.quantized[i].xs)]) : [];
+      const quantizing = form.dp4a ? INPUTS.map((point, i) => [point, quantizedOff(made[i], got.quantized[i].xq, got.quantized[i].xs, scaleLine(point))]) : [];
       const wrongly = quantizing.filter(([, q]) => q.wrong);
       let added = 0, largestKey = 0, largestValue = 0;
       want.h.forEach((value, i) => (added = Math.max(added, Math.abs(value - data.h[i]))));
@@ -1129,14 +1174,14 @@ async function checkLayer() {
         }
       }
       const cache = Math.max(keyOff, valueOff);
-      // the DP4A fused form against the one with the norms apart, bit for bit (undefined where that one was not run)
+      // the DP4A fused form against the one with the norms apart, within a few ulp (undefined where that one was not run)
       let agreed;
       if (form.dp4a && form.fused) {
         if (form.normApart) normsApart = got;
-        else if (normsApart) agreed = sameAs(got, normsApart);
+        else if (normsApart) agreed = sameAs(got, normsApart, added);
       }
       // on DP4A, how each quantized vector held (for CI's logs): the worst scale apart and the values off by 1
-      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length && agreed !== false,
+      verdicts[layerCheck(form)] = { worstRelative: Math.max(off, cache), ok: off < LAYER_LINE && cache < CACHE_LINE && !touched && !wrongly.length && agreed?.ok !== false,
         stream: off, cache, ...(touched ? { wroteOtherPositions: true } : {}), ...(agreed === undefined ? {} : { sameAsNormsApart: agreed }),
         ...(quantizing.length ? { quantized: quantizing.map(([point, q]) => `${point}: ${q.wrong ?? `scales ${q.scale.toExponential(1)}, ${q.apart} of ${q.of} values off by 1`}`).join("; ") } : {}) };
     } catch (error) {
@@ -1146,6 +1191,7 @@ async function checkLayer() {
       postMessage({ alive: true });
     }
   }
+  layerVerdicts = verdicts;
   return verdicts;
 }
 async function layer() {
@@ -1709,7 +1755,7 @@ async function checkGeneration() {
       let h = embedded(tokens[k]);
       // the GPU's quantized vector in place of x (T175), held to quantize_x of x
       const taken = (at, x, what) => {
-        const { xq, xs } = vectors[k][at], { wrong } = quantizedOff(x, xq, xs);
+        const { xq, xs } = vectors[k][at], { wrong } = quantizedOff(x, xq, xs, at === 4 * model.layers ? NORMED_SCALE_LINE : scaleLine(INPUTS[at % 4]));
         if (wrong) quantizing.push(`token ${k}, ${what}: ${wrong}`);
         return dequantized(xq, xs);
       };

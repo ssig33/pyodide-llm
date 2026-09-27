@@ -127,6 +127,18 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
     // (and every tiled shader of T146 among them: one the runner's adapter could not make fails here too)
     const check = results.gpu?.data?.steps?.find((s) => s.name === "the shaders against JavaScript");
     if (check?.error || Object.values(check?.result ?? {}).some((v) => v.error)) failed = true;
+    // T175: the numbers the layer's verdicts rest on, a line each (CI's logs are where they are read: the owner, 2026-09-27):
+    // the stream's and the cache's differences, each quantized vector's scales and values off by 1, and the DP4A fused
+    // form against the one with the norms apart (the ulp of the scales, the values off by 1, bit for bit or not)
+    for (const [name, v] of Object.entries(check?.result ?? {})) {
+      if (!name.startsWith("a layer, ") && name !== "tokens on the GPU") continue;
+      const apart = v.sameAsNormsApart;
+      console.log(`check ${name}: ${v.ok ? "ok" : "WRONG"}` + (v.error ? `, ${v.error}` : "") +
+        (Number.isFinite(v.stream) ? `, stream ${v.stream.toExponential(1)}, cache ${v.cache.toExponential(1)}` : "") +
+        (v.quantized ? `; ${v.quantized}` : "") +
+        (apart ? `; against the norms apart: scales ${apart.ulps} ulp, ${apart.apart} values off by 1, stream ${apart.stream.toExponential(1)}, ${apart.bitForBit ? "bit for bit" : "not bit for bit"}` : "") +
+        (name === "tokens on the GPU" ? `; ${v.tokens} tokens, layer ${v.layer}${v.problems ? `, ${v.problems.join(" / ")}` : ""}` : ""));
+    }
     // T157: after the CPU section, the GPU section's token table holds the GPU against it (and not the old estimate)
     if (results.cpu?.status === "ok" && results.gpu?.data && !results.gpu.markdown.includes("The CPU (an estimate): each model's weights at the CPU section's fastest")) {
       console.log("the GPU section's token table does not hold the GPU against the CPU section");

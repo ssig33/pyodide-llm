@@ -1973,9 +1973,13 @@ ${fusedWrite(output)}
 // quantizer (NORM_QUANTIZE), one dispatch where RMSNORM and QUANTIZE are two.
 //
 // RMSNorm with its output quantized as QUANTIZE quantizes it: one workgroup of 64 a token, the sum of x² as RMSNORM
-// adds it (the same scale, to the bit), then a group of 32 a thread at a time, its values weight × (s × x) as RMSNORM
-// writes them, the largest |value| / 127 its scale and each value rounded (half to even) and clamped to ±127, four to
-// a u32 (QUANTIZE's). This project's lines: RMSNORM's and QUANTIZE's in one workgroup.
+// adds it, then a group of 32 a thread at a time, its values weight × (s × x) as RMSNORM writes them, the largest
+// |value| / 127 its scale and each value rounded (half to even) and clamped to ±127, four to a u32 (QUANTIZE's). The
+// form is vLLM's rms_norm_per_block_quant (csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu
+// with layernorm_utils.cuh, https://github.com/vllm-project/vllm, commit 24c9772d, Apache-2.0): the row's rms in one
+// block, then each group's scale from its normed values, then the values normed and quantized (compute_rms,
+// compute_dynamic_per_token_scales, norm_and_quant). No lines are taken from it: these are RMSNORM's and QUANTIZE's
+// in one workgroup (vLLM's block reduction, fp8 and residual paths are not here).
 export const NORM_QUANTIZE = /* wgsl */ `
 struct Norm { size: u32, at: u32, eps: f32, unused: u32 }
 ${STEP}
