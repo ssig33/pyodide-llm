@@ -124,7 +124,10 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
   }
   if (errors.length) console.log(`page errors: ${errors.join(" / ")}`);
   console.log("");
-  await browser.close();
+  // T141: Windows' WebKit sometimes never returns from close(), and each browser waits for the one before it (bench.yml's
+  // Windows job sat 55 minutes after WebKit's report, 2026-09-27): give it 15 seconds and go on
+  const closed = await Promise.race([browser.close().then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 15000))]);
+  if (!closed) console.log(`${engine}: the browser did not close within 15 s; going on`);
 }
 server?.close();
 process.exit(failed ? 1 : 0);
