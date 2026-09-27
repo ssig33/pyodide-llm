@@ -52,11 +52,13 @@
 // forward pass on the keys and values the GPU wrote back), and the GPU 3 more (the CPU's position goes up to it first).
 // Checked: the ids are NumPy's, or where one is not, a near tie (NumPy's logit of it no farther below its largest than
 // twice the CPU's own logits from NumPy's, the difference of 7-bit activations: the steps after it are not compared,
-// their inputs differ); the keys and values of those positions in forward.js's cache against NumPy's, to the line of
+// their inputs differ; the CPU's step feeds NumPy's id to the GPU's next ones whatever it chose); the keys and values
+// the GPU wrote back of those positions (not the CPU's step's) in forward.js's cache against NumPy's, to the line of
 // the prompt's shader of the same arithmetic (float32 T147's GPU_LINE or K × E16; DP4A PACKED_LINE of the CPU's); a
-// stop token (NumPy's second) ends the steps after it; a sampled step (temperature 0.8, top-p 0.9, penalty 1.3, a
-// random number of 0.7) is a token the CPU's walk (shaders.js's walkLikeCpu) over NumPy's penalized logits reaches
-// within 2% of the mass of the random number's share (the GPU's logits are not NumPy's: T151's 1e-4 is for the same).
+// stop token (NumPy's second) ends the steps after it; a penalty of 100 on NumPy's first id (greedy) gives the largest
+// of NumPy's logits penalized so (or a near tie); two sampled steps at temperature 2 with random numbers of 0.02 and
+// 0.98 give two tokens of NumPy's nucleus, not the same (the random numbers reach the GPU: where either lands is not
+// held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js).
 //
 // T183: what a person reads to judge it, in the log of CI (the development machine does not run WebGPU's tests): E16,
 // how far NumPy's answer moves when nothing but its cache is rounded to float16 (answer(half=True), T153's review), and
@@ -98,8 +100,8 @@ const ids = (args.length ? args : ["made-up", "stories15M", "tiny-lm", "llm-jp-3
   .flatMap((id) => (id === "made-up" ? Object.keys(SYNTHETIC) : [id]));
 // T147: 150 tokens, so that the GPU's blocks of 64 are two and a part (the tiles' ends), and the caches grow to 256
 const COUNT = 150, KV_START = 8;
-// T152: the greedy steps NumPy takes after the prompt, and the tie and the sampled step's share of the mass
-const GEN = 8, SAMPLED_BAND = 0.02;
+// T152: the greedy steps NumPy takes after the prompt
+const GEN = 8;
 // The worst row of the keys and values against NumPy's, by what the matrices' shader computes in (T147, measured on
 // Dawn's lavapipe and this machine's SwiftShader, 149 tokens: two blocks of 64 and a part). The CPU's forward.js: 4.1e-2
 // to 3.2e-1 (its 7-bit activations; the made-up model's random weights the most). A GPU that is wrong lands far past
@@ -425,7 +427,10 @@ try {
       const rows = engine.keysAndValues(n, 8);
       Object.assign(out, { keys: b64(rows.keys), values: b64(rows.values) });
       out.stopped = ask(tokens[n], n, [], 4, [0, 0.9, 1], [], [greedy[1]]);
-      out.sampled = ask(tokens[n], n, [], 1, [0.8, 0.9, 1.3], [0.7]);
+      // the penalty: NumPy's first id in the history, 100 greedy
+      out.penaltyHistory = [...tokens.slice(0, -1), greedy[0], tokens[n]];
+      out.penalized = engine.generateMany(tokens[n], n, out.penaltyHistory.slice(-64), out.penaltyHistory.length, 1, 0, 0.9, 100, [], []);
+      out.sampled = [0.02, 0.98].map((random) => ask(tokens[n], n, [], 1, [2, 0.999, 1], [random]));
       return out;
     };
     const run = async (gpu, gpuForce, gpuRemembered, steps = false) => {
@@ -783,40 +788,60 @@ function stepsRight(c, steps, { cpuKv, e16, cpuLogits, kvDim }) {
     console.log(`  a token: on the CPU (${steps.why})${right ? "" : " — FAILED"}`);
     return right;
   }
-  // the ids against NumPy's, up to the first that is not NumPy's (a near tie: no farther below NumPy's largest logit
-  // than TIE times the CPU's own logits from NumPy's)
-  const tie = (i, id) => {
-    const logits = logitsOf(i), largest = logits.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
-    return logits[greedy[i]] - logits[id] <= TIE * cpuLogits * largest;
+  // how far below the largest of these logits the logit of id is, over the largest |logit|
+  const below = (logits, want, id) => (logits[want] - logits[id]) / logits.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  const nearTie = TIE * cpuLogits;
+  // the GPU's ids against NumPy's, step after step from `at`, up to the first that is not NumPy's (then a near tie:
+  // no farther below NumPy's largest logit than TIE times the CPU's own logits from NumPy's; the steps after it have
+  // other inputs). The positions whose inputs were NumPy's are compared (theirs, [position - n] each)
+  const positions = [];
+  const run = (ids, at, count) => {
+    if (!ids || ids.length !== count) {
+      failures.push(`${count} steps from ${at} came back as ${JSON.stringify(ids)}`);
+      return 0;
+    }
+    let same = 0;
+    for (; same < count && ids[same] === greedy[at + same]; same++);
+    for (let i = 0; i <= Math.min(same, count - 1); i++) positions.push(at + i);
+    if (same < count && !(below(logitsOf(at + same), greedy[at + same], ids[same]) <= nearTie)) {
+      failures.push(`step ${at + same} is ${ids[same]}, NumPy's ${greedy[at + same]}, and not a near tie`);
+    }
+    return same;
   };
-  const ids = [...(steps.first ?? []), ...(steps.second ? [steps.cpuStep, ...steps.second] : [])];
-  let same = 0;
-  for (; same < ids.length && ids[same] === greedy[same]; same++);
-  if (!steps.first || steps.first.length !== 4) failures.push(`the GPU's first 4 steps came back as ${JSON.stringify(steps.first)}`);
-  else if (same < ids.length && !tie(same, ids[same])) failures.push(`step ${same} is ${ids[same]}, NumPy's ${greedy[same]}, and not a near tie`);
-  else if (steps.first.every((id, i) => id === greedy[i]) && (!steps.second || steps.second.length !== 3)) failures.push(`the GPU's steps after the CPU's came back as ${JSON.stringify(steps.second)}`);
-  said.push(same === GEN ? `${GEN} of ${GEN} greedy ids as NumPy's` : `${same} greedy ids as NumPy's, then a near tie`);
-  // the keys and values of the positions whose inputs were NumPy's (the prompt's last token, then NumPy's ids)
-  const compared = Math.min(same + 1, GEN) * kvDim, layers = ref.header[2];
-  const byLayer = (b64) => Array.from({ length: layers }, (_, l) => floats(b64).subarray(l * GEN * kvDim, l * GEN * kvDim + compared));
-  const worst = (got, want) => Math.max(...byLayer(got).map((layer, l) => worstRow(layer, byLayer(want)[l], kvDim)));
-  const kvOff = Math.max(worst(steps.keys, ref.greedyKeys), worst(steps.values, ref.greedyValues));
+  const first = run(steps.first, 0, 4), second = first === 4 ? run(steps.second, 5, 3) : 0;
+  said.push(`${first}${first === 4 ? ` and ${second}` : ""} greedy ids as NumPy's${first === 4 && second === 3 ? "" : " (then a near tie)"}` +
+    (first === 4 ? `, the CPU's step between them ${steps.cpuStep === greedy[4] ? "NumPy's" : `${steps.cpuStep} (NumPy's ${greedy[4]})`}` : ""));
+  // the keys and values the GPU wrote back of the positions whose inputs were NumPy's (not the CPU's step's: the CPU's)
+  const layers = ref.header[2];
+  const rowsOf = (b64) => {
+    const all = floats(b64), out = new Float32Array(layers * positions.length * kvDim);
+    for (let l = 0; l < layers; l++) {
+      positions.forEach((p, k) => out.set(all.subarray((l * GEN + p) * kvDim, (l * GEN + p + 1) * kvDim), (l * positions.length + k) * kvDim));
+    }
+    return out;
+  };
+  const kvOff = Math.max(worstRow(rowsOf(steps.keys), rowsOf(ref.greedyKeys), kvDim), worstRow(rowsOf(steps.values), rowsOf(ref.greedyValues), kvDim));
   const packed = /DP4A/.test(steps.form ?? "");
   const line = packed ? PACKED_LINE * cpuKv : Math.max(GPU_LINE, K.float32 * e16);
   if (!(kvOff <= line)) failures.push(`the keys and values of the steps are ${kvOff.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
-  said.push(`keys and values ${kvOff.toExponential(2)} (line ${line.toExponential(2)})`);
+  said.push(`keys and values of ${positions.length} positions ${kvOff.toExponential(2)} (line ${line.toExponential(2)})`);
   // a stop token: NumPy's second id ends the steps after it
   const until = greedy.indexOf(greedy[1]) + 1, wanted = greedy.slice(0, until);
-  if (same >= until && JSON.stringify(steps.stopped) !== JSON.stringify(wanted)) failures.push(`with ${greedy[1]} a stop token the steps were ${JSON.stringify(steps.stopped)}, not ${JSON.stringify(wanted)}`);
+  if (first >= until && JSON.stringify(steps.stopped) !== JSON.stringify(wanted)) failures.push(`with ${greedy[1]} a stop token the steps were ${JSON.stringify(steps.stopped)}, not ${JSON.stringify(wanted)}`);
   said.push(`a stop token after ${steps.stopped?.length} steps`);
-  // a sampled step against the CPU's walk over NumPy's logits, penalized as the CPU penalizes them
-  const logits = logitsOf(0).slice();
-  wgsl.penalizeLikeCpu(logits, ref.tokens, 1.3);
-  const walk = wgsl.walkLikeCpu(logits, 0.8, 0.9), goal = 0.7 * walk.mass, band = SAMPLED_BAND * walk.mass;
-  const reached = walk.tokens.filter((_, k) => walk.cumulative[k] > goal - band && (k ? walk.cumulative[k - 1] : 0) <= goal + band);
-  const drawn = steps.sampled?.[0];
-  if (!reached.includes(drawn)) failures.push(`the sampled step is ${drawn}, the CPU's walk reaches ${reached.join(" or ")}`);
-  said.push(`sampled ${drawn} (the CPU's walk: ${reached.join(" or ")})`);
+  // the penalty (100 on NumPy's first id, greedy): the largest of NumPy's logits penalized so, or a near tie
+  const penalized = logitsOf(0).slice();
+  wgsl.penalizeLikeCpu(penalized, steps.penaltyHistory ?? [], 100);
+  const wantPenalized = wgsl.argmaxLikeCpu(penalized), gotPenalized = steps.penalized?.[0];
+  if (!(below(penalized, wantPenalized, gotPenalized) <= nearTie)) failures.push(`with a penalty of 100 the step is ${gotPenalized}, NumPy's ${wantPenalized}, and not a near tie`);
+  said.push(`penalized ${gotPenalized}${gotPenalized === wantPenalized ? " as NumPy's" : ` (NumPy's ${wantPenalized})`}`);
+  // sampled at temperature 2 with a random number of 0.02 and one of 0.98: two tokens of NumPy's nucleus, and not
+  // the same (the random numbers reach the GPU; its logits are not NumPy's, so where either lands is not held to it)
+  const walk = wgsl.walkLikeCpu(logitsOf(0), 2, 0.999), [low, high] = steps.sampled ?? [];
+  if (!(walk.tokens.includes(low?.[0]) && walk.tokens.includes(high?.[0]) && low[0] !== high[0])) {
+    failures.push(`sampled at 0.02 and 0.98: ${low?.[0]} and ${high?.[0]}, of NumPy's nucleus of ${walk.tokens.length}, which are to differ`);
+  }
+  said.push(`sampled ${low?.[0]} and ${high?.[0]}`);
   console.log(`  a token by ${steps.form}: ${said.join(", ")}${failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""}`);
   return !failures.length;
 }
