@@ -208,7 +208,7 @@ const readySeconds = (Date.now() - started) / 1000;
 // layers on SwiftShader and its shaders compiled, with gpuTest=on: minutes; refused without it: at once)
 let gpuVerdict = null;
 if (swiftShader && kind === playwright.chromium) {
-  await page.waitForFunction(() => /prompt on GPU|prompt on CPU \((?!GPU getting ready)/.test(document.getElementById("status-text")?.textContent ?? ""), null, { timeout: 0 });
+  await page.waitForFunction(() => /on WebGPU(?! where)|prompts on the CPU \(/.test(document.getElementById("status-text")?.textContent ?? ""), null, { timeout: 0 });
   gpuVerdict = { seconds: (Date.now() - started) / 1000 - readySeconds, status: await page.evaluate(() => document.getElementById("status-text").textContent) };
   console.log(`the GPU's verdict ${gpuVerdict.seconds.toFixed(1)}s after ready: ${gpuVerdict.status}`);
 }
@@ -265,7 +265,7 @@ if (result.early.length) failures.push(`before the answer ended: ${[...new Set(r
 if (expected[model] && !result.text.startsWith(expected[model])) failures.push(`unexpected text: ${result.text.slice(0, 120)}`);
 if (gpuTest && !/on WebGPU/.test(result.prompt)) failures.push(`the prompt did not go through the GPU (${result.prompt || "no prompt line"}; ${result.status})`);
 // (refused as a fallback adapter, or before that for another reason: a page that is not cross-origin isolated)
-if (swiftShader && !gpuTest && (!/prompt on CPU \(/.test(gpuVerdict?.status ?? "") || /on WebGPU/.test(result.prompt))) {
+if (swiftShader && !gpuTest && (!/prompts on the CPU \(/.test(gpuVerdict?.status ?? "") || /on WebGPU/.test(result.prompt))) {
   failures.push(`SwiftShader was not refused (${gpuVerdict?.status}; ${result.prompt})`);
 }
 console.log(`${engine} ${browserVersion}, ${model}: ready in ${readySeconds.toFixed(1)}s, ${result.meta}`);

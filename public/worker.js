@@ -1273,8 +1273,8 @@ const threadsNow = () => outsideNow?.engine?.threads ?? 1;
 // meanwhile says it too; the page drops what is not of its latest load.
 function watchGpu(id) {
   const engine = outsideNow?.engine;
-  if (!engine) return "prompt on CPU (the NumPy engine runs this model)";
-  if (!engine.gpu) return `prompt on CPU (${benchPage ? "the benchmark times the CPU" : "no WebGPU in a worker here"})`;
+  if (!engine) return "prompts on the CPU (the NumPy engine runs this model)";
+  if (!engine.gpu) return `prompts on the CPU (${benchPage ? "the benchmark times the CPU" : "no WebGPU in a worker here"})`;
   engine.gpu.then((note) => outsideNow?.engine === engine && postMessage({ type: "gpu", load: id, note, ...(engine.gpuReady ?? {}) }));
   return engine.gpuStatus;
 }

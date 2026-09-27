@@ -404,7 +404,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
     `${argmax(want) === best ? "as NumPy's" : `(NumPy's ${argmax(want)})`}, the prompt ${(cpu.promptMs / n).toFixed(2)} ms a token`);
   if (late) {
     // T147: a request forward.js gave up on is answered by nothing
-    const tried = late.note === "prompt on GPU" && late.gpuTokens === 0;
+    const tried = late.note === "prompts on WebGPU" && late.gpuTokens === 0;
     // T148: and the CPU did those blocks itself: its keys are the CPU's own run's, to the bit
     const cpuDid = late.keys === cpu.keys;
     const wrong = tried && (late.done !== 0 || late.failed !== 0 || !cpuDid);
@@ -425,7 +425,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
   }
   for (const gpu of runs) {
     const failures = [];
-    if (gpu.note !== "prompt on GPU") failures.push(`the GPU did not take it: ${gpu.note}`);
+    if (gpu.note !== "prompts on WebGPU") failures.push(`the GPU did not take it: ${gpu.note}`);
     if (gpu.gpuTokens !== n || gpu.again?.gpuTokens !== n) failures.push(`the GPU took ${gpu.gpuTokens} and ${gpu.again?.gpuTokens} of ${n} tokens`);
     if (gpu.past?.gpuTokens !== 0) failures.push(`a block past the GPU's keys and values went to the GPU (${gpu.past?.gpuTokens} tokens)`);
     const line = /DP4A/.test(gpu.form ?? "") ? PACKED_LINE * cpuKv : /f16/.test(gpu.form ?? "") ? HALF_LINE : GPU_LINE;

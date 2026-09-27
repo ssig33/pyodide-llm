@@ -781,7 +781,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuStatus = note;
       resolve(note);
     };
-    if (gpuWhyNot) settleGpu(`prompt on CPU (${gpuWhyNot})`);
+    if (gpuWhyNot) settleGpu(`prompts on the CPU (${gpuWhyNot})`);
     else startGpu();
   });
   // why this model's prompt stays on the CPU, or null: the first stage (T135) takes Llama's layers of int8 weights
@@ -814,7 +814,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       quiet = setTimeout(() => stopGpu(`the GPU said nothing for ${GPU_QUIET_MS / 1000} s`), GPU_QUIET_MS);
     };
     gpuWorker = gpu();
-    gpuStatus = "prompt on CPU (GPU getting ready)";
+    gpuStatus = "prompts on the CPU while the GPU gets ready";
     gpuWorker.onmessage = ({ data }) => {
       if (data.type === "progress") return listen();
       clearTimeout(quiet);
@@ -827,7 +827,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         const forms = data.forms.map((f) => `${f.name} ${f.none ?? (f.remembered ? "remembered" : f.ms ? `${f.ms.toFixed(1)} ms` : "untimed")}`).join("; ");
         const blocks = data.blocks.map(({ count, ms }) => `${count} tokens ${ms.toFixed(1)} ms`).join(", ");
         console.info(`gpu: the matrices by ${data.form}, the attention by ${data.attention} (a pass of the first layer by ${GPU_BLOCK} tokens: ${forms}; a whole block: ${blocks})`);
-        settleGpu?.(gpuForce.always ? "prompt on GPU" : "prompt on GPU when faster");
+        settleGpu?.(gpuForce.always ? "prompts on WebGPU" : "prompts on WebGPU where it is faster than the CPU");
       } else if (data.type === "unusable") {
         stopGpu(data.reason);
       } else if (data.type === "failed") {
@@ -849,7 +849,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (ctl) Atomics.store(ctl, GPU_WANTED, 0);  // T147: a request still under way writes nothing now
     gpuWorker?.postMessage({ type: "stop" });
     gpuWorker = null;
-    const note = `prompt on CPU (${why ?? "the model was let go"})`;
+    const note = `prompts on the CPU (${why ?? "the model was let go"})`;
     if (settleGpu) settleGpu(note);
     else if (gpu) gpuStatus = note;
   }
@@ -869,8 +869,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function verdict() {
     const most = times.of(GPU_BLOCK, threads), from = times.threshold(GPU_BLOCK, threads);
     if (!most || gpuForce.always) return;
-    const status = from > GPU_BLOCK ? "prompt on CPU (faster here)"
-      : from > BATCH ? `prompt on GPU from ${Math.ceil(from / BATCH) * BATCH} tokens` : "prompt on GPU";
+    const status = from > GPU_BLOCK ? "prompts on the CPU (faster here than WebGPU)"
+      : from > BATCH ? `prompts of ${Math.ceil(from / BATCH) * BATCH} tokens and more on WebGPU` : "prompts on WebGPU";
     if (status !== gpuStatus) {
       console.info(`gpu: a block of ${GPU_BLOCK} tokens: ${most.gpu.toFixed(1)} ms on the GPU, ${most.cpu.toFixed(1)} ms on the ` +
         `CPU (${threads} thread${threads > 1 ? "s" : ""}), the GPU from ${from > GPU_BLOCK ? "no count" : `${from} tokens`}: ${status}`);

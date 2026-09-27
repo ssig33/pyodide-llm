@@ -220,7 +220,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
 - **完了条件の書き方（レビューの案）**: 1B 級で 64 トークン以上のプロンプトが CPU より速い。**覆す条件**: `/benchmark/` の「A prompt」の最速が 64 トークンで 90 GFLOPS 未満なら、1B でも CPU に負ける。
 
 - **本番の確認（2026-09-27、8c1062c のデプロイの後）**: gpu-prompt.yml（36277493235）は Chromium・Chrome・Edge の SwiftShader の synthetic と、新しい Dawn（lavapipe）のジョブ（4 モデル、3.4 分）が通った。models.yml の `gpu=on`（36277494297）: llm-jp-3 150M と sarashina2.2 0.5B は「prompts on WebGPU」で答えた。**Llama 3.2 1B は SwiftShader で形の計測の段が 180 秒の期限を越え、「prompts on the CPU (timing the tiled shaders took more than 180 s)」で CPU に戻って答えた**（準備完了 210.4 秒。T148 でフォールバックのアダプタを断れば訪問者には起きない。試験の道具で SwiftShader を通すときは形を固定するなど）。Qwen2.5 0.5B（bias）と Firefox（Worker に WebGPU なし）は理由を出して CPU で答えた（e2e が「GPU を通らなかった」と落とすのは、頼んだ試しの形のせいで期待どおり）。
-### T148 [性能] 既定で GPU、端末で測って選ぶ（方針 9） — 状態: **レビュー済み（must-fix 2 と should 9 を直した、2026-09-27、Opus medium、ブランチ `t148-default`）。直しの確かめを待って本線へ。文面は仮（下の案 A と B、持ち主が選ぶ）。持ち主の端末の数字は未計測**（T147 の後。規模 小〜中）
+### T148 [性能] 既定で GPU、端末で測って選ぶ（方針 9） — 状態: **レビュー済み（must-fix 2 と should 9 を直した、2026-09-27、Opus medium、ブランチ `t148-default`）。直しの確かめを待って本線へ。文面は案 A（持ち主、2026-09-27）。持ち主の端末の数字は未計測**（T147 の後。規模 小〜中）
 - 作るもの: オプションなしで GPU を使う。読み込みか最初のプロンプトで GPU と CPU を短く測り、その端末で GPU が遅ければ CPU に戻す（ソフトウェアスレッドの本数の検索と同じ形）。判断はコンソールに 1 行、ステータス行に「prompts on WebGPU」か「on the CPU (理由)」。重みを 2 重に持つと入らないモデル（T156 の前）は CPU。`?gpu=` の旗は外す。
 - 止まる点: 持ち主の端末（Android・iPhone・PC）で、既定のページで遅くならないこと。レビューは Opus xhigh（全部の訪問者の既定が変わるので、測り方の揺れ・熱・最初のプロンプトの短さで選び違えないかを見る）。
 - T147 のレビューから: GPU を待たずに準備完了にし、GPU の準備ができたら途中のプロンプトから GPU に切り替える（`gpuEnd` があるので安全なことはレビューがコードで確かめた）。
@@ -248,9 +248,9 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T170 → T152（T
   - should 7: 覚える名前は `gpu:<id>`、`?hf=` は `gpu:hf:<リポジトリ>@<版>`、フォルダは `gpu:file:<名前>`。
   - should 8: ステータス行は判定が出たときだけ変わる（CPU の時間が無い間は準備ができたときの文のまま）。しきい値は 16 の倍数に切り上げ、16 以下なら数を出さない。
   - should 9: `?bench=` のページは GPU の Worker を作らない（最初の読み込みから）。`requestAdapter` は `powerPreference` なし（ノートの 2 つ目の GPU を訪問のあいだ起こし続けない。どのアダプタでも CPU と比べて選ぶ）。
-- **文面の案（持ち主が選ぶ）**: ステータス行の GPU の部分（「tiny-lm 29M · SIMD kernels, int8, relaxed SIMD, 4 threads, ＿＿ · Pyodide …」の ＿＿）。**いま入っているのは案 B**（レビューの直した案）:
+- **文面の案（持ち主が選ぶ）**: ステータス行の GPU の部分（「tiny-lm 29M · SIMD kernels, int8, relaxed SIMD, 4 threads, ＿＿ · Pyodide …」の ＿＿）。**持ち主の判断（2026-09-27）: 案 A**（「ステータスは少し長くなっても、実験というプロジェクトの特質として許せます」）。入っているのは案 A:
 
-  | 場面 | 案 A（最初の仮） | 案 B（いま） |
+  | 場面 | 案 A（採用） | 案 B（不採用） |
   |---|---|---|
   | 準備中 | prompts on the CPU while the GPU gets ready | prompt on CPU (GPU getting ready) |
   | 準備ができた、まだ比べていない | prompts on WebGPU where it is faster than the CPU | prompt on GPU when faster |
