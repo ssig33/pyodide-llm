@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { pyodideWithEngine } from "./engine.mjs";
-import { automaticDtype, footprint } from "../public/forward.js";
+import { automaticDtype, footprint, keysInHalf } from "../public/forward.js";
 import { MODELS } from "../src/models.js";
 
 const root = new URL("../", import.meta.url).pathname;
@@ -214,14 +214,80 @@ let failed = false;
 // T144: heads of another size than dim / heads, which none of the models below has. Qwen3 0.6B's int8 (670744604
 // bytes, its header from config.json) with the options the converter gives it: forward.js put 755.3 MiB after it on
 // a shared memory and 1427.3 MiB on a plain one (measured in the review of T124). Without head_dim footprint() counts
-// its keys and values 45% short (419.1 and 755.1 MiB) and a memory chosen by that runs out near the end of the context
+// its keys and values 45% short (419.1 and 755.1 MiB) and a memory chosen by that runs out near the end of the context.
+// T160: a grouped-query model (16 heads, 8 of keys and values) keeps float32 keys and values on a shared memory too:
+// the 1427.3 MiB of the plain one either way (the two differ in nothing else footprint() counts)
 {
   const header = [1024, 3072, 28, 16, 8, 151936, 4096], int8 = 670744604, MiB = 1 << 20;
   const options = { dtype: "int8", bias: false, arch: "llama", qk_norm: true, head_dim: 128 };
-  for (const [halfKV, placed] of [[true, 755.3], [false, 1427.3]]) {
-    const bound = footprint(header, int8, { ...options, halfKV }) / MiB;
+  for (const halfKV of [true, false]) {
+    const bound = footprint(header, int8, { ...options, halfKV }) / MiB, placed = 1427.3;
     assert.ok(bound >= placed && bound < placed + 4, `Qwen3 0.6B: ${bound.toFixed(1)} MiB counted, ${placed} placed`);
   }
+}
+// T160: keys and values in float16 (a shared memory) for a model with a key of every head; for a grouped-query one
+// float32, but where only float16 fits a 32-bit memory (Qwen2.5 3B: 3.82 GiB, 4.03 in float32). A model on a 64-bit
+// memory either way (Llama 3.2 3B, 4.41 GiB in float16) takes float32. The sizes: llama2_convert.checkpoint_size()
+{
+  const cases = [["llm-jp-3 150M", [512, 2048, 12, 8, 8, 99584, 4096], 160e6, {}, true],
+    ["Qwen2.5 0.5B", [896, 4864, 24, 14, 2, 151936, 4096], 555992604, { bias: true }, false],
+    ["Qwen2.5 3B", [2048, 11008, 36, 16, 2, 151936, 4096], 3472375836, { bias: true }, true],
+    ["Llama 3.2 3B", [3072, 8192, 28, 24, 8, 128256, 4096], 3614847004, {}, false]];
+  for (const [name, header, size, form, half] of cases) {
+    const options = { dtype: "int8", ...form };
+    assert.equal(keysInHalf(header, size, { ...options, halfKV: true }), half, `${name}: float16 keys and values ${!half}`);
+    assert.equal(keysInHalf(header, size, options), false, `${name}: float16 keys and values not on a shared memory`);
+    const [f16, f32] = [true, false].map((halfKV) => footprint(header, size, { ...options, halfKV }));
+    assert.equal(f16 < f32, half, `${name}: footprint() counts ${half ? "float32" : "float16"} keys and values`);
+  }
+}
+// T160: what forward.js allocates against footprint() (as for the models below), on made-up int8 models of 4096
+// positions whose keys and values outweigh the rest: grouped-query (16 heads, 8 of keys and values: float32 on a
+// shared memory too) and not (8 and 8: float16 there). None of the models below has grouped-query attention. A
+// footprint() that counts the other type is 25 MiB off, past the line's 6 MiB and 5%.
+py.globals.set("WITHOUT", py.toPy(without));
+py.runPython(`
+import struct, numpy as np, llama2_convert
+
+def made_up(dim, heads, kv_heads, hidden=512, layers=4, vocab=320, seq_len=4096):
+    """an int8 checkpoint as quantize.py writes one, and its bytes after the checkpoint at the end of the context"""
+    rng = np.random.default_rng(0)
+    header = (dim, hidden, layers, heads, kv_heads, vocab, seq_len)
+    out = [struct.pack("<7i", *header)]
+    for shape, is_matrix in llama2_convert.layout(*header):
+        if is_matrix is None:
+            continue
+        values = (rng.standard_normal(shape) * 0.3).astype(np.float32)
+        if is_matrix:
+            q, scales = llama2_convert.quantize(values.reshape(-1, shape[-1]))
+            out += [q.tobytes(), scales.tobytes()]
+        else:
+            out.append((1.0 + values * 0.1).tobytes())
+    pieces = [f"<{i}>".encode() for i in range(vocab)]
+    tokenizer = struct.pack("<i", max(map(len, pieces))) + b"".join(struct.pack("<fi", 0.0, len(p)) + p for p in pieces)
+    data = b"".join(out)
+    llama = kernel_llama(data, tokenizer, dtype="int8", disable=WITHOUT)
+    capacity = llama2_numpy.KV_START
+    while capacity < seq_len:
+        llama.forward(llama.bos, capacity, need_logits=False)
+        capacity *= 2
+    llama.forward(llama.bos, seq_len - 1, need_logits=False)
+    used = int(llama._external[0].memoryBytes())
+    llama.release(); del llama; gc.collect()
+    return used, len(data), list(header)
+`);
+for (const [name, dim, heads, kvHeads] of [["made-up, grouped-query", 512, 16, 8], ["made-up, a key for every head", 256, 8, 8]]) {
+  const [used, size, header] = py.runPython(`made_up(${dim}, ${heads}, ${kvHeads})`).toJs();
+  const after = used - (shared ? 8192 : 64) - size;
+  const int8 = !without.includes("int8");
+  const options = { dtype: "int8", int8, relaxed: Boolean(kernels.relaxed) && !without.includes("relaxed"),
+    halfKV: shared && int8 && !without.includes("kv16") };
+  const bound = footprint(header, size, options);
+  const close = after <= bound && bound - after <= 0.05 * bound + 6 * 2 ** 20;
+  console.log(`${name}: ${(after / 2 ** 20).toFixed(1)} MiB after the checkpoint at the end of the context, footprint ` +
+    `${(bound / 2 ** 20).toFixed(1)} MiB, keys and values in ${keysInHalf(header, size, options) ? "float16" : "float32"}` +
+    `${close ? "" : " — FAILED"}`);
+  failed ||= !close;
 }
 for (const id of ids.length ? ids : ["stories260K", "stories15M", "tiny-lm", "llm-jp-3-150m"]) {
   const entry = modelOf(id);

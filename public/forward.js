@@ -197,7 +197,8 @@ const frameBytes = (arrays) => arrays.reduce((size, [, bytes]) => size + align(b
  * above what createForward allocates (tests/forward-check.mjs holds the two together).
  * header: the 7 ints of the legacy format. dtype: the file's ("float32", "float16", "int8", "int6"). int8: the int8
  * kernels compute on the weights (not with ?without=int8, which widens them to float32); relaxed: with relaxed SIMD
- * (a float32 correction a group); halfKV: keys and values in float16 (T110: an int8 model on a shared memory).
+ * (a float32 correction a group); halfKV: the keys and values may be float16 (T110: an int8 model on a shared memory;
+ * whether they are is keysInHalf's, T160).
  * kvStart and outliers are llama2_numpy's KV_START and OUTLIER_CHANNELS. arch and head_dim are of the form
  * (llama2_numpy.FORM, which a model's options carry: the caller passes them in as they are, T144): head_dim is the
  * size of a head where it is not dim / heads (T124), 0 where it is. gpu (T135): the page asked for the prompt on the
@@ -232,9 +233,19 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
     most = Math.max(most, capacity + larger);
     capacity = larger;
   }
-  bytes += most * layers * 2 * kvDim * (halfKV ? 2 : 4);
-  return Math.ceil(bytes) + 2 ** 20;  // and a megabyte for the alignment of every array
+  // (and a megabyte for the alignment of every array)
+  const others = Math.ceil(bytes) + 2 ** 20, keys = most * layers * 2 * kvDim;
+  // T160: a grouped-query model's keys and values are widened for every head of their group, g = heads / kvHeads
+  // times, which float16 saves nothing of (Qwen2.5 0.5B, g = 7: float32 1.42 to 1.44 times as fast on one thread at
+  // position 2000, 1.15 to 1.26 on four, CI's x86-64 and arm64; TODO.md's T160): float32 there, unless that alone
+  // takes the model past a 32-bit memory (Qwen2.5 3B: 3.82 GiB, 4.03 in float32). keysInHalf tells which.
+  const half = halfKV && (kvHeads >= heads || (needsWide(size, others + 4 * keys) && !needsWide(size, others + 2 * keys)));
+  return others + keys * (half ? 2 : 4);
 }
+/** T160: whether the keys and values of a model that may keep them in float16 (footprint's halfKV) do, as footprint
+ * counts them. The worker hands this to createForward: what it sized the memory for. */
+export const keysInHalf = (header, size, options = {}) =>
+  Boolean(options.halfKV) && footprint(header, size, options) < footprint(header, size, { ...options, halfKV: false });
 /** Whether a checkpoint of size bytes and the forward pass after it (footprint) pass the 4 GiB of a 32-bit memory.
  * A model that fits stays there: a 64-bit memory runs the kernels about a tenth slower (T101, measured). */
 export const needsWide = (size, after) => CONTROL_BYTES + size + after > PAGES_32 * PAGE;
@@ -284,12 +295,12 @@ const CHUNKS_PER_THREAD = 4;
 
 /** What Llama(external=) takes: the size of the checkpoint, read() for the few bytes Python looks at itself, and
  * start(plan), which builds the forward pass. */
-export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce }) {
+export function external({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce, halfKeys }) {
   const outside = {
     size,
     read: (offset, length) => new Uint8Array(memory.buffer, base + offset, length).slice(),
     start: (plan) => {
-      outside.engine = createForward({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce,
+      outside.engine = createForward({ memory, base, size, kernels, spawn, gpu, gpuRoom, gpuRemembered, gpuForce, halfKeys,
         plan: plan.toJs ? plan.toJs({ dict_converter: Object.fromEntries }) : plan });
       return outside.engine;
     },
@@ -315,6 +326,9 @@ function halfToFloat(h) {
 /** wrap (tests/profile.mjs only): gets the kernels' exports and returns what to call instead, to time the forward
  * pass with some kernels replaced by functions that do nothing. */
 /** stalledMs (tests only): how long a phase may make no progress before its software threads are given up (T120) */
+/** halfKeys (T160): keysInHalf's answer for this model, which the worker sized the memory by. Left out (the tests,
+ * the benchmark's own model): float16 where every head has keys of its own, which keysInHalf answers for every model
+ * that fits a 32-bit memory with float32 keys and values, or needs a 64-bit one either way. */
 /** gpuForce (tests only, T147): { matrices, attention }, the names of the GPU's shaders to take (shaders.js's
  * promptForms, gpu.js's attentions), without timing the others. T148: fallback, a fallback adapter taken as a GPU
  * (SwiftShader and lavapipe: the only WebGPU of CI and the development machine); always, every block the GPU can take
@@ -323,7 +337,7 @@ function halfToFloat(h) {
  * gpu.js's STEP_MS in CI, T147); pieceBytes (T155), the most bytes of a piece of a matrix on the GPU, so that a small
  * model goes in pieces as a matrix past a buffer of the device does */
 export function createForward({ memory, base, size, kernels, plan, spawn, gpu, gpuRoom, gpuRemembered, gpuForce = {},
-  wrap = (exports) => exports, stalledMs = STALLED_MS }) {
+  halfKeys, wrap = (exports) => exports, stalledMs = STALLED_MS }) {
   const { dim, n_layers: layers, n_heads: heads, n_kv_heads: kvHeads, head_size: headSize, vocab_size: vocab,
     seq_len: seqLen, rotary, arch } = plan;
   const hidden = plan.hidden_dim, kvDim = kvHeads * headSize, qDim = heads * headSize;
@@ -427,8 +441,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // shared, that is where there are software threads: several threads wait on the memory, and reading half of it
   // made a long context 1.2 times as fast with 4; one thread waits on the arithmetic, and widening every key and
   // value made it 1.6 to 1.8 times as slow. A float32 model, the one held to NumPy's numbers, stays in float32.
+  // T160: a grouped-query model's too, unless that alone would not fit a 32-bit memory (keysInHalf, halfKeys). The
+  // GPU's keys and values stay float16 either way: cacheHalves widens them into a float32 cache.
   // KV: the bytes of one position's keys in the cache; KF: in float32.
-  const halfKV = Boolean(plan.half_kv) && sharedMemory;
+  const halfKV = Boolean(plan.half_kv) && sharedMemory && (halfKeys ?? kvHeads >= heads);
   const D = dim * 4, HD = hidden * 4, KF = kvDim * 4, QF = qDim * 4, KV = kvDim * (halfKV ? 2 : 4);
   const inFrame = frameArrays(dim, hidden, kvDim, qDim), S = frameBytes(inFrame);
   const frames = alloc(BATCH * S), at = {};

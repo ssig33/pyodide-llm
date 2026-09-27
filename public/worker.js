@@ -562,16 +562,18 @@ function pooledWeights(size, after, shared, wide) {
 // T115: what the forward pass of a checkpoint of size bytes puts after it, at most (forward.js's footprint()): from
 // its header (the 7 ints) and the options it is loaded with (their form: head_dim where a head is not dim / heads,
 // T124: the keys and values of a Qwen3 0.6B are twice what the header says), on a shared memory (an int8 model's keys
-// and values in float16 there, T110) or not
-function afterCheckpoint(header, size, options, shared) {
+// and values may be float16 there, T110; forward.js's keysInHalf says whether they are, T160) or not.
+// What footprint() takes (the worker asks keysInHalf the same).
+function forwardOptions(options, shared) {
   const { dtype = "float32" } = options;
   const int8 = !disabled.includes("int8"), quantized = dtype === "int8" || dtype === "int6";
-  return forwardModule.footprint(header, size, {
+  return {
     ...options, dtype, int8, relaxed: Boolean(jsKernels?.relaxed) && !disabled.includes("relaxed"),
     halfKV: shared && quantized && int8 && !disabled.includes("kv16"),
     kvStart: llama2_numpy.KV_START, outliers: llama2_numpy.OUTLIER_CHANNELS, gpu: hasWebGpu,
-  });
+  };
 }
+const afterCheckpoint = (header, size, options, shared) => forwardModule.footprint(header, size, forwardOptions(options, shared));
 // the page cross-origin isolated (stage 3), shared memories to be had, and not ?threads=1: the memory is shared
 const sharedWanted = () => Boolean(sharedKernels && self.crossOriginIsolated && threadsRequest?.fixed !== 1);
 
@@ -602,6 +604,7 @@ function weightsBuffer(size, header, options) {
     // to). Where a shared one is refused after all, the plain one keeps float32 keys and values, twice what was
     // counted: a model at the edge then runs out of memory near the end of its context (T115)
     const after = afterCheckpoint(header, size, options, wanted);
+    const halfKeys = forwardModule.keysInHalf(header, size, forwardOptions(options, wanted));  // T160: what after counts
     const wide = forceWide || forwardModule.needsWide(size, after);
     if (wide && !wideKernels?.plain) {
       throw new Error("This model needs more than 4 GB of memory, which this browser cannot give a web page (no 64-bit " +
@@ -625,7 +628,7 @@ function weightsBuffer(size, header, options) {
         // them would slow down with its upload and compilation; its first load is one of them)
         // (nor under the rounds of /benchmark/'s model section, T184: the same; its page path starts the GPU after them)
         outsideNow = forwardModule.external({ memory, base, size, kernels, spawn, gpu: hasWebGpu && !benchPage && !benching ? openGpu : undefined, gpuRoom,
-          gpuRemembered: gpuRequest?.remembered, gpuForce });
+          gpuRemembered: gpuRequest?.remembered, gpuForce, halfKeys });
         return llama2_numpy.Llama.callKwargs(null, tokenizer, { ...options, external: outsideNow });
       },
       destroy() {},
