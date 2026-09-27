@@ -6,7 +6,8 @@
 //
 // The scenes: the page with the smallest model ready; the settings sheet open at its engine switches (T75); the
 // benchmark's bubble (T76); the sheet that opens any repository, and a repository the converter refuses (T88);
-// /benchmark/ before a run and after "Run all" (T134, whole pages: it is a page that scrolls).
+// /benchmark/ before a run, while "Run all" runs the CPU section (T177: its progress) and after (T134, whole pages: it is
+// a page that scrolls).
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -130,6 +131,14 @@ for (const [width, viewport] of Object.entries(widths)) {
   await acrossReload(() => page.waitForFunction(() => document.querySelector("section .head button"), null, { timeout: 120000 }));
   await page.screenshot({ path: path.join(directory, `benchmark-${width}.png`), fullPage: true });
   await page.goto(`${site}benchmark/?run=all&model=stories260K&size=64`);
+  // T177: the CPU section under way, its stage counted and its seconds going (the window, not the whole page)
+  await acrossReload(() => page.waitForFunction(() => {
+    const box = document.querySelector('section[data-section="cpu"] .progress');
+    return box && !box.hidden && /\/ \d+ ·/.test(box.querySelector(".stage").textContent)
+      && box.querySelector(".elapsed").textContent !== "0 s";
+  }, null, { timeout: 300000, polling: 100 }));
+  await page.locator('section[data-section="cpu"]').scrollIntoViewIfNeeded();
+  await shot(page, "benchmark-running", width);
   await acrossReload(() => page.waitForFunction(() => window.__benchmark?.done, null, { timeout: 900000 }));
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(directory, `benchmark-done-${width}.png`), fullPage: true });

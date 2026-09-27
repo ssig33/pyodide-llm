@@ -40,6 +40,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
         <label><input id="large" type="checkbox" /> GPU: also Llama 3.2 3B (3.2 GB)</label>
         <label><input id="full" type="checkbox" /> model: every step (slower)</label>
       </div>
+      <p id="overall" class="overall" hidden></p>
       <section data-section="device">
         <h2>This browser</h2>
         <p class="about">WebAssembly SIMD and relaxed SIMD, 64-bit memories, shared memory (software threads), WebGPU and
@@ -108,6 +109,18 @@ const BENCH_MODEL = "llm-jp-3-150m";
   section { border-top: 1px solid var(--line); padding: 12px 0; }
   .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .head .state { font-size: 0.8rem; color: var(--muted); }
+  /* T177: a running section's stage and how long it has run, so that a long one is not taken for a frozen page */
+  .overall { font-size: 0.85rem; margin: -8px 0 12px; font-variant-numeric: tabular-nums; }
+  .progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline; font-size: 0.8rem; color: var(--muted); margin: 8px 0 2px; }
+  .progress[hidden] { display: none; }
+  .progress .bar { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .progress .bar > div { height: 100%; width: 0; border-radius: 3px; background: var(--accent); transition: width 0.3s; }
+  /* no count of stages: a piece going back and forth */
+  .progress .bar.unknown > div { width: 30%; animation: sweep 1.6s ease-in-out infinite alternate; }
+  @keyframes sweep { from { margin-left: 0; } to { margin-left: 70%; } }
+  @media (prefers-reduced-motion: reduce) { .progress .bar.unknown > div { animation: none; width: 100%; opacity: 0.35; } }
+  .progress .stage { overflow-wrap: anywhere; }
+  .progress .elapsed { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .state.ok { color: inherit; }
   .state.wrong, .state.error { color: var(--bad); }
   /* a table wider than a phone scrolls inside itself: the page never does */
@@ -171,8 +184,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
   }
   if (await isolating()) await new Promise(() => {});
 
-  // ---- the sections' elements: a head with a Run button and the state, and what the section found
-  const parts: Record<string, { run: HTMLButtonElement; state: HTMLElement; out: HTMLElement }> = {};
+  // ---- the sections' elements: a head with a Run button and the state, the progress while it runs (T177), and what
+  // the section found
+  type Progress = { box: HTMLElement; bar: HTMLElement; fill: HTMLElement; stage: HTMLElement; elapsed: HTMLElement };
+  const parts: Record<string, { run: HTMLButtonElement; state: HTMLElement; progress: Progress; out: HTMLElement }> = {};
   for (const section of document.querySelectorAll<HTMLElement>("section[data-section]")) {
     const name = section.dataset.section as Name;
     const head = document.createElement("div");
@@ -185,10 +200,16 @@ const BENCH_MODEL = "llm-jp-3-150m";
     state.className = "state";
     head.append(title, run, state);
     section.prepend(head);
+    const box = document.createElement("div");
+    box.className = "progress";
+    box.hidden = true;
+    box.innerHTML = `<div class="bar" role="progressbar" aria-label="${title.textContent}"><div></div></div><span class="stage"></span><span class="elapsed"></span>`;
+    const progress = { box, bar: box.querySelector<HTMLElement>(".bar")!, fill: box.querySelector<HTMLElement>(".bar > div")!,
+      stage: box.querySelector<HTMLElement>(".stage")!, elapsed: box.querySelector<HTMLElement>(".elapsed")! };
     const out = document.createElement("div");
     out.className = "out";
-    section.append(out);
-    parts[name] = { run, state, out };
+    section.append(box, out);
+    parts[name] = { run, state, progress, out };
     run.onclick = () => runSections([name]);
   }
 
@@ -217,13 +238,42 @@ const BENCH_MODEL = "llm-jp-3-150m";
     return html.join("");
   }
 
+  // ---- T177: the stage the running section is at. at / of where the section knows how many stages it has (the bar
+  // then fills stage by stage, and within a stage by part, 0 to 1, where that is known), else the stage's name only
+  type Stage = { stage: string; at?: number; of?: number; part?: number };
+  let current: Name | undefined, sectionBegan = 0, runBegan = 0;
+  const clock = (ms: number) => {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
+  };
+  function staged(name: Name, { stage, at, of, part = 0 }: Stage) {
+    const p = parts[name].progress;
+    const counted = Boolean(at && of);
+    p.bar.classList.toggle("unknown", !counted);
+    p.fill.style.width = counted ? `${(100 * Math.min(1, (at! - 1 + Math.min(1, part)) / of!)).toFixed(1)}%` : "";
+    if (counted) p.bar.setAttribute("aria-valuenow", String(Math.round((100 * (at! - 1)) / of!)));
+    else p.bar.removeAttribute("aria-valuenow");
+    p.stage.textContent = counted ? `${at} / ${of} · ${stage}` : stage;
+  }
+  // the seconds of the running section, and of the whole run when it is more than one section
+  let runNames: readonly Name[] = [];
+  function ticked() {
+    if (!current) return;
+    const now = performance.now();
+    parts[current].progress.elapsed.textContent = clock(now - sectionBegan);
+    if (runNames.length > 1) {
+      const title = document.querySelector(`section[data-section="${current}"] h2`)?.textContent;
+      $("overall").textContent = `Section ${runNames.indexOf(current) + 1} / ${runNames.length} · ${title} · ${clock(now - runBegan)} in all`;
+    }
+  }
+
   // one worker, one question, one answer (the section workers answer every message once)
   function ask(worker: Worker, message: any): Promise<any> {
     return new Promise((resolve) => {
       worker.onmessage = ({ data }) => {
-        // the GPU section's device-lost notice comes on its own, and so do the line's "still reading" and the GPU
-        // prompt's "still at it"
-        if (data.lost || data.alive) return;
+        // the GPU section's device-lost notice comes on its own, and so do the line's "still reading", the GPU
+        // prompt's "still at it" and a section's stages (T177)
+        if (data.lost || data.alive || data.stage !== undefined) return;
         resolve(data);
       };
       worker.onerror = (event) => resolve({ error: `the worker failed: ${event.message ?? "error"}` });
@@ -238,7 +288,10 @@ const BENCH_MODEL = "llm-jp-3-150m";
   function worker(file: string) {
     const w = new Worker(`${BASE}${file}${V}`, { type: "module" });
     live.add(w);
-    w.addEventListener("message", () => { heard = performance.now(); });
+    w.addEventListener("message", ({ data }) => {
+      heard = performance.now();
+      if (current && typeof data?.stage === "string") staged(current, data);
+    });
     return w;
   }
   const STALL_MS = 5 * 60_000, TICK_MS = 5000;
@@ -312,17 +365,22 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const entry = model();
     const w = worker("worker.js");
     const rounds = ($("full") as HTMLInputElement).checked ? FULL_ROUNDS : ROUNDS;
+    // T177: the load, then each round (loaded again and run: the worker says ready at the end of each round's load)
+    const stages = 1 + rounds.length;
+    let readies = 0;
+    const round = (i: number) => staged("model", { stage: `round: ${rounds[i].name}`, at: 2 + i, of: stages });
     try {
       const answer: any = await new Promise((resolve) => {
-        let asked = false;
         w.onmessage = ({ data }) => {
-          if (data.type === "status") parts.model.state.textContent = data.text;
-          else if (data.type === "progress") parts.model.state.textContent = `${(data.received / 1e6 || 0).toFixed(1)} / ${(data.total / 1e6).toFixed(1)} MB`;
-          else if (data.type === "ready" && !asked) {
-            // once: every round loads the model again and says ready too (T96)
-            asked = true;
-            parts.model.state.textContent = "the rounds...";
-            w.postMessage({ type: "bench", model: entry, load: 1, rounds, prompt: entry.prompt || "Once upon a time", steps: 64 });
+          if (data.type === "status" && !readies) staged("model", { stage: data.text, at: 1, of: stages });
+          else if (data.type === "progress" && !readies) {
+            staged("model", { stage: `the model: ${(data.received / 1e6 || 0).toFixed(1)} / ${(data.total / 1e6).toFixed(1)} MB`,
+                              at: 1, of: stages, part: data.received / data.total || 0 });
+          } else if (data.type === "ready") {
+            // the bench once: every round loads the model again and says ready too (T96)
+            if (!readies) w.postMessage({ type: "bench", model: entry, load: 1, rounds, prompt: entry.prompt || "Once upon a time", steps: 64 });
+            round(Math.min(Math.max(readies - 1, 0), rounds.length - 1));
+            readies++;
           } else if (data.type === "bench") resolve(data);
           else if (data.type === "error") resolve({ error: data.message });
         };
@@ -350,8 +408,11 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const w = worker("benchmark/gpu.js");
     const steps: any[] = [];
     let lost: string | undefined;
+    // T177: the steps are this page's, counted once the adapter says whether it has the packed int8 dot
+    const models = ["llm-jp-3 150M", "Llama 3.2 1B", ...(($("large") as HTMLInputElement).checked ? ["Llama 3.2 3B"] : [])];
+    let of: number | undefined;
     const step = async (name: string, message: any) => {
-      parts.gpu.state.textContent = `${name}...`;
+      staged("gpu", { stage: name, at: of && steps.length + 1, of });
       const answer = await ask(w, message);
       steps.push({ name, ...(answer.error ? { error: answer.error } : { result: answer.result }) });
       return answer.result;
@@ -363,9 +424,12 @@ const BENCH_MODEL = "llm-jp-3-150m";
         const why = steps[0].error ?? (info?.worker ? "navigator.gpu gave no adapter" : "no WebGPU in a worker here");
         return { status: "none", markdown: why };
       }
+      // the adapter, the check, the shapes, the tokens, the ways, a layer, besides the weights, the ceilings, a prompt,
+      // the bridge
+      of = 2 + Object.keys(SHAPES).length + models.length * (info.packed ? 2 : 1) + GPU_WAYS.length + 5;
       const check = await step("the shaders against JavaScript", { step: "check" });
       for (const [name, shape] of Object.entries(SHAPES)) await step(`bandwidth: ${name}`, { step: "bandwidth", shape });
-      for (const name of ["llm-jp-3 150M", "Llama 3.2 1B", ...(($("large") as HTMLInputElement).checked ? ["Llama 3.2 3B"] : [])]) {
+      for (const name of models) {
         await step(`a token of ${name}`, { step: "token", model: name, kind: "widen" });
         if (info.packed) await step(`a token of ${name}, packed int8`, { step: "token", model: name, kind: "packed" });
       }
@@ -377,6 +441,7 @@ const BENCH_MODEL = "llm-jp-3-150m";
       // T168: the ceilings just before the prompt, so that both are measured as warm as each other
       await step("the device's ceilings", { step: "ceilings" });
       await step("a prompt all at once", { step: "prompt", counts: PROMPT_COUNTS });
+      staged("gpu", { stage: "the bridge", at: of, of });
       const bridge = await gpuBridge(w);
       const wrong = check && Object.values(check).some((v: any) => !v.ok && !v.error);
       // not ok either when the shaders could not be checked (or a tiled one could not run, T146), or when the device
@@ -516,7 +581,6 @@ const BENCH_MODEL = "llm-jp-3-150m";
       const info = await ask(w, { step: "info" });
       if (info.error) return { status: "error", markdown: info.error };
       if (!info.result.syncHandle) return { status: "none", markdown: "no private file system that a worker can write in place here" };
-      parts.storage.state.textContent = "writing...";
       const answer = await ask(w, { step: "run", mib: Number(($("size") as HTMLSelectElement).value) });
       if (answer.error) return { status: "error", markdown: answer.error };
       const r = answer.result, mb = (r.mib * 2 ** 20) / 1e6;
@@ -590,11 +654,20 @@ const BENCH_MODEL = "llm-jp-3-150m";
     const buttons = [$("run-all"), ...Object.values(parts).map((p) => p.run)] as HTMLButtonElement[];
     buttons.forEach((b) => (b.disabled = true));
     (window as any).__benchmark.done = false;
+    runNames = names;
+    runBegan = performance.now();
+    $("overall").hidden = names.length < 2;
+    const tick = setInterval(ticked, 1000);
     for (const name of names) {
-      const { state, out } = parts[name];
+      const { state, progress, out } = parts[name];
       state.className = "state";
       state.textContent = "running...";
       out.innerHTML = "";
+      current = name;
+      sectionBegan = performance.now();
+      staged(name, { stage: "starting" });
+      progress.box.hidden = false;
+      ticked();
       let result: Result;
       const stall = stalled();
       try {
@@ -607,8 +680,9 @@ const BENCH_MODEL = "llm-jp-3-150m";
         live.clear();
       }
       results[name] = result;
+      progress.box.hidden = true;
       state.className = `state ${result.status}`;
-      state.textContent = STATE[result.status];
+      state.textContent = `${STATE[result.status]} · ${clock(performance.now() - sectionBegan)}`;
       out.innerHTML = rendered(result.markdown);
       // T157: the GPU section's tables hold the GPU against the CPU section; a CPU section run after it (on its own
       // button) writes them again, and the report with them
@@ -619,6 +693,9 @@ const BENCH_MODEL = "llm-jp-3-150m";
       }
       report();
     }
+    clearInterval(tick);
+    current = undefined;
+    if (names.length > 1) $("overall").textContent = `${names.length} sections in ${clock(performance.now() - runBegan)}`;
     buttons.forEach((b) => (b.disabled = false));
     (window as any).__benchmark.done = true;
     running = false;

@@ -10,6 +10,9 @@
 //                                 whether the file opens again once the first is closed. The file is removed at the end.
 
 const PIECE = 8 << 20;
+// T177: the stage a run is at, for the page to show ({stage, at, of}; it answers none of the page's questions)
+const STAGES = 4;
+const stage = (name, at) => postMessage({ stage: name, at, of: STAGES });
 const FOLDER = "benchmark", FILE = "pieces.bin", PROGRESS = "progress.json";
 
 // the bytes of piece i: a pattern of its own, so that the read-back can tell the pieces apart
@@ -81,13 +84,16 @@ async function run(mib) {
       return { seconds: seconds(start), flushSeconds: seconds(f) };
     };
     const apart = scattered(count);
+    stage("writing in order", 1);
     out.sequential = once(Array.from({ length: count }, (_, i) => i));
+    stage("writing far apart", 2);
     out.scattered = once(apart);
     // (c) far apart with a flush after every piece and the small record rewritten, as a resumable conversion would
     // at every boundary of a tensor (T137, 2: the record comes after the flush of the output)
     const progressFile = await dir.getFileHandle(PROGRESS, { create: true });
     const progress = await progressFile.createSyncAccessHandle();
     const encoder = new TextEncoder();
+    stage("far apart, a flush after each piece", 3);
     try {
       const start = performance.now();
       let flushing = 0;
@@ -106,6 +112,7 @@ async function run(mib) {
       progress.close();
     }
     // (d) read back in order, and check that every piece is the one written there
+    stage("reading back", 4);
     began = performance.now();
     let wrong = 0;
     for (let i = 0; i < count; i++) {

@@ -43,6 +43,27 @@ const WEBGPU = ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-web
 // the sections whose failure is this page's: the others depend on the runner (its GPU, its disk, its line), and what
 // they could not do is printed
 const OURS = ["device", "cpu", "model"];
+// T177: every stage a section showed while it ran, as the page drew it (a watcher in the page from its start, so that a
+// stage shown for a moment is seen too). A section of more than one stage that measured and never changed its stage
+// on the page would look frozen to a visitor: that fails (the page's own "starting" is not counted: the stages come from
+// the section). The browser's features are one quick stage, and a section
+// that found no such thing here stops at its first.
+const STAGED = ["cpu", "model", "gpu", "storage", "line"];
+function watchStages() {
+  const seen = (window.__stages = {});
+  const look = () => {
+    for (const box of document.querySelectorAll("section[data-section] .progress")) {
+      const text = box.querySelector(".stage")?.textContent;
+      const name = box.closest("section").dataset.section;
+      if (box.hidden || !text) continue;
+      const list = (seen[name] ??= []);
+      if (list.at(-1) !== text) list.push(text);
+    }
+  };
+  document.addEventListener("DOMContentLoaded", () => {
+    new MutationObserver(look).observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+  });
+}
 
 let failed = false;
 for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"]) {
@@ -57,6 +78,7 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
     continue;
   }
   const page = await (await browser.newContext()).newPage();
+  await page.addInitScript(watchStages);
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error.message)));
   try {
@@ -77,6 +99,15 @@ for (const engine of engines.length ? engines : ["chromium", "firefox", "webkit"
     console.log(`sections: ${statuses.join(", ")}`);
     for (const [name, result] of Object.entries(results)) {
       if (result.status === "wrong" || (result.status === "error" && OURS.includes(name))) failed = true;
+    }
+    const stages = await page.evaluate(() => window.__stages);
+    for (const [name, result] of Object.entries(results)) {
+      const shown = stages[name] ?? [];
+      console.log(`${name} stages on the page: ${shown.join(" → ") || "none"}`);
+      if (STAGED.includes(name) && ["ok", "wrong"].includes(result.status) && new Set(shown.filter((text) => text !== "starting")).size < 2) {
+        console.log(`${name}: its stage on the page never changed while it ran`);
+        failed = true;
+      }
     }
     // the shaders against JavaScript are the GPU section's check of its own results: with an adapter they must run
     // (and every tiled shader of T146 among them: one the runner's adapter could not make fails here too)

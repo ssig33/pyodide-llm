@@ -13,9 +13,11 @@
 //                                               huggingface.co read no faster than each of rates (MB/s)
 //
 // The first message is claimed before anything is awaited (a module worker's port opens at its first await, and a
-// message that comes before onmessage is set is lost: T109).
+// message that comes before onmessage is set is lost: T109). While a step runs, it tells the page each stage it starts
+// ({stage, at, of}, T177): the page shows it, and it answers none of the page's questions.
 const search = new URL(import.meta.url).search;  // ?v=<commit>: every file of the same deployment
 const at = (name) => new URL(`../${name}${search}`, import.meta.url);
+const stage = (name, at, of) => postMessage({ stage: name, at, of });
 
 self.onmessage = async ({ data }) => {
   try {
@@ -146,6 +148,10 @@ async function cpu(counts = [1, 2, 4]) {
   const shared = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
   const kernels = shared ? await kernelsOf(forward, "shared") : await kernelsOf(forward, "plain");
   if (!kernels) return { none: "no WebAssembly SIMD in this browser: the model page runs on NumPy here" };
+  // T177: making the model, then each count of software threads (one only without shared memory)
+  const stages = 1 + counts.filter((asked) => shared || asked === 1).length;
+  let done = 0;
+  stage("making the model", ++done, stages);
   const model = madeUpModel();
   const after = forward.footprint(model.header, model.size, { dtype: "int8", relaxed: Boolean(kernels.relaxed), halfKV: shared });
   const { memory, base } = forward.weightsMemory(model.size, { shared, after });
@@ -156,6 +162,7 @@ async function cpu(counts = [1, 2, 4]) {
     for (const asked of counts) {
       // without shared memory there are no software threads: one row, of one thread
       if (!shared && asked > 1) continue;
+      stage(`${asked} software thread${asked > 1 ? "s" : ""}`, ++done, stages);
       const threads = await engine.setThreads(asked);
       if (threads !== asked) {
         rows.push({ asked, threads, none: "the browser did not start that many software threads" });
@@ -248,18 +255,22 @@ async function measure(url, { bytes, rate, range = true }) {
 
 async function line({ site, hf, rates = [], seconds = 4 }) {
   const out = { site: null, hf: null, paced: [] };
+  const stages = 2 + rates.length;
+  stage("this site: a part of the model", 1, stages);
   try {
     out.site = await measure(site.url, site);
   } catch (error) {
     out.site = { error: String(error.message ?? error) };
   }
+  stage("huggingface.co: a range of a model", 2, stages);
   try {
     out.hf = await measure(hf.url, { bytes: hf.bytes });
   } catch (error) {
     out.hf = { error: String(error.message ?? error) };
     return out;
   }
-  for (const rate of rates) {
+  for (const [i, rate] of rates.entries()) {
+    stage(`huggingface.co no faster than ${rate} MB/s`, 3 + i, stages);
     // a line slower than the rate asked for cannot be paced to it: said as such, not measured for ever
     if (out.hf.MBps < rate) {
       out.paced.push({ rate, slower: true });
