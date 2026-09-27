@@ -15,6 +15,7 @@
 import json
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -53,6 +54,9 @@ def fetch(entry, name, directory):
                     while block := response.read(CHUNK):
                         out.write(block)
                 break
+            except urllib.error.HTTPError as error:
+                if error.code < 500 or attempt == 2:
+                    raise  # a file the repository does not have (404) is not asked for again (T192: split models)
             except OSError:
                 if attempt == 2:
                     raise

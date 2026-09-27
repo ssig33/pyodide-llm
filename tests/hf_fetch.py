@@ -8,6 +8,7 @@
 import json
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 from fixed_outputs import HERE, fetch
@@ -22,7 +23,20 @@ if model_id.startswith("hf:"):
 else:
     entry = json.loads(subprocess.check_output(["node", "-e", script], cwd=HERE.parent))
 hf = entry["hf"]
-weights = fetch(entry, hf["weights"], directory)
+try:
+    weights = fetch(entry, hf["weights"], directory)
+except urllib.error.HTTPError as error:
+    # T192: a model without a model.safetensors is split over several files (Qwen3 1.7B and up). Its index says which,
+    # read as the page's worker reads it (shardsOf()): the files named in weight_map, in the order of their names.
+    # perplexity_prepare.py joins them as the page does (llama2_convert.joined_shards()).
+    if error.code != 404 or hf["weights"].endswith(".gguf"):
+        raise
+    index = fetch(entry, f"{hf['weights']}.index.json", directory)
+    shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+    if not shards:
+        raise
+    for name in shards:
+        weights = fetch(entry, name, directory)
 gguf, vocabulary = hf["weights"].endswith(".gguf"), hf.get("vocabulary")
 if gguf and not vocabulary:
     print(weights)  # T74: the GGUF says its configuration and vocabulary itself
