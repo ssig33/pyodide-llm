@@ -428,6 +428,7 @@ T146 → T168 → T147 → T148 → T149 → T150 → T151 → T175 → T170 →
 - **文面の案（英語の仮）**: 帯「3 / 9 · bandwidth: Llama 3.2 1B w1」と右に「42 s」「1 min 04 s」、始めは「starting」、終わりの状態「done · 42 s」、全体「Section 2 / 6 · CPU · 1 min 04 s in all」「6 sections in 3 min 10 s」。段の名前: CPU「making the model」「1 software thread」「2 software threads」、保存「writing in order」「writing far apart」「far apart, a flush after each piece」「reading back」、回線「this site: a part of the model」「huggingface.co: a range of a model」「huggingface.co no faster than 4 MB/s」、モデル「(Worker の文そのまま)」「the model: 12.3 / 171.0 MB」「round: everything」、GPU は今までの段の名前（「the adapter」「the shaders against JavaScript」…「the bridge」）。
 - 持ち主に見てもらうこと: preview.yml の画面（棒の色と太さ、帯の位置、全体の行の位置と言い方）。GPU の節の段の名前は長いものがあり、スマホでは 2 行に折れる。
 
+- **本線に入れた（2026-09-27、持ち主が `preview.yml` の画面を見て「なんかよさそう。入れてみて違ったらまた言うよ」）**。画面で気づいた別件: スマホ幅で機能の表の「storage the browser grants」の値が右で切れる（T177 の前から）。
 ### T175 [性能] 1 トークンの層の行列を ORT DP4A small M の形に（T150 の融合を載せ替える） — 状態: 未着手（2026-09-27、持ち主の Android の報告から。T152 の前。規模 中）
 - 根拠: 持ち主の Android で、1 トークンの行列 × ベクトルは ORT DP4A small M が 1B の w1 で 38.6 GB/s（バッファの読みの 96.8%）なのに、T150 の層（分けた形も融合も）は llama.cpp の mul_mat_vec を土台にしていて 7.4 GB/s（18.5%）、融合は分けた形の 0.87〜0.99 倍（T150 の覆す条件に当たった）。1B の 1 トークンは今の形で約 150 ms（16 層）、DP4A の形なら重みの読みで約 29 ms（1.1 GB ÷ 38.6）の見込み。
 - 作るもの: `fusedMatVec` の行列の部分を ORT DP4A small M（T149 の `ortDp4aMatVec`、活性値を QUANTIZE してから `dot4I8Packed`）に載せ替えた形。norm・RoPE とキャッシュ・残差・SwiGLU の融合は、この形の上で残すか外すかを端末で測って決める（分けた形・norm を別にした形・融合を並べて交互に）。T151 のトークンを GPU で回す形（`generate`）もこの層を使う。元ネタ: ORT の `dp4a_matmul_nbits.cc` の small M（MIT）。
