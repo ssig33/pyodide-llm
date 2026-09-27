@@ -136,8 +136,10 @@ jobs:
             // T145: the list itself, each GGUF against the original its vocabulary comes from
             if (process.env.LISTED === "true") {
               for (const { id, hf } of MODELS.filter((model) => model.hf?.vocabulary && model.hf.weights?.endsWith(".gguf"))) {
-                if (jobs.some((job) => job.id === id)) continue;
-                jobs.push({ id, original: `${hf.vocabulary.repo}@${hf.vocabulary.revision}`, gguf: `${hf.repo}@${hf.revision}/${hf.weights}` });
+                const gguf = `${hf.repo}@${hf.revision}/${hf.weights}`;
+                // a Qwen3 is in the list twice (thinking and not, T124) with one GGUF: checked once (the review of T203)
+                if (jobs.some((job) => job.id === id || job.gguf === gguf)) continue;
+                jobs.push({ id, original: `${hf.vocabulary.repo}@${hf.vocabulary.revision}`, gguf });
               }
             }
             console.log(`matrix=${JSON.stringify(jobs)}`);
