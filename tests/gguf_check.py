@@ -23,7 +23,9 @@
 #       Two converted checkpoints (the <out> of tests/perplexity_prepare.py) on the same text: the largest logit
 #       difference, how often the most likely token agrees, and the perplexity of each. The acceptance of T74 is
 #       this between the int8 made from the GGUF and the int8 made from safetensors: top-1 agreement of 99% and
-#       perplexity within 0.2% (exit 1 otherwise).
+#       perplexity within 0.2% (exit 1 otherwise). That line holds for models whose int8 costs about 0.6% or less
+#       (SmolLM2 135M, Pythia 410M): where it costs 1 to 3% (Pythia 70M and 160M, GPT-2), an int8 of the original
+#       rounded again as well (its scales made float16) is outside it too (T136's third stage, the review).
 import json
 import math
 import struct
@@ -693,7 +695,9 @@ def check_logits(a, b, text_file, count):
     # The line T74 is held to (Fable, 2026-09-24): the two int8 differ only by the rounding of the scales
     # (float16 in Q8_0, float32 here), so they must agree on the most likely token 99 times in 100 and be within
     # 0.2% of perplexity. The float32 against int8 of the same model measures 96.3% and 0.6%: a mistake in the
-    # reader (a wrong order, a wrong scale) lands far outside this.
+    # reader (a wrong order, a wrong scale) lands far outside this. Only for a model as little bothered by int8: on
+    # Pythia 70M and 160M and GPT-2 (int8 costs 1 to 3% there) two int8 of the same quality agree 94.5 to 98.6% of
+    # the time and differ by up to 0.2% (T136's third stage, the review): read those against such a rounding again.
     ok = agree / n >= 0.99 and abs(second_ppl / first_ppl - 1) <= 0.002
     print(json.dumps({"a": Path(a).name, "b": Path(b).name, "tokens": n, "largest logit difference": largest,
                       "top-1 agreement": agree / n, "perplexity a": first_ppl, "perplexity b": second_ppl,
