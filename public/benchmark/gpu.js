@@ -1261,12 +1261,16 @@ async function generate() {
       const fixed = work && !work.unsteady ? msPerToken * per - work.ms * per : undefined;
       return { perSubmission: per, msPerToken, ...(fixed === undefined ? {} : { fixedMs: fixed }) };
     });
-    // the sampling alone, on Llama 3's vocabulary (128256 logits, made up: a spread of 2 and 20 tokens far above it)
+    // the sampling alone, on Llama 3's vocabulary: logits as a model's, and flat ones (every token over the floor)
     const sampling = fallback ? undefined : await samplingAlone();
     return { model: fallback ? "the check's small model" : "Llama 3.2 1B's width", layers: model.layers, vocab: model.vocab,
       GB: parts.bytes / 1e9, dispatches: parts.dispatches, tokens, settings: GENERATE_SETTINGS, work, rows, sampling };
   });
 }
+// the sampling alone (paired(): T168's n and 2n) on Llama 3's vocabulary, twice: on logits as a model's (madeUpLogits:
+// a spread of 2 and 20 tokens far above it, a few percent of the vocabulary over the nucleus's floor) and on flat ones
+// (a spread of 1, none above: every token over the floor, so that SAMPLE gathers and reads all of them each round
+// of its searches: its worst case). `over` is how many tokens are over the floor
 async function samplingAlone() {
   const vocab = MODELS["Llama 3.2 1B"].vocab, positions = 2 * GENERATE_MOST + 2;
   return scoped(async (owned) => {
@@ -1278,24 +1282,51 @@ async function samplingAlone() {
     };
     const logits = make(vocab * 4), probs = make(vocab * 4), order = make(vocab * 4), state = make(WGSL.STATE_BYTES),
       chosen = make(positions * 4), randoms = make(positions * 4), settings = make(WGSL.SAMPLING_BYTES, UNIFORM | COPY_DST);
-    device.queue.writeBuffer(logits, 0, madeUpLogits(vocab, 2));
     device.queue.writeBuffer(randoms, 0, randomsOf(positions));
     device.queue.writeBuffer(settings, 0, WGSL.samplingSettings({ vocab, ...GENERATE_SETTINGS }));
     const history = [...Array(64)].map(() => (Math.random() * vocab) | 0), start = WGSL.samplingState({ token: history[63], pos: 0, history });
     const group = device.createBindGroup({ layout: sample.getBindGroupLayout(0),
       entries: [logits, probs, order, state, chosen, randoms, settings].map((b, binding) => ({ binding, resource: { buffer: b } })) });
-    const r = await paired(async (n) => {
-      device.queue.writeBuffer(state, 0, start);
-      const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
-      for (let i = 0; i < n; i++) run(pass, [sample, group, 1, 1]);
-      pass.end();
-      const began = performance.now();
-      device.queue.submit([encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-      return performance.now() - began;
-    }, GENERATE_MOST);
-    return { vocab, msEach: r.ms / r.dispatches, ...(r.unsteady ? { unsteady: true } : {}) };
+    const timed = async (values) => {
+      device.queue.writeBuffer(logits, 0, values);
+      const r = await paired(async (n) => {
+        device.queue.writeBuffer(state, 0, start);
+        const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+        for (let i = 0; i < n; i++) run(pass, [sample, group, 1, 1]);
+        pass.end();
+        const began = performance.now();
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        return performance.now() - began;
+      }, GENERATE_MOST);
+      return { msEach: r.ms / r.dispatches, over: overTheFloor(values, GENERATE_SETTINGS.temperature), ...(r.unsteady ? { unsteady: true } : {}) };
+    };
+    const peaked = await timed(madeUpLogits(vocab, 2)), flat = await timed(madeUpLogits(vocab, 1, 0));
+    return { vocab, ...peaked, flat };
   });
+}
+// how many of the logits SAMPLE keeps over the nucleus's floor (kernel.ts's: within temperature × ln 1e7 of the largest)
+function overTheFloor(logits, temperature) {
+  let best = -Infinity;
+  for (const value of logits) best = Math.max(best, value);
+  const floor = best - temperature * 16.118095;
+  let over = 0;
+  for (const value of logits) if (value >= floor) over++;
+  return over;
+}
+// logits with equal ones where the draw's order among them shows (the check's ties cases): two at the top (10: the
+// first index, 100, is the most likely), a run of 20 at TIED_RUN (a fifth of the top's probability each at temperature
+// 0.7, their indices descending as written so the order of the index is not the order written), and a tail of 200
+// distinct values below (a fiftieth each, rising by the index) that a nucleus of top-p 0.9 reaches into: no equal
+// logits at its border, where SAMPLE takes every equal token and the CPU's sort takes some (a different mass)
+const TIED_RUN = Math.fround(8.87);
+function tiedLogits(vocab) {
+  const logits = new Float32Array(vocab);
+  logits[700] = 10;
+  logits[100] = 10;
+  for (let i = 0; i < 20; i++) logits[900 - 3 * i] = TIED_RUN;
+  for (let i = 0; i < 200; i++) logits[200 + i] = 7.26 + i * 1e-3;
+  return logits;
 }
 // logits as a model's look (a few tokens far above the rest), made up: a normal spread and `peaks` tokens 8 to 14 over it
 function madeUpLogits(vocab, spread, peaks = 20) {
@@ -1336,16 +1367,18 @@ function acceptable(logits, { temperature, topp }, random, band = 0) {
 // The sampler alone: cases of logits (a vocabulary of 1003, not a multiple of 256, and Llama 3's 128256; normal
 // spreads from flat to steep, and tokens far above them), top-p 0.9, 0.5 and none, random numbers at 0, inside and
 // just under 1, temperature 0 and 1.3 too, the penalty (the window's tokens among the most likely, a repeated one,
-// negative ones, and likely ones older than the window that must not be penalized), and equal logits at the top and
-// at the border. Then runs of four tokens in one submission (the i-th random number for the i-th token, the logits
-// penalized again each time as the CPU's would be), and a run with a stop token: it is written, the state stops and
-// nothing after it changes.
+// negative ones, and likely ones older than the window that must not be penalized), and equal logits (tiedLogits: the
+// most likely token is the first index of the two at the top; the draw among equals is the exact token in the order of
+// the index, as SAMPLE takes them and walkLikeCpu walks them). Then runs of four tokens in one submission (the i-th
+// random number for the i-th token, the logits penalized again each time as the CPU's would be), and a run with a stop
+// token: it is written, the state stops and nothing after it changes.
 async function checkSampling() {
   const pipeline = await compiled(WGSL.SAMPLE);
   postMessage({ alive: true });
   const cases = [];
   for (const vocab of [1003, 128256]) {
-    for (const spread of vocab === 1003 ? [0.5, 2, 6, 12] : [2, 6]) {
+    // (a fallback adapter takes a second or so for each of the big vocabulary's: one spread there)
+    for (const spread of vocab === 1003 ? [0.5, 2, 6, 12] : fallback ? [2] : [2, 6]) {
       for (const topp of [0.9, 0.5, 1]) {
         for (const random of [0, Math.random(), 1 - 2 ** -24]) cases.push({ vocab, spread, topp, temperature: 0.7, penalty: 1.3, random });
       }
@@ -1355,8 +1388,11 @@ async function checkSampling() {
   }
   // a history shorter than the window (its empty slots must not count: token 0, among the most likely, is in none)
   for (const spread of [0.5, 2, 6]) for (let i = 0; i < 3; i++) cases.push({ vocab: 1003, spread, topp: 0.9, temperature: 0.7, penalty: 1.3, random: Math.random(), short: true });
-  cases.push({ vocab: 1003, spread: 2, topp: 0.9, temperature: 0.7, penalty: 1.3, random: 0.3, ties: true });
-  cases.push({ vocab: 1003, spread: 2, topp: 0.9, temperature: 0, penalty: 1, random: 0.3, ties: true });
+  // equal logits (tiedLogits): the draw on the first of the two at the top, on the fifth of the run of 20, and the most
+  // likely token (temperature 0)
+  cases.push({ vocab: 1003, topp: 0.9, temperature: 0.7, penalty: 1, random: 0.05, ties: true });
+  cases.push({ vocab: 1003, topp: 0.9, temperature: 0.7, penalty: 1, random: "fifth", ties: true });
+  cases.push({ vocab: 1003, topp: 0.9, temperature: 0, penalty: 1, random: 0.3, ties: true });
   const most = 128256, owned = [];
   let wrong = 0, edge = 0, checked = 0;
   const problems = [];
@@ -1398,9 +1434,12 @@ async function checkSampling() {
           WGSL.penalizeLikeCpu(cpu, seen, c.penalty);
           const { first, picks } = acceptable(cpu, c, draws[k]);
           checked++;
-          if (!picks.has(got.ids[k])) {
+          // the ties case holds SAMPLE to the token itself: equal probabilities in the order of their index, the
+          // random number in the middle of the fifth's share (no border near): a token of the same logit is not enough
+          const right = c.ties && c.temperature ? got.ids[k] === first : picks.has(got.ids[k]);
+          if (!right) {
             wrong++;
-            problems.push(`${c.vocab} spread ${c.spread} top-p ${c.topp} T ${c.temperature} r ${draws[k].toFixed(3)}: ${got.ids[k]}, the CPU ${first}`);
+            problems.push(`${c.vocab} spread ${c.spread ?? "tied"} top-p ${c.topp} T ${c.temperature} r ${draws[k].toFixed(3)}: ${got.ids[k]}, the CPU ${first}`);
             return;
           }
           if (got.ids[k] !== first) edge++;
@@ -1419,7 +1458,7 @@ async function checkSampling() {
         }
       };
       for (const c of cases) {
-        const logits = madeUpLogits(c.vocab, c.spread);
+        const logits = c.ties ? tiedLogits(c.vocab) : madeUpLogits(c.vocab, c.spread);
         const ranked = [...logits.keys()].sort((a, b) => logits[b] - logits[a]);
         // 70 tokens: the 6 before the window two of the most likely (3rd and 4th, which must not be penalized), then the
         // window: the three most likely twice each (a repeat is penalized once), early and late in it (both halves of
@@ -1429,16 +1468,11 @@ async function checkSampling() {
             ranked[1], ...ranked.slice(35, 43), ranked[2]];
         if (c.short) logits[0] = (logits[ranked[0]] + logits[ranked[1]]) / 2;
         let random = c.random;
-        if (c.ties) {
-          // equal logits: at the top (the first index is the most likely), and a run of 20 further down, where the
-          // random number falls on the fifth of them in the CPU's walk (the draw among equals)
-          logits[ranked[1]] = logits[ranked[0]];
-          for (let i = 10; i < 30; i++) logits[ranked[i]] = logits[ranked[10]];
-          const penalized = Float32Array.from(logits);
-          WGSL.penalizeLikeCpu(penalized, history, c.penalty);
-          const walk = c.temperature ? WGSL.walkLikeCpu(penalized, c.temperature, c.topp) : null;
-          const k = walk ? walk.tokens.map((token, at) => [token, at]).filter(([token]) => penalized[token] === penalized[ranked[10]])[4]?.[1] : undefined;
-          if (k !== undefined) random = (walk.cumulative[k - 1] + walk.cumulative[k]) / 2 / walk.mass;
+        if (random === "fifth") {
+          // the middle of the fifth tied token's share in the CPU's walk (the ties in the order of their index)
+          const walk = WGSL.walkLikeCpu(logits, c.temperature, c.topp);
+          const k = walk.tokens.map((token, at) => [token, at]).filter(([token]) => logits[token] === TIED_RUN)[4][1];
+          random = (walk.cumulative[k - 1] + walk.cumulative[k]) / 2 / walk.mass;
         }
         judge(c, logits, history, [random], await sampled(c, logits, history, [random], 1));
         postMessage({ alive: true });

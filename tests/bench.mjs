@@ -232,12 +232,14 @@ assert.equal(layerTable({ name: "a layer of a token", error: "x | y" })[0], "**A
 const generateStep = { name: "tokens generated on the GPU", result: { model: "Llama 3.2 1B's width", layers: 2, vocab: 32000, GB: 0.21,
   dispatches: 13, tokens: 16, settings: { temperature: 0.7, topp: 0.9, penalty: 1.3 }, work: { ms: 9.1 },
   rows: [{ perSubmission: 1, msPerToken: 14.2, fixedMs: 5.1 }, { perSubmission: 4, msPerToken: 10.4, fixedMs: 5.2 }, { perSubmission: 16, msPerToken: 9.4, fixedMs: 4.8 }],
-  sampling: { vocab: 128256, msEach: 0.31 } } };
+  sampling: { vocab: 128256, msEach: 0.31, over: 5114, flat: { msEach: 1.2, over: 128256, unsteady: true } } } };
 const generateRight = { sampling: { ok: true }, "tokens on the GPU": { ok: true } };
 const generateLines = generateTable(generateStep, generateRight);
 assert.ok(generateLines.includes("| 1, each read back as it comes | 14.20 | 5.10 |  |"), generateLines.join("\n"));
 assert.ok(generateLines.includes("| 16, read back once | 9.40 | 4.80 | 1.5× |"), generateLines.join("\n"));
-assert.ok(generateLines.at(-1).includes("9.10 ms") && generateLines.at(-1).includes("0.310 ms"), generateLines.at(-1));
+assert.ok(generateLines.at(-1).includes("9.10 ms") && generateLines.at(-1).includes("0.310 ms (5114 tokens over the floor)"), generateLines.at(-1));
+assert.ok(generateLines.at(-1).includes("on flat logits, unsteady: 1.200 ms (128256 tokens over the floor)."), generateLines.at(-1));
+assert.ok(generateTable({ ...generateStep, result: { ...generateStep.result, sampling: { vocab: 128256, msEach: 0.31 } } }, generateRight).at(-1).endsWith("0.310 ms."));
 for (const [label, lines] of [["right", generateLines], ["lost", generateTable(generateStep, generateRight, { lost: "lost" })],
   ["fallback", generateTable(generateStep, generateRight, { fallback: true })], ["wrong", generateTable(generateStep, { ...generateRight, sampling: { ok: false } })],
   ["no check", generateTable(generateStep)]]) {

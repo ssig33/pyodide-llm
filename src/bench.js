@@ -320,8 +320,8 @@ export function layerTable(step, check, ceilings, gpu = {}) {
  * T151: the GPU section's table of tokens generated on the GPU (public/shaders.js's EMBED, fusedMatVec and SAMPLE: the
  * sampling on the GPU too, the state carried from token to token there). step: {name, result: {model, layers, vocab,
  * GB, dispatches, tokens, settings, work: {ms, unsteady}, rows: [{perSubmission, msPerToken, fixedMs}], sampling:
- * {vocab, msEach, unsteady}}} or {name, error}; check: the shaders against JavaScript ("sampling" and "tokens on the
- * GPU"); gpu: { fallback, lost }. A row a way of submitting: one token a submission, each read back as it comes, and
+ * {vocab, msEach, over, unsteady, flat: {msEach, over, unsteady}}}} or {name, error}; check: the shaders against
+ * JavaScript ("sampling" and "tokens on the GPU"); gpu: { fallback, lost }. A row a way of submitting: one token a submission, each read back as it comes, and
  * several in one submission, read back once. "A submission besides its tokens" is what a submission costs past its
  * tokens' work (the wait and the reading back: a row's ms a token times its tokens, less a token's work, the
  * difference of 2n tokens in one submission and n), and "faster than one a submission" the first row's ms a token
@@ -348,5 +348,9 @@ export function generateTable(step, check, gpu = {}) {
       `${number(row.msPerToken, 2)} | ${derived && Number.isFinite(row.fixedMs) ? (row.fixedMs < 0 ? "under the noise" : number(row.fixedMs, 2)) : ""} | ` +
       `${derived && row !== one && one ? times(one.msPerToken / row.msPerToken) : ""} |`),
     "", `A token's work: ${r.work ? `${r.work.unsteady ? "unsteady: " : ""}${number(r.work.ms, 2)} ms` : "not measured here"}; ` +
-    `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens): ${r.sampling ? `${r.sampling.unsteady ? "unsteady: " : ""}${number(r.sampling.msEach, 3)} ms` : "not measured here"}.`];
+    `the sampling alone (made-up logits of ${r.sampling?.vocab ?? "Llama 3's"} tokens): ${r.sampling ? samplingCell(r.sampling) : "not measured here"}` +
+    `${r.sampling?.flat ? `; on flat logits, ${samplingCell(r.sampling.flat)}` : ""}.`];
 }
+// the ms of the sampling alone, with how many tokens were over the nucleus's floor (what SAMPLE gathers and reads each
+// round of its searches: T151)
+const samplingCell = (s) => `${s.unsteady ? "unsteady: " : ""}${number(s.msEach, 3)} ms${Number.isFinite(s.over) ? ` (${s.over} tokens over the floor)` : ""}`;

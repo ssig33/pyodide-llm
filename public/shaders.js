@@ -2130,8 +2130,10 @@ var<workgroup> best_index: array<u32, WG_SIZE>;
 var<workgroup> shared_sum: array<f32, WG_SIZE>;
 var<workgroup> shared_sums: array<vec4<f32>, WG_SIZE>;
 var<workgroup> uniform_word: u32;
-var<workgroup> bounds: vec2<u32>;
-var<workgroup> bound_sum: f32;
+// the search's bounds, in bits, and the sum at lo: thread 0 writes them, every thread reads them by one
+// workgroupUniformLoad a round (a barrier, and the value uniform for the loop's own barriers)
+struct Bound { lo: u32, hi: u32, sum: f32 }
+var<workgroup> bound: Bound;
 var<workgroup> found: atomic<u32>;
 
 // cumsum.wgsl's scan: (the sum of the values of the threads before t, the sum of all), in the same order every run
@@ -2189,23 +2191,22 @@ fn total4(value: vec4<f32>, t: u32) -> vec4<f32> {
     return sums;
 }
 
-// top_p_pivot's search, over the bits of the probabilities gathered (probs[0 .. count)): from lo, whose sum is
-// lo_sum and passes, to hi, which does not, the largest bits whose probability has a sum at or over it that passes:
-// at or over limit (the nucleus: strict false), or over it (the draw: strict true). Returns (those bits, that sum)
+// top_p_pivot's search, over the bits of the probabilities gathered (probs[0 .. count)): from lo, whose sum S(lo)
+// (the sum of the probabilities at or over it) is lo_sum and passes, to hi, which does not, the largest bits whose
+// sum passes: at or over limit (the nucleus: strict false), or over it (the draw: strict true). S only changes at a
+// probability that is present, so the largest passing bits are one (and the draw's is where the CPU's walk stops:
+// S(w) counts every token the sorted walk passes before w's last, and S of the next larger probability is what it
+// passed before w's first). Each round narrows (lo, hi) to a quarter or so: 15 rounds from bits 0 to 1.0, 10 to 14
+// for the draw from the nucleus's probability, each a read of the count gathered. Returns (those bits, that sum)
 fn pivot(lo_start: u32, lo_sum_start: f32, limit: f32, strict: bool, count: u32, t: u32) -> vec2<f32> {
-    // the bounds as every thread reads them from thread 0 (uniform: the loop's rounds have barriers)
     if (t == 0u) {
-        bounds = vec2<u32>(lo_start, ONE_BITS + 1u);
-        bound_sum = lo_sum_start;
+        bound = Bound(lo_start, ONE_BITS + 1u, lo_sum_start);
     }
-    let start = workgroupUniformLoad(&bounds);
-    var lo = start.x;
-    var hi = start.y;
-    var lo_sum = workgroupUniformLoad(&bound_sum);
-    while (hi - lo > 1u) {
+    var b = workgroupUniformLoad(&bound);
+    while (b.hi - b.lo > 1u) {
         // three pivots spaced over (lo, hi), in bits: a positive float orders as its bits
-        let spacing = max((hi - lo) / (PIVOTS + 1u), 1u);
-        let u = min(vec3<u32>(lo + spacing, lo + 2u * spacing, lo + 3u * spacing), vec3<u32>(hi - 1u));
+        let spacing = max((b.hi - b.lo) / (PIVOTS + 1u), 1u);
+        let u = min(vec3<u32>(b.lo + spacing, b.lo + 2u * spacing, b.lo + 3u * spacing), vec3<u32>(b.hi - 1u));
         let f = bitcast<vec3<f32>>(u);
         var acc = vec4<f32>(0.0);
         for (var k = t; k < count; k += WG_SIZE) {
@@ -2214,27 +2215,21 @@ fn pivot(lo_start: u32, lo_sum_start: f32, limit: f32, strict: bool, count: u32,
         }
         let sums = total4(acc, t);
         if (t == 0u) {
-            var new_lo = lo;
-            var new_hi = hi;
-            var new_sum = lo_sum;
+            var next = b;
             for (var j = 0u; j < PIVOTS; j++) {
                 let passes = select(sums[j] >= limit, sums[j] > limit, strict);
-                if (passes && u[j] > new_lo) {
-                    new_lo = u[j];
-                    new_sum = sums[j];
-                } else if (!passes && u[j] < new_hi) {
-                    new_hi = u[j];
+                if (passes && u[j] > next.lo) {
+                    next.lo = u[j];
+                    next.sum = sums[j];
+                } else if (!passes && u[j] < next.hi) {
+                    next.hi = u[j];
                 }
             }
-            bounds = vec2<u32>(new_lo, new_hi);
-            bound_sum = new_sum;
+            bound = next;
         }
-        let b = workgroupUniformLoad(&bounds);
-        lo = b.x;
-        hi = b.y;
-        lo_sum = workgroupUniformLoad(&bound_sum);
+        b = workgroupUniformLoad(&bound);
     }
-    return vec2<f32>(bitcast<f32>(lo), lo_sum);
+    return vec2<f32>(bitcast<f32>(b.lo), b.sum);
 }
 
 // the token into chosen and the state: the next pass's input at the next position, into the window; or the end
