@@ -5,11 +5,17 @@
 // The old kernels are compiled here from that commit's kernels/*.ts (as kernels/build.py's plain module), the new
 // ones are public/simdkernel_plain.wasm (make kernels). Exit 1 if the outputs differ.
 // T160: at the end, the float16 cache against the float32 one, old and new (above 1: the float16 cache is slower).
+// T201: --exact, for a change that must write the old's bits (the softmax's maximum): any bit that differs fails, and
+// before the timing each position of short heads (1 to 72 positions, around the 4 and 32 of the maximum's steps)
+// takes a turn as the one far largest score (its key ten times the query), so that a maximum that skips a position
+// (a lane, an accumulator, the tail) moves every weight of that head (exp(0) is 1 only against the true maximum).
+//   node tests/attention-compare.mjs FETCH_HEAD [rounds] --exact
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
 const root = new URL("../", import.meta.url).pathname;
-const [ref = "origin/main", rounds = "3"] = process.argv.slice(2);
+const exact = process.argv.includes("--exact");
+const [ref = "origin/main", rounds = "3"] = process.argv.slice(2).filter((a) => a !== "--exact");
 const dir = `${root}.tmp/attention-compare/`;
 fs.mkdirSync(dir, { recursive: true });
 for (const file of ["kernel.ts", "six.ts"]) {
@@ -24,6 +30,38 @@ const kernels = { old: load(`${dir}old.wasm`), new: load(`${root}public/simdkern
 const F = new Float32Array(memory.buffer);
 
 let failed = false;
+if (exact) {
+  // T201: each position the one largest score in turn, both caches, old and new to the bit
+  const nh = 2, hs = 8, kvDim = nh * hs, seq = 72;
+  const q = 1 << 20, att = q + 4096, out = att + 4096, other = out + 4096, kc = other + 4096;
+  const vc = kc + seq * kvDim * 4, kh = vc + seq * kvDim * 4, vh = kh + seq * kvDim * 2;
+  for (let i = q / 4; i < q / 4 + nh * hs; i++) F[i] = Math.random() * 2 - 1;
+  for (let i = kc / 4; i < kh / 4; i++) F[i] = Math.random() * 2 - 1;
+  kernels.new.to_f16(vh, vc, seq * kvDim);
+  let checked = 0, differ = 0;
+  for (let pos = 0; pos < seq; pos++) {
+    for (let p = 0; p <= pos; p++) {
+      const row = kc / 4 + p * kvDim, saved = F.slice(row, row + kvDim);
+      for (let i = 0; i < kvDim; i++) F[row + i] = 10 * F[q / 4 + i];
+      kernels.new.to_f16(kh, kc, seq * kvDim);
+      for (const [name, k, v] of [["attention", kc, vc], ["attention_f16", kh, vh]]) {
+        kernels.old[name](out, q, k, v, att, pos, nh, nh, hs, 0, nh);
+        kernels.new[name](other, q, k, v, att, pos, nh, nh, hs, 0, nh);
+        checked++;
+        for (let i = 0; i < nh * hs; i++) {
+          if (!Object.is(F[out / 4 + i], F[other / 4 + i])) {
+            if (differ < 5) console.log(`${name} ${nh}/${nh}/${hs} pos ${pos}, the largest at ${p}: old ${F[out / 4 + i]}, new ${F[other / 4 + i]}`);
+            differ++;
+            break;
+          }
+        }
+      }
+      F.set(saved, row);
+    }
+  }
+  if (differ) failed = true;
+  console.log(`attention-compare --exact: the largest score at each position, ${checked} calls, ${differ} differ from the old`);
+}
 const times = {};  // T160: "shape, position" -> {attention: {old, new}, attention_f16: {old, new}}
 console.log(`| kernel | heads / kv heads / head size, position | old µs | new µs | old ÷ new | G MAC/s old → new |\n|---|---|---:|---:|---:|---|`);
 for (const [nh, nkv, hs, positions] of [[8, 8, 64, [16, 256, 1000, 2000, 4000]], [32, 8, 64, [256, 4000]], [4, 2, 6, [0, 1, 2, 3, 4, 5, 6, 7]], [3, 3, 10, [9]]]) {
@@ -48,6 +86,7 @@ for (const [nh, nkv, hs, positions] of [[8, 8, 64, [16, 256, 1000, 2000, 4000]],
         difference = Math.max(difference, Math.abs(F[out / 4 + i] - F[other / 4 + i]));
         if (F[halves / 4 + i] !== F[other / 4 + i]) { failed = true; console.log(`${name} ${nh}/${nkv}/${hs} pos ${pos}: the heads in two ranges differ from all at once`); break; }
       }
+      if (exact && difference > 0) { failed = true; console.log(`${name} ${nh}/${nkv}/${hs} pos ${pos}: old and new differ by ${difference} (--exact)`); }
       if (difference > 1e-5 * largest) { failed = true; console.log(`${name} ${nh}/${nkv}/${hs} pos ${pos}: old and new differ by ${difference} of ${largest}`); }
       if (pos < 16) continue;  // the small shapes check the edges only
       const n = Math.max(10, Math.floor(20000 / (pos + 1)));

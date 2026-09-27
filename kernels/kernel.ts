@@ -363,6 +363,37 @@ const HALF_SCALE: f32 = 5.192296858534828e33;  // 2^112 (0x77800000)
   return (f32x4.extract_lane(a, 0) + f32x4.extract_lane(a, 2)) + (f32x4.extract_lane(a, 1) + f32x4.extract_lane(a, 3));
 }
 
+// The largest of from and the n floats at at. A NaN anywhere makes it NaN (f32x4.max and max keep a NaN, T195), and
+// max does not depend on the order, so the result is the one of a scalar walk to the bit (and -0 is below +0 in both).
+// T189 (sample): maxima side by side, since x86 has no instruction for f32x4.max (NaN, -0): V8 writes it as 8
+// instructions, a chain of about 14 cycles, and one maximum waited on itself. T201: eight of them, 32 floats a turn
+// (four still waited on the chain on x86), for sample's logits and attention's scores (which took one scalar maximum
+// a position). No public implementation's lines: llama.cpp's ggml_vec_max_f32 is a scalar walk.
+// @ts-ignore: decorator
+@inline function largest(at: usize, n: i32, from: f32): f32 {
+  let best = from;
+  let i = 0;
+  if (n >= 4) {
+    let b0 = f32x4.max(f32x4.splat(from), v128.load(at)), b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0, b6 = b0, b7 = b0;
+    for (i = 4; i + 32 <= n; i += 32) {
+      const a = at + (<usize>i << 2);
+      b0 = f32x4.max(b0, v128.load(a));
+      b1 = f32x4.max(b1, v128.load(a, 16));
+      b2 = f32x4.max(b2, v128.load(a, 32));
+      b3 = f32x4.max(b3, v128.load(a, 48));
+      b4 = f32x4.max(b4, v128.load(a, 64));
+      b5 = f32x4.max(b5, v128.load(a, 80));
+      b6 = f32x4.max(b6, v128.load(a, 96));
+      b7 = f32x4.max(b7, v128.load(a, 112));
+    }
+    for (; i + 4 <= n; i += 4) b0 = f32x4.max(b0, v128.load(at + (<usize>i << 2)));
+    const bests = f32x4.max(f32x4.max(f32x4.max(b0, b1), f32x4.max(b2, b3)), f32x4.max(f32x4.max(b4, b5), f32x4.max(b6, b7)));
+    best = max(max(f32x4.extract_lane(bests, 0), f32x4.extract_lane(bests, 1)), max(f32x4.extract_lane(bests, 2), f32x4.extract_lane(bests, 3)));
+  }
+  for (; i < n; i++) best = max(best, load<f32>(at + (<usize>i << 2)));
+  return best;
+}
+
 // @ts-ignore: decorator
 @inline function attentionOf<T>(out: usize, q: usize, kc: usize, vc: usize, att: usize, pos: i32, nh: i32, nkv: i32, hs: i32, h0: i32, h1: i32): void {
   const E: usize = sizeof<T>();  // bytes per key or value
@@ -418,8 +449,7 @@ const HALF_SCALE: f32 = 5.192296858534828e33;  // 2^112 (0x77800000)
   // 2. softmax, head by head, four exponentials at a time
   for (let h = h0; h < h1; h++) {
     const scores = att + (<usize>(h * count) << 2);
-    let mx: f32 = -f32.MAX_VALUE;
-    for (let t = 0; t < count; t++) mx = max<f32>(mx, load<f32>(scores + (<usize>t << 2)));
+    const mx = largest(scores, count, -f32.MAX_VALUE);
     const mxs = f32x4.splat(mx);
     let sums = f32x4.splat(0);
     let t = 0;
@@ -717,24 +747,7 @@ function sortNucleus(probs: usize, index: usize, lo: i32, hi: i32): void {
 // +inf makes it +inf, and all -inf make it -inf. Logits like these come of a broken model or an overflow; the engine
 // stops with an error on -1 (NumPy's sample() and shaders.js's sampleLikeCpu() stop on the same logits)
 export function sample(logits: usize, n: i32, temperature: f32, topp: f32, random: f64, probs: usize, index: usize): i32 {
-  let best = load<f32>(logits);
-  let i = 0;
-  if (n >= 4) {
-    // T189: four maxima side by side. x86 has no instruction for f32x4.max (NaN, -0): V8 writes several, and one
-    // maximum waited on itself (on the x86 runners 1.3 ns a logit, three quarters of the walk; the arm64 runner 0.15)
-    let b0 = v128.load(logits), b1 = b0, b2 = b0, b3 = b0;
-    for (i = 4; i + 16 <= n; i += 16) {
-      const at = logits + (<usize>i << 2);
-      b0 = f32x4.max(b0, v128.load(at));
-      b1 = f32x4.max(b1, v128.load(at, 16));
-      b2 = f32x4.max(b2, v128.load(at, 32));
-      b3 = f32x4.max(b3, v128.load(at, 48));
-    }
-    for (; i + 4 <= n; i += 4) b0 = f32x4.max(b0, v128.load(logits + (<usize>i << 2)));
-    const bests = f32x4.max(f32x4.max(b0, b1), f32x4.max(b2, b3));
-    best = max(max(f32x4.extract_lane(bests, 0), f32x4.extract_lane(bests, 1)), max(f32x4.extract_lane(bests, 2), f32x4.extract_lane(bests, 3)));
-  }
-  for (; i < n; i++) best = max(best, load<f32>(logits + (<usize>i << 2)));
+  const best = largest(logits, n, load<f32>(logits));
   if (!isFinite<f32>(best)) return -1;
   const nucleus = topp > 0 && topp < 1;
   // With a nucleus, tokens less than a ten millionth as probable as the best one cannot matter (ln 1e-7 = -16.118):
@@ -746,7 +759,8 @@ export function sample(logits: usize, n: i32, temperature: f32, topp: f32, rando
   // the walk 1.23 times main's where this is 2.1), and none at all slower still (0.45 times)
   const floors = f32x4.splat(floor), shift = f32x4.splat(best);
   let count = 0;
-  for (i = 0; i + 8 <= n; i += 8) {
+  let i = 0;
+  for (; i + 8 <= n; i += 8) {
     const at = logits + (<usize>i << 2);
     const a = v128.load(at), b = v128.load(at, 16);
     const pa = f32x4.ge(a, floors), pb = f32x4.ge(b, floors);

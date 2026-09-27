@@ -208,9 +208,9 @@ for size in (fast.vocab_size, fast.vocab_size - 3):
 # a maximum left out shows only where exp() overflows (softmax does not care what is taken away from all the logits):
 # two tokens far above the rest, drawn with two random numbers that both land on the more probable one (its share is
 # 1 / (1 + 1/e) = 0.73). Left out, the two are as probable and 0.6 lands on the second. They are put in every part of
-# the maximum that could be left out whole: the first four, the same lane of one of the four maxima (16 apart), the
-# fours after the sixteens and the tail one at a time (T189's review: the pairs only 16 apart from 4 to 35 let the
-# fours after the sixteens and the tail be left out)
+# the maximum that could be left out whole: the first four, the same lane of one of the eight maxima (32 apart, T201:
+# positions 4 to 35 are each lane of each once), the fours after the thirty-twos and the tail one at a time (T189's
+# review: the pairs only 16 apart from 4 to 35 let the fours after the sixteens and the tail be left out)
 for size in (fast.vocab_size, fast.vocab_size - 1, fast.vocab_size - 3):
     for first in list(range(36)) + list(range(size - 40, size - 1)):
         for gap in (1, 4, 16):
