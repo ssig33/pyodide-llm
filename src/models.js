@@ -67,8 +67,8 @@ const thinking = { steps: 0, temperature: 0.6, topp: 0.95, repetition_penalty: 1
 const atOnce = { steps: 0, temperature: 0.7, topp: 0.8, repetition_penalty: 1.0 };
 /** A Qwen3 twice (T124, the owner's "両方を別々に用意できないのか"): thinking first, and answering at once. The two
  * share their weights, and so a conversion kept in the browser; only the format differs. */
-function thinkingAndNot(id, name, repo, revision, download, sizes, chat = {}) {
-  const common = { group: "hf", hf: hf(repo, revision), download, conversion: {}, options: qwen3,
+function thinkingAndNot(id, name, source, download, sizes, chat = {}) {
+  const common = { group: "hf", ...source, download, conversion: {}, options: qwen3,
     prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE, ...chat };
   return [
     { ...common, id: `${id}-thinking`, name: `${name} (thinking)`, note: `thinks before it answers · 日本語 / English · ${sizes}`,
@@ -77,6 +77,10 @@ function thinkingAndNot(id, name, repo, revision, download, sizes, chat = {}) {
       generation: chat.generation ?? atOnce, template: QWEN3_AT_ONCE },
   ];
 }
+/** T203 (T136's fourth stage): a Q8_0 GGUF's weights with the vocabulary and config.json of its original, which
+ * tests/gguf_check.py tensors held them to (gguf.yml's candidates) */
+const ggufOf = (repo, revision, weights, original, originalRevision, tokenizer = "tokenizer.json") =>
+  ({ original, hf: { repo, revision, weights, vocabulary: { repo: original, revision: originalRevision, tokenizer } } });
 const harmony = { specials: ["<|channel|>", "<|message|>", "<|start|>", "<|end|>"], stop_tokens: [1, 2, 10, 11, 13] };
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
   "November", "December"];
@@ -184,6 +188,11 @@ export const LICENSES = {
   "mradermacher/pythia-70m-deduped-GGUF": APACHE, "mradermacher/pythia-160m-GGUF": APACHE,
   "mradermacher/pythia-410m-GGUF": APACHE, "mradermacher/pythia-1b-GGUF": APACHE, "mradermacher/pythia-1.4b-GGUF": APACHE,
   "mradermacher/gpt2-GGUF": MIT,
+  // T203 (T136's fourth stage): Qwen3 and DeepSeek-R1 (the card's license is the original's)
+  "unsloth/Qwen3-0.6B-GGUF": APACHE, "unsloth/Qwen3-1.7B-GGUF": APACHE, "Qwen/Qwen3-4B-GGUF": APACHE,
+  "Qwen/Qwen3-8B-GGUF": APACHE, "mmnga-o/Qwen3-Swallow-8B-RL-v0.2-gguf": APACHE,
+  "unsloth/Qwen3-4B-Instruct-2507-GGUF": APACHE, "unsloth/Qwen3-4B-Thinking-2507-GGUF": APACHE,
+  "mradermacher/DeepSeek-R1-Distill-Qwen-1.5B-GGUF": MIT,
 };
 /** The Hugging Face repository a model comes from. */
 export const sourceOf = (entry) => entry.hf?.repo ?? entry.source;
@@ -454,8 +463,11 @@ const LISTED = [
     hf: { repo: "bartowski/SmolLM2-1.7B-Instruct-GGUF", revision: "1f03464768bfcc0319fc50da8ff5fb20b6417ba2", weights: "SmolLM2-1.7B-Instruct-Q8_0.gguf" }, download: 1820414944,
     conversion: {}, options: {}, generation: sampled(1.1),
     prompt: "What will be popular next? Name three things.", placeholder: "Ask or instruct (e.g. What is the capital of Japan?)" },
-  { group: "hf", id: "hf-deepseek-r1-qwen-1.5b", name: "DeepSeek-R1 Distill Qwen 1.5B", note: "thinks before it answers · English · fetches 3.6 GB → int8 2.0 GB · desktop only",
-    hf: hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562"), download: 3554214621,
+  { group: "hf", id: "hf-deepseek-r1-qwen-1.5b", name: "DeepSeek-R1 Distill Qwen 1.5B", note: "thinks before it answers · English · fetches 1.9 GB (GGUF) → int8 2.0 GB · desktop only",
+    // T203: mradermacher's Q8_0 (its card names the original as its base model, and MIT)
+    ...ggufOf("mradermacher/DeepSeek-R1-Distill-Qwen-1.5B-GGUF", "dcc15b1cfd0973faf5dc043fd405661fe061e7aa",
+      "DeepSeek-R1-Distill-Qwen-1.5B.Q8_0.gguf", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562"),
+    download: 1894532384,
     // the BOS is the tokenizer's <｜begin▁of▁sentence｜> (151646): config.json says 151643, the end of a sentence, and
     // with it perplexity was 2.5 to 2.7 times higher and four answers of five fell apart; the real format opens the
     // thought with <think> (T138's review). The list's options go over what the kept conversion says: no new CONVERTER
@@ -488,25 +500,38 @@ const LISTED = [
           vocabulary: { repo: "unsloth/Llama-3.2-3B-Instruct", revision: "006f5dcd1393c3add266de40994ba96225e9689d", tokenizer: "tokenizer.json" } }, download: 3421899296,
     conversion: {}, options: {}, generation: sampled(1.1),
     prompt: "What will be popular next? Name three things.", placeholder: "Ask or instruct (e.g. What is the capital of Japan?)" },
-  // T124: Qwen3, each twice (thinking and not), and Qwen3's 2507 4B, one of each form
-  ...thinkingAndNot("hf-qwen3-0.6b", "Qwen3 0.6B", "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca", 1503300328,
-    "fetches 1.5 GB → int8 671 MB"),
-  ...thinkingAndNot("hf-qwen3-1.7b", "Qwen3 1.7B", "Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", 4063515592,
-    "fetches 4.1 GB → int8 1.9 GB · desktop only"),
-  ...thinkingAndNot("hf-qwen3-4b", "Qwen3 4B", "Qwen/Qwen3-4B", "1cfa9a7208912126459214e8b04321603b3df60c", 8044982000,
-    "fetches 8.0 GB → int8 4.5 GB · desktop only · Chrome and Firefox"),
-  ...thinkingAndNot("hf-qwen3-8b", "Qwen3 8B", "Qwen/Qwen3-8B", "b968826d9c46dd6066d109eabc6255188de91218", 16381516776,
-    "fetches 16.4 GB → int8 9.2 GB · desktop only · Chrome and Firefox"),
+  // T124: Qwen3, each twice (thinking and not), and Qwen3's 2507 4B, one of each form. T203: from Q8_0 GGUFs (Qwen's
+  // own 0.6B and 1.7B are not the original's weights: tests/gguf_check.py tensors found every matrix 0.9 to 2.2% off
+  // its Q8_0, so unsloth's)
+  ...thinkingAndNot("hf-qwen3-0.6b", "Qwen3 0.6B",
+    ggufOf("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-Q8_0.gguf",
+      "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"), 639447744,
+    "fetches 639 MB (GGUF) → int8 671 MB"),
+  ...thinkingAndNot("hf-qwen3-1.7b", "Qwen3 1.7B",
+    ggufOf("unsloth/Qwen3-1.7B-GGUF", "d7f544eead698dbd1f15126ef60b45a1e1933222", "Qwen3-1.7B-Q8_0.gguf",
+      "Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"), 1834426944,
+    "fetches 1.8 GB (GGUF) → int8 1.9 GB · desktop only"),
+  ...thinkingAndNot("hf-qwen3-4b", "Qwen3 4B",
+    ggufOf("Qwen/Qwen3-4B-GGUF", "bc640142c66e1fdd12af0bd68f40445458f3869b", "Qwen3-4B-Q8_0.gguf",
+      "Qwen/Qwen3-4B", "1cfa9a7208912126459214e8b04321603b3df60c"), 4280404704,
+    "fetches 4.3 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox"),
+  ...thinkingAndNot("hf-qwen3-8b", "Qwen3 8B",
+    ggufOf("Qwen/Qwen3-8B-GGUF", "7c41481f57cb95916b40956ab2f0b139b296d974", "Qwen3-8B-Q8_0.gguf",
+      "Qwen/Qwen3-8B", "b968826d9c46dd6066d109eabc6255188de91218"), 8709518112,
+    "fetches 8.7 GB (GGUF) → int8 9.2 GB · desktop only · Chrome and Firefox"),
   // Qwen3 Swallow's card gives one sampling, the thinking one, for both
-  ...thinkingAndNot("hf-qwen3-swallow-8b", "Qwen3 Swallow 8B RL", "tokyotech-llm/Qwen3-Swallow-8B-RL-v0.2",
-    "9218f4843b6f93369a0b0999d8f58d61487ea71c", 16381516776, "fetches 16.4 GB → int8 9.2 GB · desktop only · Chrome and Firefox",
-    { generation: thinking }),
-  { group: "hf", id: "hf-qwen3-4b-instruct-2507", name: "Qwen3 4B Instruct 2507", note: "answers instructions · 日本語 / English · fetches 8.0 GB → int8 4.5 GB · desktop only · Chrome and Firefox",
-    hf: hf("Qwen/Qwen3-4B-Instruct-2507", "cdbee75f17c01a7cc42f958dc650907174af0554"), download: 8044982000,
+  ...thinkingAndNot("hf-qwen3-swallow-8b", "Qwen3 Swallow 8B RL",
+    ggufOf("mmnga-o/Qwen3-Swallow-8B-RL-v0.2-gguf", "3fc755c6ab3780ebad6671130fc1b630bbd1575b", "Qwen3-Swallow-8B-RL-v0.2-Q8_0.gguf",
+      "tokyotech-llm/Qwen3-Swallow-8B-RL-v0.2", "9218f4843b6f93369a0b0999d8f58d61487ea71c"), 8709519968,
+    "fetches 8.7 GB (GGUF) → int8 9.2 GB · desktop only · Chrome and Firefox", { generation: thinking }),
+  { group: "hf", id: "hf-qwen3-4b-instruct-2507", name: "Qwen3 4B Instruct 2507", note: "answers instructions · 日本語 / English · fetches 4.3 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox",
+    ...ggufOf("unsloth/Qwen3-4B-Instruct-2507-GGUF", "a06e946bb6b655725eafa393f4a9745d460374c9", "Qwen3-4B-Instruct-2507-Q8_0.gguf",
+      "Qwen/Qwen3-4B-Instruct-2507", "cdbee75f17c01a7cc42f958dc650907174af0554"), download: 4280405600,
     conversion: {}, options: qwen3, generation: atOnce, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
   // its chat_template begins the answer with <think> itself
-  { group: "hf", id: "hf-qwen3-4b-thinking-2507", name: "Qwen3 4B Thinking 2507", note: "thinks before it answers · 日本語 / English · fetches 8.0 GB → int8 4.5 GB · desktop only · Chrome and Firefox",
-    hf: hf("Qwen/Qwen3-4B-Thinking-2507", "768f209d9ea81521153ed38c47d515654e938aea"), download: 8044982000,
+  { group: "hf", id: "hf-qwen3-4b-thinking-2507", name: "Qwen3 4B Thinking 2507", note: "thinks before it answers · 日本語 / English · fetches 4.3 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox",
+    ...ggufOf("unsloth/Qwen3-4B-Thinking-2507-GGUF", "f40adb104d4d44aee52f398b60597c5866a973a3", "Qwen3-4B-Thinking-2507-Q8_0.gguf",
+      "Qwen/Qwen3-4B-Thinking-2507", "768f209d9ea81521153ed38c47d515654e938aea"), download: 4280405632,
     conversion: {}, options: qwen3, generation: thinking, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
 ];
 
