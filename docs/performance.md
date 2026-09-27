@@ -69,6 +69,13 @@ browser and system: [kernels/README.md](../kernels/README.md).
 
 Attention grows with the position: in llm-jp-3-150m it is 2% of a token at position 16, 48% at 2000, 65% at 4000.
 
+Around the forward pass, Python chooses each token (`node tests/overhead.mjs`, the CI's x86-64 and arm64 runners,
+one thread, 128 tokens): what a generated token costs outside `forward.js` is 0.31-0.35 ms for llm-jp-3-150m (4% of
+the token) and 0.24-0.35 ms for tiny-lm (16-20%), most of it the sampling kernel. A call from Python into
+JavaScript costs 1.3-1.7 µs. The first code after a forward pass is slower than the same code warm, since the pass
+has read the weights through the caches. With the threads a page uses, the forward pass is 1.5-1.9 times shorter on
+those runners and the outside stays, so it is an estimated 5-8% and 26-27% there (not measured).
+
 ## Long texts
 
 By default a model writes until it stops or its context is full; llm-jp-3-150m has 4096 tokens. Its KV cache grows
