@@ -157,8 +157,9 @@ jobs:
             models: >-
               hf-rakutenai-2.0-mini-instruct hf-rakutenai-7b-chat hf-swallow-ms-7b-instruct hf-mistral-7b-instruct-v0.2
               hf-mistral-7b-instruct-v0.3 hf-zephyr-7b-beta
-          # T124 (2026-09-26): Qwen3, 64 GB of downloads. The two forms of a Qwen3 (thinking and not) share the weights
-          # and differ in the format alone, so both only for the 0.6B and one of each other pair
+          # T124 (2026-09-26): Qwen3, 33 GB of downloads (64 GB before T203's Q8_0 GGUFs). The two forms of a Qwen3
+          # (thinking and not) share the weights and differ in the format alone, so both only for the 0.6B and one of
+          # each other pair
           - size: qwen3
             timeout: 3000
             models: >-
