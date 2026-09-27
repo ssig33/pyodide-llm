@@ -182,36 +182,47 @@ assert.equal(matVecRow(matVecTable(matVecSteps, {}, { ...matVecCeilings, fallbac
 assert.ok(matVecTable(matVecSteps, {}, matVecCeilings).includes("| llama.cpp MMVQ, 4 rows | failed: a \\| b |"));
 // T150: the layer's table: "faster than the separate steps" beside a fused row, against the separate steps of the
 // same reduction, but none after a lost device, on a fallback adapter, for a row the check found WRONG or an unsteady
-// one; every row as many cells as the header, a failure's | in its cell
+// one; the share of the buffer's reads beside GB/s, but not after a lost device or on a fallback adapter; every row
+// as many cells as the header, a failure's | in its cell
 const layerStep = { name: "a layer of a token", result: { model: "Llama 3.2 1B", pos: 127, layers: 16, GB: 0.0684, rows: [
-  { form: "separate steps", check: "a layer, separate steps", fused: false, subgroups: false, dispatches: 14, msPerLayer: 4.2 },
-  { form: "fused (T150)", check: "a layer, fused (T150)", fused: true, subgroups: false, dispatches: 5, msPerLayer: 2.1 },
+  { form: "separate steps", check: "a layer, separate steps", fused: false, subgroups: false, dispatches: 14, msPerLayer: 4.2, GBps: 16.3 },
+  { form: "fused (T150), the norms apart", check: "a layer, fused (T150), the norms apart", fused: true, normApart: true, subgroups: false, dispatches: 7, msPerLayer: 2.8, GBps: 24.4 },
+  { form: "fused (T150)", check: "a layer, fused (T150)", fused: true, subgroups: false, dispatches: 5, msPerLayer: 2.1, GBps: 32.6 },
   { form: "separate steps, subgroups", check: "a layer, separate steps, subgroups", fused: false, subgroups: true, error: "a | b\nc" },
-  { form: "fused (T150), subgroups", check: "a layer, fused (T150), subgroups", fused: true, subgroups: true, dispatches: 5, msPerLayer: 1.9 }] } };
+  { form: "fused (T150), subgroups", check: "a layer, fused (T150), subgroups", fused: true, subgroups: true, dispatches: 5, msPerLayer: 1.9, GBps: 36 }] } };
 const layerRight = { "a layer, separate steps": { ok: true }, "a layer, fused (T150)": { ok: true } };
+const layerCeilings = { global: { GBps: 40 } };
 const fasterOf = (lines, form) => cellsOf(lines.find((line) => line.startsWith(`| ${form} |`) || line.startsWith(`| ${form} (WRONG`))).at(-1).trim();
-const layerLines = layerTable(layerStep, layerRight);
-assert.ok(layerLines.includes("| fused (T150) | 5 | 2.10 | 33.6 | 2.0× |"), layerLines.join("\n"));
+const layerLines = layerTable(layerStep, layerRight, layerCeilings);
+assert.ok(layerLines.includes("| fused (T150) | 5 | 2.10 | 32.6 (81.5%) | 33.6 | 2.0× |"), layerLines.join("\n"));
+assert.ok(layerLines.includes("| fused (T150), the norms apart | 7 | 2.80 | 24.4 (61.0%) | 44.8 | 1.5× |"), layerLines.join("\n"));
 assert.equal(fasterOf(layerLines, "separate steps"), "");
 // no separate steps measured with subgroups: nothing to hold the fused one against
 assert.equal(fasterOf(layerLines, "fused (T150), subgroups"), "");
-assert.ok(layerLines.includes("| separate steps, subgroups | failed: a \\| b c | | | |"), layerLines.join("\n"));
-for (const [label, lines] of [["right", layerLines], ["lost", layerTable(layerStep, layerRight, { lost: "lost" })],
-  ["fallback", layerTable(layerStep, layerRight, { fallback: true })], ["no check", layerTable(layerStep)]]) {
+assert.ok(layerLines.includes("| separate steps, subgroups | failed: a \\| b c | | | | |"), layerLines.join("\n"));
+for (const [label, lines] of [["right", layerLines], ["lost", layerTable(layerStep, layerRight, layerCeilings, { lost: "lost" })],
+  ["fallback", layerTable(layerStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true })], ["no check", layerTable(layerStep)]]) {
   const rowsOf = lines.filter((line) => line.startsWith("|"));
   assert.equal(rowsOf.length, 2 + layerStep.result.rows.length, label);
   for (const line of rowsOf) assert.equal(cellsOf(line).length, cellsOf(rowsOf[0]).length, `${label}: ${line}`);
   assert.ok(!lines.join("\n").includes("undefined") && !lines.join("\n").includes("NaN"), label);
 }
-assert.equal(fasterOf(layerTable(layerStep, layerRight, { lost: "lost" }), "fused (T150)"), "");
-assert.ok(layerTable(layerStep, layerRight, { lost: "lost" }).some((line) => line.includes("the device was lost")));
-assert.equal(fasterOf(layerTable(layerStep, layerRight, { fallback: true }), "fused (T150)"), "");
+const lostLayer = layerTable(layerStep, layerRight, layerCeilings, { lost: "lost" });
+assert.equal(fasterOf(lostLayer, "fused (T150)"), "");
+assert.ok(lostLayer.includes("| fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), lostLayer.join("\n"));
+assert.ok(lostLayer.some((line) => line.includes("the device was lost")));
+const fallbackLayer = layerTable(layerStep, layerRight, { ...layerCeilings, fallback: true }, { fallback: true });
+assert.equal(fasterOf(fallbackLayer, "fused (T150)"), "");
+assert.ok(fallbackLayer.includes("| fused (T150) | 5 | 2.10 | 32.6 | 33.6 |  |"), fallbackLayer.join("\n"));
 const layerWrong = { ...layerRight, "a layer, fused (T150)": { ok: false } };
 assert.equal(fasterOf(layerTable(layerStep, layerWrong), "fused (T150)"), "");
 assert.ok(layerTable(layerStep, layerWrong).some((line) => line.startsWith("| fused (T150) (WRONG in the check) |")));
 // the separate steps WRONG: nothing right to hold the fused one against
 assert.equal(fasterOf(layerTable(layerStep, { ...layerRight, "a layer, separate steps": { ok: false } }), "fused (T150)"), "");
-const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.fused && !row.subgroups ? { ...row, unsteady: true } : row)) } };
-assert.ok(layerTable(unsteadyStep, layerRight).includes("| fused (T150) | 5 | unsteady: 2.10 | 33.6 |  |"));
+const unsteadyStep = { ...layerStep, result: { ...layerStep.result, rows: layerStep.result.rows.map((row) => (row.fused && !row.subgroups && !row.normApart ? { ...row, unsteady: true } : row)) } };
+assert.ok(layerTable(unsteadyStep, layerRight).includes("| fused (T150) | 5 | unsteady: 2.10 | 32.6 | 33.6 |  |"));
+// a fallback adapter's few hundredths of a GB/s still show
+const slowStep = { ...layerStep, result: { ...layerStep.result, rows: [{ ...layerStep.result.rows[0], msPerLayer: 2900, GBps: 0.0236 }] } };
+assert.ok(layerTable(slowStep, layerRight, undefined, { fallback: true }).includes("| separate steps | 14 | 2900.00 | 0.024 | 46400.0 |  |"));
 assert.equal(layerTable({ name: "a layer of a token", error: "x | y" })[0], "**A layer of a token**: x \\| y");
 console.log("ok");

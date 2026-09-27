@@ -690,24 +690,29 @@ async function token(name, kind = "widen", { sample = false } = {}) {
 
 // ---- T150: one layer of a generated token (Llama 3.2 1B's width, at position LAYER_POS), as its fourteen separate
 // steps (RMSNorm, q, k, v, RoPE and the cache, the attention, o, the residual add, RMSNorm, gate, up, SwiGLU, down, the
-// residual add: the prompt's shaders and T149's matrix × vector) and fused into five (shaders.js's fusedMatVec: q, k
+// residual add: the prompt's shaders and T149's matrix × vector), fused into five (shaders.js's fusedMatVec: q, k
 // and v with the norm and RoPE, the attention, o with the add, gate and up with the norm and SwiGLU, down with the
-// add), each with the workgroup's reduction and, where subgroups are, with subgroupAdd. Both forms read the same
-// weights: a layer's four matrices (q, k and v one after the other; o; gate and up; down), the separate steps a range
-// of rows of them each. Timed as the matrix × vector is (T149): n layers a submission, each on the next copy of the
-// weights (copies that make MATVEC_BYTES, so that a layer is not read from the GPU's caches), a submission of 2n less
-// one of n (paired). The attention is the prompt's (flashTile, f32 in the workgroup's memory and no subgroups, the
-// same in both forms: its cost is in both rows alike).
+// add), and fused but for the norms, which stay dispatches of their own (seven: what folding the norm into the read
+// saves or costs, T150's review), each with the workgroup's reduction and, where subgroups are, with subgroupAdd. All
+// read the same weights: a layer's four matrices (q, k and v one after the other; o; gate and up; down), the separate
+// steps a range of rows of them each. Timed as the matrix × vector is (T149), n layers a submission, each on the next
+// copy of the weights (copies that make MATVEC_BYTES, so that a layer is not read from the GPU's caches), a submission
+// of 2n less one of n, but the forms in turn (interleaved: T150's review, as T147's timeForms), so that a device that
+// warms up and slows down does so for all of them alike. The attention is the prompt's (flashTile, f32 in the
+// workgroup's memory and no subgroups, the same in every form: its cost is in every row alike).
 const LAYER_POS = 127, LAYER_MOST = 4096, EPS = 1e-5, THETA = 500000;
 const layerShape = ({ dim, hidden, heads, kvHeads }) => {
   const headSize = dim / heads, kvDim = headSize * kvHeads;
   return { dim, hidden, heads, kvHeads, headSize, kvDim,
     matrices: { qkv: [dim + 2 * kvDim, dim], o: [dim, dim], gateUp: [2 * hidden, dim], down: [dim, hidden] } };
 };
+// fused: the matrices fused (fusedMatVec); normApart: their norms still dispatches of their own
+const LAYER_KINDS = [{ name: "separate steps", fused: false }, { name: "fused (T150), the norms apart", fused: true, normApart: true },
+  { name: "fused (T150)", fused: true }];
 const layerForms = () => {
   const subgroups = device.features.has("subgroups") && (navigator.gpu.wgslLanguageFeatures?.has("subgroup_id") ?? false);
-  return (subgroups ? [false, true] : [false]).flatMap((withSubgroups) => [false, true].map((fused) =>
-    ({ name: `${fused ? "fused (T150)" : "separate steps"}${withSubgroups ? ", subgroups" : ""}`, fused, subgroups: withSubgroups })));
+  return (subgroups ? [false, true] : [false]).flatMap((withSubgroups) => LAYER_KINDS.map((kind) =>
+    ({ ...kind, name: `${kind.name}${withSubgroups ? ", subgroups" : ""}`, subgroups: withSubgroups })));
 };
 // the check's verdict of a form, by name
 const layerCheck = (form) => `a layer, ${form.name}`;
@@ -729,7 +734,8 @@ async function layerPipes(shape, subgroups) {
   const pipes = { small: pipelinesFor().small };
   for (const [key, code] of [["norm", WGSL.RMSNORM], ["rope", WGSL.ROPE], ["swiglu", WGSL.SWIGLU], ["flash", WGSL.flashTile(flash)],
     ["product", WGSL.mulMatVec({ packed: false, subgroups })], ["qkv", WGSL.fusedMatVec({ input: "norm", output: "rope", subgroups })],
-    ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })], ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })]]) {
+    ["add", WGSL.fusedMatVec({ input: "plain", output: "add", subgroups })], ["glu", WGSL.fusedMatVec({ input: "norm", output: "swiglu", subgroups })],
+    ["qkvPlain", WGSL.fusedMatVec({ input: "plain", output: "rope", subgroups })], ["gluPlain", WGSL.fusedMatVec({ input: "plain", output: "swiglu", subgroups })]]) {
     pipes[key] = await compiled(code);
   }
   return pipes;
@@ -813,6 +819,16 @@ function layerParts(shape, pos, copies, owned, data) {
     const m = copiesOf[copy];
     const attention = [pipes.flash, group(pipes.flash, [[0, v.q], [1, v.keys], [2, v.values], [3, v.att], [4, u.flash], [5, u.step]]), heads, 1];
     const groups = (rows) => Math.ceil(rows / WGSL.MUL_MAT_VEC_ROWS);
+    const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
+    if (form.normApart) {
+      return [norm(u.attentionNorm),
+        [pipes.qkvPlain, group(pipes.qkvPlain, [[0, m.qkv.w], [1, m.qkv.s], [2, v.xb], [3, u.qkv], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles]]), groups(m.qkv.rows), 1],
+        attention,
+        [pipes.add, group(pipes.add, [[0, m.o.w], [1, m.o.s], [2, v.att], [3, u.o], [5, v.h]]), groups(dim), 1],
+        norm(u.ffnNorm),
+        [pipes.gluPlain, group(pipes.gluPlain, [[0, m.gateUp.w], [1, m.gateUp.s], [2, v.xb], [3, u.gateUp], [5, v.g]]), groups(hidden), 1],
+        [pipes.add, group(pipes.add, [[0, m.down.w], [1, m.down.s], [2, v.g], [3, u.down], [5, v.h]]), groups(dim), 1]];
+    }
     if (form.fused) {
       return [
         [pipes.qkv, group(pipes.qkv, [[0, m.qkv.w], [1, m.qkv.s], [2, v.h], [3, u.qkv], [4, v.norms], [5, v.q], [6, v.keys], [7, v.values], [8, v.angles]]), groups(m.qkv.rows), 1],
@@ -825,7 +841,6 @@ function layerParts(shape, pos, copies, owned, data) {
     const product = ({ w, s, n }, first, rows, x, y) => [pipes.product, group(pipes.product, [
       [0, { buffer: w, offset: first * n, size: rows * n }], [1, { buffer: s, offset: first * n / 8, size: rows * n / 8 }],
       [2, x], [3, y], [4, shapeOf(rows, n)]]), groups(rows), 1];
-    const norm = (params) => [pipes.norm, group(pipes.norm, [[0, v.h], [1, v.norms], [2, v.xb], [3, params], [4, u.step]]), 1, 1];
     const add = [pipes.small, group(pipes.small, [[0, v.t], [1, v.h]]), 1, 1];
     return [norm(u.attentionNorm), product(m.qkv, 0, dim, v.xb, v.q), product(m.qkv, dim, kvDim, v.xb, v.k), product(m.qkv, dim + kvDim, kvDim, v.xb, v.v),
       [pipes.rope, group(pipes.rope, [[0, v.q], [1, v.k], [2, v.v], [3, v.keys], [4, v.values], [5, v.angles], [6, u.rope], [7, u.step]]), 1, 1],
@@ -919,9 +934,12 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
   const down = product(d.down, hidden, 0, dim, gate.map((g, i) => (g / (1 + Math.exp(-g))) * up[i]));
   return { h: h1.map((value, i) => value + down[i]), keys, values };
 }
-// The check (T150): every form of the layer on a small one (Llama's shape: GQA, 4 heads of 64 and 2 of K and V; a
-// hidden width of 544 = 17 groups, a part of mul_mat_vec's 64 a pass), at position 70 (71 positions, two tiles of the
-// attention), against layerReference. The residual stream after it is held to LAYER_LINE of what the layer added to
+// The check (T150): every form of the layer (Llama's shape: GQA, 33 heads of 64 and 3 of K and V; a width of 2112 = 66
+// groups and a hidden width of 2080 = 65, each past one pass of mul_mat_vec's 64 groups a workgroup, so that the x²
+// and the rows' sums of the second pass are seen: T150's review, whose three breakings of them the width of 256 let
+// through), at position 70 (71 positions, two tiles of the attention), against layerReference. The weights' scales
+// go as 1 / sqrt(width) and the stream's large channels as the width (3 in 256), so that the activations, the
+// attention's scores and the norm's scale are as they were at a width of 256. The residual stream after it is held to LAYER_LINE of what the layer added to
 // it (float32 sums in another order are off by about 1e-6 of it; a wrong index, a norm read from the wrong place, a
 // residual left out or gate taken for up by a tenth or more), the key and value of the position to 2e-3 of the largest
 // (a float16 rounded the other way is 2^-11 of itself), and the cache's other positions must stay as they were.
@@ -932,8 +950,8 @@ function layerReference({ dim, hidden, heads, kvHeads, headSize, kvDim }, pos, d
 // eps under LAYER_LINE; the timing keeps EPS). Larger channels (±60) make the attention's softmax steep enough that a
 // key or value of the position rounded the other way in float16 moves the stream by up to 2e-4 (lavapipe, 2026-09-27);
 // at ±30 both forms stay within 1e-6 over 45 draws
-const LAYER_CHECK = { dim: 256, hidden: 544, heads: 4, kvHeads: 2 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
-const LAYER_CHECK_OUTLIERS = 3, LAYER_CHECK_OUTLIER = 30, LAYER_CHECK_EPS = 1;
+const LAYER_CHECK = { dim: 2112, hidden: 2080, heads: 33, kvHeads: 3 }, LAYER_CHECK_POS = 70, LAYER_LINE = 1e-3, CACHE_LINE = 2e-3;
+const LAYER_CHECK_OUTLIERS = Math.round((3 * LAYER_CHECK.dim) / 256), LAYER_CHECK_OUTLIER = 30, LAYER_CHECK_EPS = 1;
 async function checkLayer() {
   const shape = layerShape(LAYER_CHECK), pos = LAYER_CHECK_POS, verdicts = {};
   const data = { ...layerState(shape, pos), angles: layerAngles(shape.headSize, pos), eps: LAYER_CHECK_EPS };
@@ -941,7 +959,7 @@ async function checkLayer() {
     data.h[Math.floor((i + 0.5) * shape.dim / LAYER_CHECK_OUTLIERS)] = LAYER_CHECK_OUTLIER * (i % 2 ? -1 : 1);
   }
   for (const [key, [rows, n]] of Object.entries(shape.matrices)) {
-    data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01) };
+    data[key] = { w: new Uint8Array(rows * n).map(() => (Math.random() * 256) | 0), s: floats(rows * n / GROUP, 0.01 * Math.sqrt(256 / n)) };
   }
   const want = layerReference(shape, pos, data);
   let added = 0, largestKey = 0, largestValue = 0;
@@ -992,12 +1010,13 @@ async function layer() {
   await scoped(async (owned) => {
     const parts = layerParts(shape, LAYER_POS, copies, owned);
     await device.queue.onSubmittedWorkDone();
+    // the forms that can run here, each with what submits n layers of it (each on the next copy) and waits
+    const timed = [];
     for (const form of layerForms()) {
-      const row = { form: form.name, check: layerCheck(form), fused: form.fused, subgroups: form.subgroups };
+      const row = { form: form.name, check: layerCheck(form), fused: form.fused, subgroups: form.subgroups, ...(form.normApart ? { normApart: true } : {}) };
       try {
         const pipes = await layerPipes(shape, form.subgroups);
-        const each = [...Array(copies)].map((_, copy) => parts.dispatches(form, pipes, copy));
-        // n layers a submission, each on the next copy
+        const each = await validated(async () => [...Array(copies)].map((_, copy) => parts.dispatches(form, pipes, copy)));
         let next = 0;
         const submission = async (n) => {
           const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
@@ -1008,19 +1027,26 @@ async function layer() {
           await device.queue.onSubmittedWorkDone();
           return performance.now() - began;
         };
-        const r = await validated(async () => {
-          if (fallback) return { ms: await submission(1), dispatches: 1 };
-          await submission(2);
-          return paired(submission, LAYER_MOST);
-        });
-        rows.push({ ...row, dispatches: each[0].length, msPerLayer: r.ms / r.dispatches, layers: r.dispatches,
-          ...(r.ratio ? { ratio: r.ratio } : {}), ...(r.unsteady ? { unsteady: true } : {}) });
+        row.dispatches = each[0].length;
+        timed.push({ row, submission });
       } catch (error) {
-        rows.push({ ...row, error: String(error?.message ?? error) });
+        timed.push({ row: { ...row, error: String(error?.message ?? error) } });
       } finally {
         postMessage({ alive: true });
       }
     }
+    const running = timed.filter((t) => t.submission);
+    try {
+      const results = await validated(() => interleaved(running.map((t) => t.submission), LAYER_MOST));
+      running.forEach((t, i) => {
+        const r = results[i];
+        Object.assign(t.row, r.error ? { error: r.error } : { msPerLayer: r.ms / r.dispatches, layers: r.dispatches, GBps: bytes / (r.ms / r.dispatches) / 1e6,
+          ...(r.ratio ? { ratio: r.ratio } : {}), ...(r.unsteady ? { unsteady: true } : {}) });
+      });
+    } catch (error) {
+      running.forEach((t) => (t.row.error = String(error?.message ?? error)));
+    }
+    rows.push(...timed.map((t) => t.row));
   });
   return { model: "Llama 3.2 1B", pos: LAYER_POS, layers: MODELS["Llama 3.2 1B"].layers, copies, GB: bytes / 1e9, rows };
 }
@@ -1166,6 +1192,44 @@ async function paired(submission, most, strict = false) {
     if (tries) {
       if (!(took > 0)) throw new Error(`a submission of ${2 * n} took no longer than one of ${n}: the device's load moved`);
       return { ms: took, dispatches: n, ratio, unsteady: true };
+    }
+  }
+}
+// T150's review: paired() for several things at once, in turn (T147's timeForms): n for each as paired() finds it, then
+// PAIRS rounds of a submission of n and one of 2n of each, so that a device's warming and load fall on all of them
+// alike. Each: { ms, dispatches (n), ratio } as paired() says it, unsteady past STEADY after the rounds are taken
+// once more, or { error } where its 2n took no longer than its n. On a fallback adapter one submission of 1 each.
+async function interleaved(submissions, most) {
+  if (fallback) {
+    const results = [];
+    for (const submission of submissions) results.push({ ms: await submission(1), dispatches: 1 });
+    return results;
+  }
+  const counts = [];
+  for (const submission of submissions) {
+    await submission(2);
+    let n = 1;
+    while ((await submission(n)) < SUBMISSION_MS && n < most) n *= 2;
+    counts.push(n);
+    postMessage({ alive: true });
+  }
+  for (let tries = 0; ; tries++) {
+    const differences = submissions.map(() => []), ratios = submissions.map(() => []);
+    for (let round = 0; round < PAIRS; round++) {
+      for (let i = 0; i < submissions.length; i++) {
+        const once = await submissions[i](counts[i]), twice = await submissions[i](2 * counts[i]);
+        differences[i].push(twice - once);
+        ratios[i].push(twice / once);
+      }
+      postMessage({ alive: true });
+    }
+    const results = submissions.map((_, i) => {
+      const ratio = middle(ratios[i]), took = middle(differences[i]);
+      return { ms: took, dispatches: counts[i], ratio, steady: took > 0 && ratio >= STEADY[0] && ratio <= STEADY[1] };
+    });
+    if (tries || results.every((r) => r.steady)) {
+      return results.map(({ steady, ...r }) => (r.ms > 0 ? { ...r, ...(steady ? {} : { unsteady: true }) }
+        : { error: `a submission of ${2 * r.dispatches} took no longer than one of ${r.dispatches}: the device's load moved` }));
     }
   }
 }

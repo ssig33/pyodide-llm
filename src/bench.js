@@ -279,17 +279,20 @@ export function tokenTable(steps, baseline, gpu = {}) {
 }
 
 /**
- * T150: the GPU section's table of one layer of a token, its fourteen steps each a dispatch of their own against the
- * same fused into five (public/shaders.js's fusedMatVec). step: {name, result: {model, pos, layers, GB, rows: [{form,
- * check, fused, subgroups, dispatches, msPerLayer, unsteady}, or {form, check, error}]}} or {name, error}; check: the
- * shaders against JavaScript (a form's verdict under row.check); gpu: { fallback, lost }. "Faster than the separate
- * steps" beside a fused row, against the separate steps of the same reduction: not where noRatios() says none, nor
- * for a row the check found WRONG or that was unsteady.
+ * T150: the GPU section's table of one layer of a token: its fourteen steps each a dispatch of their own, the same
+ * fused into five (public/shaders.js's fusedMatVec), and fused but for the norms (seven). step: {name, result: {model,
+ * pos, layers, GB, rows: [{form, check, fused, normApart, subgroups, dispatches, msPerLayer, GBps, unsteady}, or {form,
+ * check, error}]}} or {name, error}; check: the shaders against JavaScript (a form's verdict under row.check);
+ * ceilings: T168's (the buffer's reads, for the share of it the layer's weights are read at); gpu: { fallback, lost }.
+ * "Faster than the separate steps" beside a fused row, against the separate steps of the same reduction (measured in
+ * turn with it): not where noRatios() says none, nor for a row the check found WRONG or that was unsteady. The share
+ * of the reads: not after a lost device, on a fallback adapter, or where that read was unsteady (as matVecTable).
  */
-export function layerTable(step, check, gpu = {}) {
+export function layerTable(step, check, ceilings, gpu = {}) {
   if (!step) return [];
   if (step.error || !step.result) return [`**A layer of a token**: ${tableCell(step.error ?? "not measured")}`];
   const r = step.result, none = noRatios(gpu);
+  const reads = !gpu.lost && ceilings && !ceilings.fallback && !ceilings.global?.unsteady ? ceilings.global?.GBps : undefined;
   const wrong = (row) => Boolean(check && check[row.check] && !check[row.check].ok);
   const usable = (row) => Number.isFinite(row?.msPerLayer) && row.msPerLayer > 0 && !row.unsteady && !wrong(row);
   const faster = (row) => {
@@ -297,13 +300,16 @@ export function layerTable(step, check, gpu = {}) {
     const separate = r.rows.find((one) => !one.fused && one.subgroups === row.subgroups);
     return usable(separate) ? times(separate.msPerLayer / row.msPerLayer) : "";
   };
-  return [`**A layer of a token** (${r.model}'s width, at position ${r.pos}, ${number(r.GB * 1000, 0)} MB of weights): its fourteen steps each a dispatch of its own ` +
-    "(the norm, q, k, v, RoPE and the cache, the attention, o, the residual's add, the norm, gate, up, SwiGLU, down, the add), and the same fused into five " +
-    "(q, k and v with the norm, RoPE and the cache; the attention; o with the add; gate and up with the norm and SwiGLU; down with the add). " +
-    "Each is timed as a submission of 2n layers less one of n, the weights read from copies of them in turn, as the matrix × vector is.",
-    ...(none ? [`Faster than the separate steps: ${none}.`] : []), "",
-    `| a layer | dispatches | GPU ms | its ${r.layers} layers, ms | faster than the separate steps |`, "|---|---:|---:|---:|---:|",
-    ...r.rows.map((row) => (row.error ? `| ${tableCell(row.form)} | ${tableCell(`failed: ${row.error}`)} | | | |`
+  // two significant digits under 1 GB/s (a fallback adapter reads a layer at a few hundredths)
+  const GBps = (row) => (Number.isFinite(row.GBps) ? `${row.GBps < 1 ? row.GBps.toPrecision(2) : number(row.GBps)}${reads ? ` (${number((100 * row.GBps) / reads)}%)` : ""}` : "");
+  return [`**A layer of a token** (${r.model}'s width, at position ${r.pos}, ${number(r.GB * 1000, 1)} MB of weights): its fourteen steps each a dispatch of its own ` +
+    "(the norm, q, k, v, RoPE and the cache, the attention, o, the residual's add, the norm, gate, up, SwiGLU, down, the add), the same fused into five " +
+    "(q, k and v with the norm, RoPE and the cache; the attention; o with the add; gate and up with the norm and SwiGLU; down with the add), " +
+    "and fused but for the two norms (seven). The forms are timed in turn, each as a submission of 2n layers less one of n, the weights read from copies of them in turn, as the matrix × vector is. " +
+    `GB/s: the layer's weights over its time${reads ? `; in parentheses, the share of what a loop that only reads a buffer reads, ${number(reads)} GB/s below` : ""}.`,
+    ...(none ? [`Faster than the separate steps: ${none}.`] : []), ...(gpu.lost ? ["No share of the buffer's reads: the device was lost."] : []), "",
+    `| a layer | dispatches | GPU ms | GB/s | its ${r.layers} layers, ms | faster than the separate steps |`, "|---|---:|---:|---:|---:|---:|",
+    ...r.rows.map((row) => (row.error ? `| ${tableCell(row.form)} | ${tableCell(`failed: ${row.error}`)} | | | | |`
       : `| ${tableCell(row.form)}${wrong(row) ? " (WRONG in the check)" : ""} | ${row.dispatches} | ${row.unsteady ? "unsteady: " : ""}${number(row.msPerLayer, 2)} | ` +
-        `${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
+        `${GBps(row)} | ${number(row.msPerLayer * r.layers)} | ${faster(row)} |`))];
 }

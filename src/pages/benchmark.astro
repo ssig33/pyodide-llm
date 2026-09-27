@@ -423,7 +423,7 @@ const SITE_MODELS = MODELS.filter((entry) => !entry.hf && entry.checkpoint);
     const baseline = cpuBaseline(results.cpu);
     const gpu = { fallback: r.fallback, lost, check: check?.result };
     lines.push(...tokenTable(steps.filter((x) => x.name.startsWith("a token")), baseline, gpu));
-    lines.push("", ...layerTable(steps.find((s) => s.name === "a layer of a token"), check?.result, gpu));
+    lines.push("", ...layerTable(steps.find((s) => s.name === "a layer of a token"), check?.result, ceilings, gpu));
     lines.push("", ...overheadMarkdown(steps.find((s) => s.name === "what a token costs besides the weights")),
       "", ...ceilingsMarkdown(steps.find((s) => s.name === "the device's ceilings")),
       "", ...promptMarkdown(steps.find((s) => s.name === "a prompt all at once"), check?.result, ceilings, baseline, gpu));
