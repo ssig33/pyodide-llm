@@ -237,9 +237,10 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   const others = Math.ceil(bytes) + 2 ** 20, keys = most * layers * 2 * kvDim;
   // T160: a grouped-query model's keys and values are widened for every head of their group, g = heads / kvHeads
   // times, which float16 saves nothing of (Qwen2.5 0.5B, g = 7: float32 1.42 to 1.44 times as fast on one thread at
-  // position 2000, 1.15 to 1.26 on four, CI's x86-64 and arm64; TODO.md's T160): float32 there, unless that alone
-  // takes the model past a 32-bit memory (Qwen2.5 3B: 3.82 GiB, 4.03 in float32). keysInHalf tells which.
-  const half = halfKV && (kvHeads >= heads || (needsWide(size, others + 4 * keys) && !needsWide(size, others + 2 * keys)));
+  // position 2000, 1.15 to 1.26 on four, CI's x86-64 and arm64; TODO.md's T160): float32 there where the model still
+  // fits a 32-bit memory with it (not Qwen2.5 3B: 3.82 GiB, 4.03 in float32), float16 on a 64-bit one (the owner,
+  // 2026-09-27: Llama 3.2 3B and the 7B models keep their memory). keysInHalf tells which.
+  const half = halfKV && (kvHeads >= heads || needsWide(size, others + 4 * keys));
   return others + keys * (half ? 2 : 4);
 }
 /** T160: whether the keys and values of a model that may keep them in float16 (footprint's halfKV) do, as footprint
@@ -328,7 +329,7 @@ function halfToFloat(h) {
 /** stalledMs (tests only): how long a phase may make no progress before its software threads are given up (T120) */
 /** halfKeys (T160): keysInHalf's answer for this model, which the worker sized the memory by. Left out (the tests,
  * the benchmark's own model): float16 where every head has keys of its own, which keysInHalf answers for every model
- * that fits a 32-bit memory with float32 keys and values, or needs a 64-bit one either way. */
+ * that fits a 32-bit memory with float32 keys and values. */
 /** gpuForce (tests only, T147): { matrices, attention }, the names of the GPU's shaders to take (shaders.js's
  * promptForms, gpu.js's attentions), without timing the others. T148: fallback, a fallback adapter taken as a GPU
  * (SwiftShader and lavapipe: the only WebGPU of CI and the development machine); always, every block the GPU can take

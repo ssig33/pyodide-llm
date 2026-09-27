@@ -226,13 +226,13 @@ let failed = false;
   }
 }
 // T160: keys and values in float16 (a shared memory) for a model with a key of every head; for a grouped-query one
-// float32, but where only float16 fits a 32-bit memory (Qwen2.5 3B: 3.82 GiB, 4.03 in float32). A model on a 64-bit
-// memory either way (Llama 3.2 3B, 4.41 GiB in float16) takes float32. The sizes: llama2_convert.checkpoint_size()
+// float32, but where that does not fit a 32-bit memory (Qwen2.5 3B: 3.82 GiB, 4.03 in float32; Llama 3.2 3B on a
+// 64-bit memory either way, 4.41 GiB in float16: the owner, 2026-09-27). The sizes: llama2_convert.checkpoint_size()
 {
   const cases = [["llm-jp-3 150M", [512, 2048, 12, 8, 8, 99584, 4096], 160e6, {}, true],
     ["Qwen2.5 0.5B", [896, 4864, 24, 14, 2, 151936, 4096], 555992604, { bias: true }, false],
     ["Qwen2.5 3B", [2048, 11008, 36, 16, 2, 151936, 4096], 3472375836, { bias: true }, true],
-    ["Llama 3.2 3B", [3072, 8192, 28, 24, 8, 128256, 4096], 3614847004, {}, false]];
+    ["Llama 3.2 3B", [3072, 8192, 28, 24, 8, 128256, 4096], 3614847004, {}, true]];
   for (const [name, header, size, form, half] of cases) {
     const options = { dtype: "int8", ...form };
     assert.equal(keysInHalf(header, size, { ...options, halfKV: true }), half, `${name}: float16 keys and values ${!half}`);
