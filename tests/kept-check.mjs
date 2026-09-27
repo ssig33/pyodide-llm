@@ -215,4 +215,18 @@ const readBack = async (found) => {
     "asking for eight bits does not make its own six-bit conversion replaced");
   assert.deepEqual(await kept.replaced({ ...model, id: "local", hf: { repo: "r/s", revision: "3" } }), []);
 }
+// the review of T203: a Qwen3's two forms share one conversion, kept under the id of the form that converted it. When
+// their source changes, opening the other form first replaces it too (it left a 9 GB conversion of the 8B behind)
+{
+  browser();
+  const pair = ["q-thinking", "q"];
+  const before = { ...model, id: "q-thinking", hf: { repo: "a/q", revision: "1" } };
+  const after = { ...model, id: "q", shares: pair, hf: { repo: "a/q-GGUF", revision: "2", vocabulary: { repo: "a/q", revision: "1" } } };
+  await kept.keep({ ...before, conversion: { dtype: "int8" } }, { ...manifest, id: "q-thinking" }, (a, b) => bytes.slice(a, b), vocabulary);
+  await kept.keep({ ...model, id: "r", conversion: { dtype: "int8" } }, { ...manifest, id: "r" }, (a, b) => bytes.slice(a, b), vocabulary);
+  const names = (list) => list.map((one) => decodeURIComponent(one.name));
+  assert.deepEqual(names(await kept.replaced(after)), ["a/q@1:int8:4096"], "the other form's conversion is replaced");
+  assert.deepEqual(names(await kept.replaced({ ...after, id: "q-thinking" })), ["a/q@1:int8:4096"]);
+  assert.deepEqual(await kept.replaced({ ...after, shares: undefined }), [], "without shares only its own id's");
+}
 console.log("ok");

@@ -47,11 +47,13 @@ export const outdated = (kept) => converterOf(kept.manifest) < CONVERTER;
 /** The conversions kept for a model of the list under a name it has no more, of either bits (T136: its weights come
  * from another repository now, or its vocabulary): never served again, and in the way of the new one (a 7B's 8 GB
  * each). The worker deletes them before it keeps the new one. Not those of ?hf= and of folders, which all have the
- * id "local". */
+ * id "local". shares: the ids of the list that share one conversion (a Qwen3's two forms, T124), kept under the id of
+ * whichever converted it (the review of T203: the other form's left its 9 GB behind). */
 export async function replaced(model) {
   if (model.id === "local") return [];
   const names = [...keptNames(model), ...keptNames({ ...model, conversion: { ...model.conversion, dtype: undefined } })];
-  return (await keptModels()).filter((kept) => kept.manifest.id === model.id && !names.includes(kept.name));
+  const ids = model.shares ?? [model.id];
+  return (await keptModels()).filter((kept) => ids.includes(kept.manifest.id) && !names.includes(kept.name));
 }
 const cacheKey = (name, file) => `${self.location.origin}/converted/${name}/${file}`;
 

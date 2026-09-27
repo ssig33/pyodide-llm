@@ -66,9 +66,10 @@ const qwen3 = { specials: ["<|im_start|>", "<|im_end|>", "</think>", "<think>"] 
 const thinking = { steps: 0, temperature: 0.6, topp: 0.95, repetition_penalty: 1.0 };
 const atOnce = { steps: 0, temperature: 0.7, topp: 0.8, repetition_penalty: 1.0 };
 /** A Qwen3 twice (T124, the owner's "両方を別々に用意できないのか"): thinking first, and answering at once. The two
- * share their weights, and so a conversion kept in the browser; only the format differs. */
+ * share their weights, and so a conversion kept in the browser; only the format differs. shares: both ids, for
+ * kept.js's replaced() (what either kept before its source changed goes, whichever form is opened first) */
 function thinkingAndNot(id, name, source, download, sizes, chat = {}) {
-  const common = { group: "hf", ...source, download, conversion: {}, options: qwen3,
+  const common = { group: "hf", ...source, download, conversion: {}, options: qwen3, shares: [`${id}-thinking`, id],
     prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE, ...chat };
   return [
     { ...common, id: `${id}-thinking`, name: `${name} (thinking)`, note: `thinks before it answers · 日本語 / English · ${sizes}`,
