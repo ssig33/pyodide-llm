@@ -53,14 +53,14 @@
 // Checked: the ids are NumPy's, or where one is not, a near tie (T187's: NumPy gives it at least half the probability
 // of its most likely; the steps after it are not compared, their inputs differ; the CPU's step feeds NumPy's id to the
 // GPU's next ones whatever it chose); the keys and values the GPU wrote back of its first 4 positions in forward.js's
-// cache against NumPy's, to the line of the prompt's shaders of the same arithmetic (float32 GPU_LINE or K × E16;
+// cache against NumPy's, a layer at a time (T187), to the line of the prompt's shaders of the same arithmetic (float32 GPU_LINE or K × E16;
 // DP4A K_PACKED × Q8's distance) or the run's own prompt's distance, the larger (the steps' attention reads the
 // prompt's keys and values; the next 3 read the CPU's step's too, its 7-bit activations, and are held to their ids); a
 // stop token (NumPy's second) ends the steps after it; a penalty of 100 on NumPy's first id (greedy) gives the largest
 // of NumPy's logits penalized so (or a near tie); two sampled steps at temperature 2 with random numbers of 0.02 and
 // 0.98 give two tokens of NumPy's nucleus, not the same (the random numbers reach the GPU: where either lands is not
-// held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js); and 4
-// steps after the prompt went through the CPU while the GPU's own cache held the keys and values of other tokens
+// held to NumPy's, the GPU's logits being others; the draw itself is SAMPLE's, checked on the device, gpu.js); and a
+// step after the prompt went through the CPU while the GPU's own cache held the keys and values of other tokens
 // (a prompt of them through the GPU first): the CPU's most likely token on its own keys and values, or a near tie of
 // its logits (the CPU's keys and values went up).
 //
@@ -435,17 +435,30 @@ try {
       out.penaltyHistory = [...tokens.slice(0, -1), greedy[0], tokens[n]];
       out.penalized = engine.generateMany(tokens[n], n, out.penaltyHistory.slice(-64), out.penaltyHistory.length, 1, 0, 0.9, 100, [], []);
       out.sampled = [0.02, 0.98].map((random) => ask(tokens[n], n, [], 1, [2, 0.999, 1], [random]));
+      // (T152's review) 4 sampled steps with a penalty in one submission against the same 4 asked one at a time: the
+      // GPU's arithmetic is the same, so the ids are to the bit (the random numbers taken in their order, and the
+      // penalty's window handed over from the history at every request as the GPU carries it within a submission)
+      const drawn = [2, 0.999, 1.3], numbers = [0.3, 0.7, 0.1, 0.9];
+      out.together = ask(tokens[n], n, [], 4, drawn, numbers);
+      out.apart = [];
+      for (let i = 0; i < 4; i++) out.apart.push(...(ask(i ? out.apart[i - 1] : tokens[n], n + i, out.apart.slice(0, i), 1, drawn, [numbers[i]]) ?? [NaN]));
       // the CPU's keys and values going up: a prompt of other tokens through the GPU (its own cache then holds theirs),
-      // the prompt through the CPU, and the GPU's steps from its last token, which must see the CPU's of every position
-      engine.forwardMany(tokens.slice(1, -1).reverse(), 0);
-      engine.gpuSide = "cpu";
-      engine.forwardMany(tokens.slice(0, -1), 0);
-      engine.gpuSide = null;
-      // (the CPU's logits of the prompt's last token on the CPU's keys and values, the answer: NumPy's is not, the
-      // CPU's keys and values being up to 46% from NumPy's on the made-up models)
-      engine.forward(tokens[n], n);
-      out.uploadedLogits = b64(engine.logits().slice());
-      out.uploaded = ask(tokens[n], n, [], 1);
+      // the prompt through the CPU, and the GPU's step from its last token, which must see the CPU's of every position.
+      // Twice, over two others (the review: the ids alone let a position left out pass, the GPU's own keys and values of
+      // the same token being near the CPU's): the keys and values the step wrote back are then to the bit the same
+      const upload = (other) => {
+        engine.forwardMany(other, 0);
+        engine.gpuSide = "cpu";
+        engine.forwardMany(tokens.slice(0, -1), 0);
+        engine.gpuSide = null;
+        // (the CPU's logits of the prompt's last token on the CPU's keys and values, the answer: NumPy's is not, the
+        // CPU's keys and values being up to 46% from NumPy's on the made-up models)
+        engine.forward(tokens[n], n);
+        const logits = b64(engine.logits().slice()), id = ask(tokens[n], n, [], 1), rows = engine.keysAndValues(n, 1);
+        return { logits, id, kv: b64(rows.keys) + b64(rows.values) };
+      };
+      const [one, two] = [tokens.slice(0, -1).reverse(), [...tokens.slice(1, -1), tokens[0]]].map(upload);
+      Object.assign(out, { uploadedLogits: one.logits, uploaded: one.id, uploadedTwice: two.id, uploadedSame: one.kv === two.kv });
       return out;
     };
     const run = async (gpu, gpuForce, gpuRemembered, steps = false) => {
@@ -783,7 +796,7 @@ for (const { id, cpu, gpu: runs, late, refused, remembered } of outcome.results)
       (failures.length ? ` — FAILED\n    - ${failures.join("\n    - ")}` : ""));
     failed ||= failures.length > 0;
     // (evaluated, and said, whatever came before)
-    const stepsFine = gpu.steps ? stepsRight(c, gpu.steps, { e16, q8, kvDim, prompt: gpuKv }) : true;
+    const stepsFine = gpu.steps ? stepsRight(c, gpu.steps, { e16s, q8s, kvDim, prompt: gpuLayers }) : true;
     failed ||= !stepsFine;
   }
   layerTables(c, cpu, runs, measures);
@@ -792,7 +805,7 @@ process.exit(failed ? 1 : 0);
 
 // T152: the steps of a generation on the GPU against NumPy's greedy continuation (see the head of this file): a line
 // "  a token by <form>: ..." and whether it is right
-function stepsRight(c, steps, { e16, q8, kvDim, prompt }) {
+function stepsRight(c, steps, { e16s, q8s, kvDim, prompt }) {
   const ref = c.reference, greedy = ref.greedy, vocab = floats(ref.logits).length;
   const rows = floats(ref.greedyLogits), logitsOf = (i) => rows.subarray(i * vocab, (i + 1) * vocab);
   const failures = [], said = [];
@@ -845,13 +858,26 @@ function stepsRight(c, steps, { e16, q8, kvDim, prompt }) {
     }
     return out;
   };
-  const kvOff = Math.max(worstRow(rowsOf(steps.keys), rowsOf(ref.greedyKeys), kvDim), worstRow(rowsOf(steps.values), rowsOf(ref.greedyValues), kvDim));
-  // the line of the prompt's shaders of the same arithmetic (T187: DP4A by Q8's distance), or the run's own prompt's
-  // distance where that is larger: the steps' attention reads its keys and values
+  // a layer at a time (T187's lines: the largest of all layers against the largest E16 or Q8 let a deep model's early
+  // layers go 10 times their own; the review of T152): the line of layer l is the prompt's shaders' of the same
+  // arithmetic at layer l (T187: DP4A by Q8's distance), or the run's own prompt's distance at layer l where that is
+  // larger (the steps' attention reads its keys and values)
+  const [gotK, gotV, wantK, wantV] = [steps.keys, steps.values, ref.greedyKeys, ref.greedyValues].map(rowsOf);
+  const rowsAt = (all, l) => all.subarray(l * positions.length * kvDim, (l + 1) * positions.length * kvDim);
   const packed = /DP4A/.test(steps.form ?? "");
-  const line = Math.max(packed ? K_PACKED * q8 : Math.max(GPU_LINE, K.float32 * e16), prompt);
-  if (!(kvOff <= line)) failures.push(`the keys and values of the steps are ${kvOff.toExponential(2)} from NumPy's (line ${line.toExponential(2)})`);
-  said.push(`keys and values of ${positions.length} positions ${kvOff.toExponential(2)} (line ${line.toExponential(2)})`);
+  const offs = Array.from({ length: layers }, (_, l) => Math.max(worstRow(rowsAt(gotK, l), rowsAt(wantK, l), kvDim), worstRow(rowsAt(gotV, l), rowsAt(wantV, l), kvDim)));
+  const lines = offs.map((_, l) => Math.max(packed ? K_PACKED * q8s[l] : Math.max(GPU_LINE, K.float32 * e16s[l]), prompt[l]));
+  const ratios = offs.map((off, l) => off / lines[l]);
+  const at = ratios.reduce((worst, x, l) => (!(x <= ratios[worst]) ? l : worst), 0);
+  if (!(ratios[at] <= 1)) failures.push(`the keys and values of the steps' layer ${at} are ${offs[at].toExponential(2)} from NumPy's (its line ${lines[at].toExponential(2)})`);
+  said.push(`keys and values of ${positions.length} positions ${Math.max(...offs).toExponential(2)}, layer ${at} ${ratios[at].toFixed(2)} of its line ${lines[at].toExponential(2)}`);
+  // (T152's review) 4 sampled steps in one submission, and one at a time: the same ids to the bit
+  if (JSON.stringify(steps.together) !== JSON.stringify(steps.apart)) failures.push(`4 sampled steps together ${JSON.stringify(steps.together)}, one at a time ${JSON.stringify(steps.apart)}`);
+  said.push(`4 sampled steps ${JSON.stringify(steps.together)}${JSON.stringify(steps.together) === JSON.stringify(steps.apart) ? " one at a time too" : ""}`);
+  // (T152's review) the CPU's keys and values went up whole: over two other caches the step wrote the same bits
+  if (!steps.uploadedSame || JSON.stringify(steps.uploaded) !== JSON.stringify(steps.uploadedTwice)) {
+    failures.push(`after a prompt on the CPU over two other caches of the GPU, the step wrote other keys and values (${JSON.stringify(steps.uploaded)}, ${JSON.stringify(steps.uploadedTwice)})`);
+  }
   // a stop token: NumPy's second id ends the steps after it
   const until = greedy.indexOf(greedy[1]) + 1, wanted = greedy.slice(0, until);
   if (first >= until && JSON.stringify(steps.stopped) !== JSON.stringify(wanted)) failures.push(`with ${greedy[1]} a stop token the steps were ${JSON.stringify(steps.stopped)}, not ${JSON.stringify(wanted)}`);

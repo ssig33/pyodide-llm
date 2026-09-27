@@ -22,7 +22,8 @@
 // CPU; far slower: every step on the CPU but that generation's first run; failing on its second request: the CPU from
 // there on, the step it gave back taken by the CPU. And Python's generate() through external(), as the page's worker
 // runs it, on the far faster one: sampled and greedy, the steps on the GPU and the counts right (the made-up GPU fails a
-// request whose random numbers, history or settings are not what Python should hand over).
+// request whose random numbers, history or settings are not what Python should hand over); and through Python on one
+// that fails on its second request: the generation goes on whole on the CPU (T152's review: JavaScript's null is jsnull).
 //   node tests/gpu-default-check.mjs [--forward <another forward.js, to see a broken one fail>]
 import fs from "node:fs";
 import path from "node:path";
@@ -343,12 +344,12 @@ if (isMainThread) {
     }
     py.FS.writeFile("tokenizer.bin", fs.readFileSync(tokenizer));
     const line = { fixed: 60 * perToken, perToken: 2 * perToken, step: 0.2 * cpuStep };
-    const gpu = () => {
-      const fake = new Worker(FAKE, { eval: true, workerData: line });
+    const gpuOf = (workerData) => () => {
+      const fake = new Worker(FAKE, { eval: true, workerData });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
         set onerror(f) { fake.on("error", (error) => f({ message: error.message })); } };
     };
-    const outside = external({ memory, base, size, kernels, gpu });
+    const outside = external({ memory, base, size, kernels, gpu: gpuOf(line) });
     py.globals.set("OUTSIDE", outside);
     py.globals.set("OPTIONS", py.toPy(options));
     py.runPython(`from llama2_numpy import Llama\nllama = Llama(None, open("tokenizer.bin", "rb").read(), kernels="simdkernel.so", external=OUTSIDE, **OPTIONS)`);
@@ -367,6 +368,26 @@ if (isMainThread) {
         failures.push(`Python's generate() ${i ? "greedy" : "sampled"}: ${sampled} sampled, ${gpu} on the GPU, ${text} characters`);
       }
     });
+    // T152's review: the same through Python on a GPU that fails on its second request. generateMany gives the steps
+    // back (null), and Python takes them on the CPU: the generation goes on whole (Pyodide makes JavaScript's null
+    // jsnull, not None, unless asked: generateMany says undefined, which is None)
+    const failing = external({ memory, base, size, kernels, gpu: gpuOf({ ...line, failTokensAt: 2 }) });
+    py.globals.set("OUTSIDE", failing);
+    py.runPython(`llama = Llama(None, open("tokenizer.bin", "rb").read(), kernels="simdkernel.so", external=OUTSIDE, **OPTIONS)`);
+    await failing.engine.gpu;
+    failing.engine.newGeneration();
+    let broke = null;
+    try {
+      py.runPython(`text = "".join(llama.generate("こんにちは、今日は", steps=48, temperature=0.8, topp=0.9, repetition_penalty=1.1, seed=3))`);
+    } catch (error) {
+      broke = String(error?.message ?? error).split("\n").filter(Boolean).at(-1);
+    }
+    const after = py.runPython("llama.stats").toJs({ dict_converter: Object.fromEntries });
+    py.runPython("llama.release()");
+    say(`Python's generate() on a GPU that fails on its second request: ${broke ?? `${after.sampled} sampled, ${failing.engine.gpuSampled} on the GPU`}; status ${failing.engine.gpuStatus}`);
+    if (broke || !(after.sampled === 48 - after.prompt_tokens && failing.engine.gpuSampled === 4 && /failed on a token/.test(failing.engine.gpuStatus ?? ""))) {
+      failures.push(`Python's generate() on a GPU that fails: ${broke ?? `${after.sampled} sampled, ${failing.engine.gpuSampled} on the GPU, ${failing.engine.gpuStatus}`}`);
+    }
   }
   if (failures.length) say(`FAILED\n- ${failures.join("\n- ")}`);
   else say("ok");
