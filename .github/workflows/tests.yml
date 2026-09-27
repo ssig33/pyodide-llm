@@ -1,0 +1,75 @@
+name: Tests
+
+# T188: the tests the deploy runs, and the threads' check, on any branch (--ref), without deploying: the development
+# machine (an ARM box of 2 cores, shared) runs none of them any more (the owner, 2026-09-27: "いったん、テスト CI
+# だけにしねぇか？"). `extra` runs more commands after them, for a branch's own measurements (the same process takes
+# the old and the new, as AGENTS.md says).
+on:
+  workflow_dispatch:
+    inputs:
+      extra:
+        description: 'more shell commands to run after the tests (optional), e.g. node tests/profile.mjs --from 4000'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Download and convert the models, compile the kernels
+        run: |
+          pip install numpy pytest tokenizers regex
+          npm ci
+          make models kernels
+
+      - name: Unit tests of the engine
+        run: python -m pytest tests -q
+
+      - name: Unit tests of the page's modules
+        run: |
+          node tests/bench.mjs
+          node tests/summary-check.mjs
+          node tests/models-check.mjs
+          node tests/ladder-check.mjs
+          node tests/kept-check.mjs
+          node tests/coi-js-check.mjs
+          node tests/gpu-choice-check.mjs
+
+      - name: Smoke test with the latest Pyodide
+        run: |
+          npm install --no-save pyodide@latest
+          node tests/smoke.mjs
+          node tests/forward-check.mjs --rounds 1 --positions 128
+          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --plain
+          node tests/gpu-default-check.mjs
+          node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --wide
+
+      - name: The software threads
+        run: node tests/threads-check.mjs
+
+      - name: Build the site
+        run: npm run build
+
+      - name: More
+        if: ${{ inputs.extra != '' }}
+        env:
+          EXTRA: ${{ inputs.extra }}
+        run: bash -c "$EXTRA"

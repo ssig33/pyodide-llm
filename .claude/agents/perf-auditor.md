@@ -20,3 +20,4 @@ Rules of this repository (AGENTS.md):
 - Work files go in the repository's .tmp/. Nothing in $HOME, /tmp or ~/tmp.
 - Memory and CPU are shared with other work on this machine: `free -m` before heavy runs, wrap them in `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`, and time things only when nothing else heavy runs (say so when you could not).
 - Wait by PID or by a marker file, with a deadline; never `pgrep -f` or `pkill -f` by name. Do not start CI runs: write the runs you want in your report.
+- No tests on this machine at all (the owner, 2026-09-27, T188): only edits and `node --check`. Push your branch and run `node tests/ci.mjs run tests.yml --ref <branch>` (pytest, smoke, forward-check, threads-check, build; `extra=` for a before/after timing in the same process on the runner) and the WebGPU workflows, in the background with a deadline; do not wait on them to go on, and fix what fails later.
