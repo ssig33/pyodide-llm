@@ -90,7 +90,7 @@
 - T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
 - T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
 止めた後に確かめた各ブランチの先頭（どれも origin に push 済み）: `t129-fetch-edges` f3cb9a7（案 B への入れ替えはコミット済み。その CI は未確認）、`t130-review` fb04b0b（`t130-kv-unshared` を本線に rebase しただけ、レビューの直しはまだ）、`t224-opus-review` 3ee8738（レビューの途中の AGENTS.md と docs/webgpu.md の書きかけを WIP としてコミット）、`t224-attn-vec-fable` 18d454b（= Fable の確かめ）、`t219-review` f2f421f と `t219-review-probe` 249e2ff（レビューの調べの途中）。
-再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。**再開のとき最初に T225（NVIDIA の層の検査が WRONG）、次に T226（Qwen3 などの答えも GPU で）を見る。** ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
+再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。**再開のとき最初に T225（NVIDIA の層の検査が WRONG）、次に T226（Qwen3 などの答えも GPU で）を見る。T227（報告に警告を全部）は T225 の切り分けに要るので一緒に。** ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
 
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
 - 根拠: レビューのサブエージェントが worker.js を Node の `vm` で偽の fetch・Cache API・ストリームの上で動かす試験台を作り（T97・T118・T119、約 70 件）、次を見つけた（直したものは各項のレビューの行）。
@@ -1179,6 +1179,9 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 ### T226 [性能] Qwen2・Qwen3・GPT-2・NeoX の答えも GPU で（GPU だけにも置けるように） — 状態: 未着手（2026-09-28、持ち主「Qwen3 4B ですら GPU 使われないんだが？」、NVIDIA の PC で。規模 中。再開のとき T225 の次に）
 - 今の形: 答えを GPU で書けるのは Llama の形だけ（T152 の fused の層のシェーダに bias・head の norm・違う head の大きさ・LayerNorm・GELU・並列残差が無い）。GPU だけ（T156）もそれが条件。Chrome は `deviceMemory` を 8 で止めるので、32 GB の PC も 2 重は 6.5 GiB まで。Qwen3 4B の int8 は 2 重で線を越え、GPU だけにもできず、プロンプトも含めて全部 CPU になる。
 - 作るもの: (1) 答えの層（fusedMatVec / fusedDp4aMatVec と歩の道）に、プロンプトの側（T153・T154）と同じ bias の ADD、head ごとの RMSNorm、qDim の幅、LayerNorm・GELU・並列残差を足す（元ネタはプロンプトの側と同じ llama.cpp の WebGPU）。(2) そうすれば `gpuOnlyUnfit()` の形の条件も外れ、Qwen3 4B などが GPU だけに置ける。(3) 見直し: `deviceMemory` が 8 と言う端末の 2 重の線（6.5 GiB）が、32 GB の PC でも同じになること。`performance.memory`（Chromium）や GPU の `maxBufferSize` を足した判定を考える（開発機の値を既定にしない）。
+
+### T227 [バグ] /benchmark/ の警告（WRONG と、その訳）が写した報告に全部入らない — 状態: 未着手（2026-09-28、持ち主「警告もコピペするようになってないの、不備では？」。規模 小。再開のとき T225 と一緒に）
+- 持ち主の PC の回で、画面に出た検査の WRONG とその訳（どの検査がどの数で落ちたか、tokens on the GPU の「token 2: 48, the CPU 483」など）が、写した Markdown（と Issue の要約、T185）から読み取れず、持ち主が行を拾って貼り直すことになった。報告の頭に、その回で WRONG・failed・unsteady・skipped になったものを 1 か所に全部並べる（節・検査の名前・訳の文そのまま）。要約（`shortReport()`）にも同じものを入れる。持ち主の決まり: 計測のページは詳しい説明でよい。`tests/bench.mjs` に、WRONG のある報告の頭と要約にその行が出る試験。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **完了（本線に入れた 48f8ee5、レビュー済み T217）**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）
 - CI で 2 回、2 本のほうが 1.24〜1.34 倍速いのに 1 本を選んだ（8 つの時間を 4 つずつ 2 塊から取る上側の中央値なので、1 塊が乱れると判定が返る）。検索の判定を 1 塊の乱れに強い形にする。偽の時計の試験（gpu-default-check の形）で、乱れた 1 塊があっても正しく選ぶことを見る。持ち主の Android（的の端末）で 4 本を選ぶことは変えない。
