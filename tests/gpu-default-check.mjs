@@ -348,13 +348,13 @@ if (isMainThread) {
       await turn();
     }
     say(`T223, a search while the GPU gets ready: ${beforeReady.threads} then ${engine.threads}, remembered ${JSON.stringify(told)} (${verdicts(engine).join(", ")})`);
-    const log = engine.searchLog;
-    engine.release();
+    const log = engine.searchLog, after = engine.threads;
+    engine.release();  // (one thread from here on)
     expect("T223: while the GPU gets ready, the search's 4 used and not remembered", [beforeReady.threads, beforeReady.told], [4, []]);
     expect("T223: no search begins while the GPU gets ready", idle, false);
     expect("T223: the verdicts beside the GPU marked, those after it not", log.map((v) => v.whileGpu),
       log.map((_, i) => i < beforeReady.searched));
-    expect("T223: searched again once the GPU is ready: 2, remembered", [engine.threads, told], [2, [2]]);
+    expect("T223: searched again once the GPU is ready: 2, remembered", [after, told], [2, [2]]);
   }
   {
     // a count remembered from an earlier visit (4, the owner's Android's) is searched again on the first generation
@@ -370,9 +370,10 @@ if (isMainThread) {
       generation(engine);
       await turn();
     }
-    say(`T223, a remembered 4 on its first generation: ${engine.threads}, remembered ${JSON.stringify(told)} (${verdicts(engine).join(", ")})`);
+    const after = engine.threads;
+    say(`T223, a remembered 4 on its first generation: ${after}, remembered ${JSON.stringify(told)} (${verdicts(engine).join(", ")})`);
     engine.release();
-    expect("T223: a remembered count: no search as it loads, one on the first generation, 2 remembered", [idle, began, engine.threads, told], [false, true, 2, [2]]);
+    expect("T223: a remembered count: no search as it loads, one on the first generation, 2 remembered", [idle, began, after, told], [false, true, 2, [2]]);
   }
   {
     const { threadsKey } = await import(path.join(root, "src/bench.js"));
