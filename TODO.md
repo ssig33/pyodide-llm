@@ -90,7 +90,7 @@
 - T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
 - T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
 止めた後に確かめた各ブランチの先頭（どれも origin に push 済み）: `t129-fetch-edges` f3cb9a7（案 B への入れ替えはコミット済み。その CI は未確認）、`t130-review` fb04b0b（`t130-kv-unshared` を本線に rebase しただけ、レビューの直しはまだ）、`t224-opus-review` 3ee8738（レビューの途中の AGENTS.md と docs/webgpu.md の書きかけを WIP としてコミット）、`t224-attn-vec-fable` 18d454b（= Fable の確かめ）、`t219-review` f2f421f と `t219-review-probe` 249e2ff（レビューの調べの途中）。
-再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
+再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。**再開のとき最初に T225（NVIDIA の層の検査が WRONG）を見る。** ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
 
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
 - 根拠: レビューのサブエージェントが worker.js を Node の `vm` で偽の fetch・Cache API・ストリームの上で動かす試験台を作り（T97・T118・T119、約 70 件）、次を見つけた（直したものは各項のレビューの行）。
@@ -1170,6 +1170,10 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 
 ### T224 [性能] 1 トークンの attention を llama.cpp の `flash_attn_vec` の形に — 状態: **止めた（2026-09-28、リミット）。実装はブランチ `t224-attn-vec`（fc75dbe〜9607942、Fable の確かめ 18d454b: 直しなし）。Opus xhigh のレビューが途中。再開: 本線に rebase → レビュー → 本線 → 持ち主の Android の /benchmark/ の GPU の節で attention の段（前は 0.90 ms）**
 - 持ち主の Android で、1 トークンの層 2.6 ms のうち attention だけで 0.90 ms（位置 127）。行列は 1.90 ms で帯域の 91.5%。GPU の生成が CPU に勝つ線は 1 層 2.72〜2.9 ms 以下（T152 のレビュー）なので、attention を縮めれば届く見込み。今の生成は prompt 用の flashTile（Q_TILE の 3/4 が空、ワークグループは head の数だけ）。llama.cpp の WebGPU の decode は `flash_attn_vec`（KV を分けて reduce、`ggml-webgpu.cpp` の 2078〜2113 行、MIT）で、長い文脈では層あたり 6 回（T152 の申し送り (a)）。それを元ネタに 1 トークンの attention を書き、エンジンの生成とベンチの層の表・段の表の両方で使う。GPU の K と V は float16（T147）のまま。
+
+### T225 [バグ] NVIDIA（Turing）で /benchmark/ の層の検査が全部 WRONG — 状態: 未着手（2026-09-28、持ち主が貼った PC の報告 site 4db0a8c、Windows の Chrome 154、16 論理コア。規模 小〜中。再開のときに最初に見る）
+- 層の検査が 7 つとも WRONG: llama.cpp の 4 つは worst 1.8e-3、DP4A の 3 つは worst 9.1e-4 で「quantized: o far from quantize_x's」。行列 × ベクトル・タイル・サンプリング・生成の検査は ok。モデルのページの経路（エンジンの読み込みの検査）は通って、答えは GPU（373 tok/s 対 CPU 158）で書いた。見立て（未確認）: 層の検査の線（1e-3 と、o の前の量子化のスケールの線）が NVIDIA の丸め（fast math、fma、割り算の精度。T175 のレビューが「ビット一致を求めない」とした所）に対して厳しすぎる。本物の誤りか、線の誤りかを先に切り分ける（層の段ごとに NumPy / JS と比べる、Dawn + lavapipe で同じ入力を回す）。
+- 同じ報告の数字（1 回ずつ）: プロンプトは GPU で 5.6 倍（64 トークン）・4.5 倍（256）、書くことは GPU 360〜373 tok/s 対 CPU 158（2.3 倍）。1B の 1 トークン GPU 15.0 ms（66.6 tok/s、CPU の見積もり 17.9）、3B 34.0 ms。1 層 0.42〜0.44 ms（timestamp と一致）、バッファの読み 298 GB/s、行列だけ 68%。サンプリングだけ 1 ワークグループ 0.371 ms・塊 0.104 ms（T191 が 3.6 倍効く）。CPU は 2 本が速い（書くこと 171 tok/s、ページは 8 本を選んだ: 16 か 8 で 8、8 か 4 で 8。T223 の見直しの材料）。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **完了（本線に入れた 48f8ee5、レビュー済み T217）**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）
 - CI で 2 回、2 本のほうが 1.24〜1.34 倍速いのに 1 本を選んだ（8 つの時間を 4 つずつ 2 塊から取る上側の中央値なので、1 塊が乱れると判定が返る）。検索の判定を 1 塊の乱れに強い形にする。偽の時計の試験（gpu-default-check の形）で、乱れた 1 塊があっても正しく選ぶことを見る。持ち主の Android（的の端末）で 4 本を選ぶことは変えない。
