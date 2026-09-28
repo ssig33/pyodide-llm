@@ -430,6 +430,28 @@ def head_norm(x, weight, eps=RMS_EPS):
     return (weight * heads / np.sqrt((heads * heads).mean(axis=1, keepdims=True) + np.float32(eps))).reshape(-1)
 
 
+def l2norm(x, eps=1e-6):
+    """Every row of x over its length (transformers' l2norm of Gated DeltaNet's q and k, T229)."""
+    return x / np.sqrt((x * x).sum(axis=-1, keepdims=True) + np.float32(eps))
+
+
+def softplus(x):
+    """ln(1 + e^x), as PyTorch's (x past 20 is x)."""
+    return np.where(x > 20, x, np.log1p(np.exp(np.minimum(x, 20))))
+
+
+def hadamard(x, block):
+    """Prism's rotation (T229): every block of x times the normalized Walsh-Hadamard matrix of Sylvester's order
+    (H[i, j] = (-1)^popcount(i & j) / sqrt(block)), which is its own inverse."""
+    y = np.array(x, dtype=np.float32).reshape(-1, block)
+    h = 1
+    while h < block:
+        y = y.reshape(-1, block // (2 * h), 2, h)
+        y = np.stack([y[:, :, 0] + y[:, :, 1], y[:, :, 0] - y[:, :, 1]], axis=2)
+        h *= 2
+    return (y.reshape(np.shape(x)) / np.float32(math.sqrt(block))).astype(np.float32)
+
+
 def layernorm(x, weight, bias):
     """GPT-2 normalizes by the mean and the variance, and adds a bias."""
     centred = x - x.mean()
@@ -734,7 +756,10 @@ def external_tensors(header, dtype, form=None):
 # the attributes of Llama that are tensors of the file, in no particular order
 TENSOR_NAMES = ("token_embedding_table", "rms_att_weight", "wq", "wk", "wv", "wo", "rms_ffn_weight", "w1", "w2", "w3",
                 "rms_final_weight", "freq_cis_real", "freq_cis_imag", "wcls", "bq", "bk", "bv", "positions",
-                "ln_att_bias", "ln_ffn_bias", "ln_final_bias", "bo", "b1", "b2", "q_norm", "k_norm")
+                "ln_att_bias", "ln_ffn_bias", "ln_final_bias", "bo", "b1", "b2", "q_norm", "k_norm",
+                # T229: a Qwen3.5's (qwen35_layout())
+                "wg", "wqkv", "wz", "wb", "wa", "conv", "ssm_a", "ssm_dt", "ssm_norm", "wout",
+                "signs_dim", "signs_q", "signs_v", "signs_hidden")
 
 
 def outlier_channels(weight, count=OUTLIER_CHANNELS, ratio=OUTLIER_RATIO):
@@ -760,7 +785,46 @@ def outlier_columns(classifier, channels):
 # them into the options, and one dict of these names goes to everything that lays the file out or sizes it
 # (llama2_convert.layout(), checkpoint_size() and Writer, checkpoint_dtype() below, forward.js's footprint()), so
 # that another one is added where it is used, not along the way (T144).
-FORM = {"bias": False, "arch": "llama", "qk_norm": False, "head_dim": 0}
+FORM = {"bias": False, "arch": "llama", "qk_norm": False, "head_dim": 0,
+        # T229: a Qwen3.5 (arch "qwen35") has every interval-th layer of attention and the others of Gated DeltaNet,
+        # whose q and k have k_heads heads of k_head values, v v_heads of v_head, and a causal conv of conv taps.
+        # hadamard: the block of the rotation its matrices were stored in (Prism's, 0 for none; T229)
+        "interval": 0, "k_heads": 0, "v_heads": 0, "k_head": 0, "v_head": 0, "conv": 0, "hadamard": 0}
+
+
+def qwen35_layout(dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, form):
+    """(name, shape, is a matrix) of every tensor of a Qwen3.5's checkpoint, in file order (T229): llama2_convert's
+    layout() and Llama.qwen35_tensors() both follow this list. The layers of attention (every interval-th, the last of
+    each run) and of Gated DeltaNet are stacked apart, each kind with its own tensors; the norms and the FFN are the
+    same in every layer. q and its output gate are two matrices (Hugging Face interleaves them by head). Is a matrix:
+    True for what int8 quantizes, False for float32 vectors, None for the RoPE tables. With a rotation (hadamard),
+    the signs it multiplies each kind of input by come last: of dim, of q_dim (the attention's output), of the
+    DeltaNet's v (its output) and of hidden_dim."""
+    head = int(form["head_dim"]) or dim // n_heads
+    full = n_layers // int(form["interval"])
+    linear = n_layers - full
+    q_dim, kv_dim = n_heads * head, n_kv_heads * head
+    k_dim, v_dim = int(form["k_heads"]) * int(form["k_head"]), int(form["v_heads"]) * int(form["v_head"])
+    v_heads = int(form["v_heads"])
+    tensors = [("token_embedding_table", (abs(vocab_size), dim), True), ("rms_att_weight", (n_layers, dim), False),
+               ("wq", (full, q_dim, dim), True), ("wg", (full, q_dim, dim), True), ("wk", (full, kv_dim, dim), True),
+               ("wv", (full, kv_dim, dim), True), ("wo", (full, dim, q_dim), True),
+               ("q_norm", (full, head), False), ("k_norm", (full, head), False),
+               ("wqkv", (linear, 2 * k_dim + v_dim, dim), True), ("wz", (linear, v_dim, dim), True),
+               ("wb", (linear, v_heads, dim), True), ("wa", (linear, v_heads, dim), True),
+               ("conv", (linear, 2 * k_dim + v_dim, int(form["conv"])), False), ("ssm_a", (linear, v_heads), False),
+               ("ssm_dt", (linear, v_heads), False), ("ssm_norm", (linear, int(form["v_head"])), False),
+               ("wout", (linear, dim, v_dim), True),
+               ("rms_ffn_weight", (n_layers, dim), False), ("w1", (n_layers, hidden_dim, dim), True),
+               ("w2", (n_layers, dim, hidden_dim), True), ("w3", (n_layers, hidden_dim, dim), True),
+               ("rms_final_weight", (dim,), False),
+               ("freq_cis_real", (seq_len, head // 2), None), ("freq_cis_imag", (seq_len, head // 2), None)]
+    if vocab_size < 0:
+        tensors.append(("wcls", (abs(vocab_size), dim), True))
+    if int(form["hadamard"]):
+        tensors += [("signs_dim", (dim,), False), ("signs_q", (q_dim,), False), ("signs_v", (v_dim,), False),
+                    ("signs_hidden", (hidden_dim,), False)]
+    return tensors
 
 
 def form_of(options=None):
@@ -789,7 +853,12 @@ def checkpoint_dtype(header, size, form=None):
         raise ValueError("This is not a llama2.c checkpoint: the header makes no sense.")
     q_dim, kv_dim = n_heads * head_size, n_kv_heads * head_size
     rope = 2 * seq_len * (head_size // 2)
-    if arch in ("gpt2", "neox"):
+    if arch == "qwen35":
+        tensors = qwen35_layout(*header, form)
+        # a matrix of each layer is (layers * rows, row length) as the others are counted
+        matrices = [(math.prod(shape[:-1]), shape[-1]) for _, shape, kind in tensors if kind]
+        vectors = sum(math.prod(shape) for _, shape, kind in tensors if kind is False)
+    elif arch in ("gpt2", "neox"):
         # the same tensors in the same order as gpt2_tensors() and llama2_convert.layout(arch=): q, k, v, o, the two
         # FFN matrices (no gate), and for GPT-2 the table of positions in place of the RoPE tables
         matrices = [(abs(vocab_size), dim)] + [(n_layers * dim, dim)] * 4 + [(n_layers * hidden_dim, dim), (n_layers * dim, hidden_dim)]
@@ -805,7 +874,7 @@ def checkpoint_dtype(header, size, form=None):
                     (n_layers * hidden_dim, dim)]
         vectors = 2 * n_layers * dim + dim + (n_layers * (q_dim + 2 * kv_dim) if form["bias"] else 0) \
             + (2 * n_layers * head_size if form["qk_norm"] else 0)
-    if vocab_size < 0:
+    if vocab_size < 0 and arch != "qwen35":
         matrices.append((abs(vocab_size), dim))
     floats = sum(rows * length for rows, length in matrices) + vectors + rope
 
@@ -872,7 +941,8 @@ class Llama:
                  tokenizer_kind="bpe", nfkc=False, nfc=False, pretokenizer="gpt2", bias=False, arch="llama",
                  rotary=0, parallel_residual=False, bos=BOS, stop_tokens=(BOS,), kernels=None, specials=(),
                  disable=(), external=None, rope_scaling=None, ignore_merges=False, collapse=False,
-                 unknown=None, qk_norm=False, head_dim=0, rms_norm_eps=RMS_EPS):
+                 unknown=None, qk_norm=False, head_dim=0, rms_norm_eps=RMS_EPS, interval=0, k_heads=0, v_heads=0,
+                 k_head=0, v_head=0, conv=0, hadamard=0):
         """checkpoint: llama2.c "legacy" format, a 7 int header then the weights.
 
         dtype="float16" and dtype="int8" are this project's smaller variants (convert_hf.py, quantize.py), and
@@ -890,6 +960,10 @@ class Llama:
         head_dim: the size of a head where it is not dim / n_heads (T124: Qwen3 0.6B has 16 heads of 128 in a dim of
         1024): q and the attention's output are then n_heads * head_dim wide. rms_norm_eps: config.json's, the epsilon
         of every RMSNorm (the kernels take it too).
+        arch="qwen35" (T229, Qwen3.5 and Prism's Bonsai 2): every interval-th layer is attention with an output gate
+        (a sigmoid of a second projection of the input times the attention's output) over heads whose first rotary
+        values RoPE turns; the others are Gated DeltaNet, whose k_heads, v_heads, k_head, v_head and conv say its
+        sizes (FORM). hadamard: the block size of the rotation its matrices are stored in (see rotated()).
         rope_scaling: config.json's, for the RoPE tables that are not in the file (int8, float16); see
         rope_frequencies(). ignore_merges: a byte-level BPE takes a pre-tokenized piece that is in the vocabulary
         whole (Llama 3).
@@ -981,7 +1055,11 @@ class Llama:
         # a dict from Python, or a JavaScript object from the worker
         rope_scaling = rope_scaling.to_py() if hasattr(rope_scaling, "to_py") else rope_scaling
         rope = lambda width: rope_tables(self.seq_len, width, rope_theta, rope_scaling)
-        if arch in ("gpt2", "neox"):
+        self.form = {"interval": int(interval), "k_heads": int(k_heads), "v_heads": int(v_heads), "k_head": int(k_head),
+                     "v_head": int(v_head), "conv": int(conv), "hadamard": int(hadamard), "head_dim": int(head_dim)}
+        if arch == "qwen35":
+            self.qwen35_tensors(take, shared_weights, keep_int8, dtype, rope, vocab_size)
+        elif arch in ("gpt2", "neox"):
             self.gpt2_tensors(take, shared_weights, keep_int8, kv_dim, dtype, rope)
         else:
             self.llama_tensors(take, shared_weights, keep_int8, kv_dim, bias, dtype, rope, qk_norm)
@@ -994,8 +1072,10 @@ class Llama:
             if kernels and "sampler" not in disable:
                 self.penalize, self.sample = self.kernel_sampler(kernels)
         else:
-            # NumPy's forward pass; the forward pass on the kernels is forward.js's (external), since T93
-            self.key_cache = np.zeros((n_layers, self.n_kv_heads, min(KV_START, self.seq_len), self.head_size), dtype=np.float32)
+            # NumPy's forward pass; the forward pass on the kernels is forward.js's (external), since T93. A Qwen3.5
+            # keeps keys and values for its layers of attention only
+            attending = n_layers // int(interval) if arch == "qwen35" else n_layers
+            self.key_cache = np.zeros((attending, self.n_kv_heads, min(KV_START, self.seq_len), self.head_size), dtype=np.float32)
             self.value_cache = np.zeros_like(self.key_cache)
             if kernels and "sampler" not in disable:
                 self.penalize, self.sample = self.kernel_sampler(kernels)
@@ -1043,6 +1123,28 @@ class Llama:
         if dtype != np.float32:
             # half precision is too coarse for the rotation angles, and int8 files leave the RoPE tables out
             self.freq_cis_real, self.freq_cis_imag = (table.astype(np.float32) for table in rope(self.head_size))
+
+    def qwen35_tensors(self, take, shared_weights, keep_int8, dtype, rope, vocab_size):
+        """The tensors of a Qwen3.5 (T229), in the order of qwen35_layout()."""
+        header = (self.dim, self.hidden_dim, self.n_layers, self.n_heads, self.n_kv_heads, vocab_size, self.seq_len)
+        for name, shape, kind in qwen35_layout(*header, self.form):
+            if kind is None:
+                if dtype != np.int8:
+                    setattr(self, name, take(*shape, matrix=False))
+                continue
+            if name == "token_embedding_table":
+                widen = shared_weights and not keep_int8
+            else:
+                widen = not keep_int8
+            setattr(self, name, take(*shape, matrix=bool(kind), widen=widen))
+        if shared_weights:
+            self.wcls = self.token_embedding_table
+        if dtype != np.float32:
+            # the angles of the rotated part only, in tables of a head's half (the rest is never read)
+            tables = [np.zeros((self.seq_len, self.head_size // 2), dtype=np.float32) for _ in range(2)]
+            for table, values in zip(tables, rope(self.rotary)):
+                table[:, :self.rotary // 2] = values
+            self.freq_cis_real, self.freq_cis_imag = tables
 
     def gpt2_tensors(self, take, shared_weights, keep_int8, kv_dim, dtype, rope):
         """The tensors of a GPT-2 or a GPT-NeoX, in the order llama2_convert.layout() writes them. The two
@@ -1150,6 +1252,8 @@ class Llama:
         return external[0].release()
 
     def forward(self, token, pos, need_logits=True):
+        if self.arch == "qwen35":
+            return self.forward_qwen35(token, pos, need_logits)
         n_kv_heads, head_size = self.n_kv_heads, self.head_size
         kv_mul = self.n_heads // n_kv_heads  # >1 with grouped-query attention
         if pos >= self.key_cache.shape[2]:
@@ -1221,6 +1325,88 @@ class Llama:
             return None
         # Final norm, then the classifier into logits (60% of all the multiply-adds of stories15M)
         return self.wcls @ norm(x, self.rms_final_weight, self.ln_final_bias)
+
+    def forward_qwen35(self, token, pos, need_logits=True):
+        """forward() of a Qwen3.5 (T229), after transformers' Qwen3_5ForCausalLM: every interval-th layer attention
+        with an output gate, the others Gated DeltaNet (a causal conv, then a state of k_head x v_head per head of v
+        that decays by exp(g) and learns every token's v by the delta rule), every layer then the SwiGLU FFN."""
+        form, eps = self.form, self.rms_norm_eps
+        interval, conv = form["interval"], form["conv"]
+        k_heads, v_heads, k_head, v_head = form["k_heads"], form["v_heads"], form["k_head"], form["v_head"]
+        k_dim = k_heads * k_head
+        head_size, kv_mul = self.head_size, self.n_heads // self.n_kv_heads
+        if pos == 0:
+            # every sequence begins with nothing learnt: the conv's last inputs and the states of the delta rule
+            linear = self.n_layers - self.n_layers // interval
+            self.conv_state = np.zeros((linear, 2 * k_dim + v_heads * v_head, conv - 1), dtype=np.float32)
+            self.ssm_state = np.zeros((linear, v_heads, k_head, v_head), dtype=np.float32)
+        if pos >= self.key_cache.shape[2]:
+            positions = min(max(2 * self.key_cache.shape[2], pos + 1), self.seq_len)
+            for name in ("key_cache", "value_cache"):
+                cache = getattr(self, name)
+                larger = np.zeros((*cache.shape[:2], positions, head_size), dtype=np.float32)
+                larger[:, :, :cache.shape[2]] = cache
+                setattr(self, name, larger)
+        block = form["hadamard"]
+        # Prism's rotation (T229): a matrix stored in the rotated basis is fed its input rotated the same way
+        turned = (lambda v, signs: hadamard(v * signs, block)) if block else (lambda v, signs: v)
+        signs = lambda name: getattr(self, name, None)
+        cos, sin = self.freq_cis_real[pos], self.freq_cis_imag[pos]
+        x = self.embedding(token)
+        if block:
+            x = signs("signs_dim") * hadamard(x, block)  # the embedding's rows are stored rotated too
+        full = linear = 0
+        for l in range(self.n_layers):
+            xb = rmsnorm(x, self.rms_att_weight[l], eps)
+            xr = turned(xb, signs("signs_dim"))
+            if (l + 1) % interval == 0:
+                f = full
+                full += 1
+                q = head_norm(self.wq[f] @ xr, self.q_norm[f], eps)
+                k = head_norm(self.wk[f] @ xr, self.k_norm[f], eps)
+                gate = self.wg[f] @ xr
+                q = partial_rope(q.reshape(-1, head_size), cos, sin, self.rotary).reshape(self.n_kv_heads, kv_mul, head_size)
+                self.key_cache[f, :, pos] = partial_rope(k.reshape(-1, head_size), cos, sin, self.rotary)
+                self.value_cache[f, :, pos] = (self.wv[f] @ xr).reshape(self.n_kv_heads, head_size)
+                keys, values = self.key_cache[f, :, :pos + 1], self.value_cache[f, :, :pos + 1]
+                att = (q @ keys.transpose(0, 2, 1)) * np.float32(1.0 / math.sqrt(head_size))
+                att = np.exp(att - att.max(axis=-1, keepdims=True))
+                att /= att.sum(axis=-1, keepdims=True)
+                out = (att @ values).reshape(self.q_dim) / (1.0 + np.exp(-gate))
+                x = x + self.wo[f] @ turned(out, signs("signs_q"))
+            else:
+                r = linear
+                linear += 1
+                mixed = self.wqkv[r] @ xr
+                z = self.wz[r] @ xr
+                beta = 1.0 / (1.0 + np.exp(-(self.wb[r] @ xb)))
+                g = self.ssm_a[r] * softplus(self.wa[r] @ xb + self.ssm_dt[r])
+                # the causal conv over this input and the last conv - 1, then SiLU
+                window = np.concatenate([self.conv_state[r], mixed[:, None]], axis=1)
+                self.conv_state[r] = window[:, 1:]
+                mixed = (window * self.conv[r]).sum(axis=1)
+                mixed = mixed / (1.0 + np.exp(-mixed))
+                q = l2norm(mixed[:k_dim].reshape(k_heads, k_head)) / np.float32(math.sqrt(k_head))
+                k = l2norm(mixed[k_dim:2 * k_dim].reshape(k_heads, k_head))
+                v = mixed[2 * k_dim:].reshape(v_heads, v_head)
+                # head h of v reads head h // (v_heads / k_heads) of q and k (transformers' repeat_interleave)
+                q, k = np.repeat(q, v_heads // k_heads, axis=0), np.repeat(k, v_heads // k_heads, axis=0)
+                state = self.ssm_state[r] * np.exp(g)[:, None, None]
+                delta = (v - np.einsum("hkv,hk->hv", state, k)) * beta[:, None]
+                state += k[:, :, None] * delta[:, None, :]
+                self.ssm_state[r] = state
+                out = np.einsum("hkv,hk->hv", state, q)
+                # every head normalized, times SiLU of its part of z
+                zs = z.reshape(v_heads, v_head)
+                out = head_norm(out.reshape(-1), self.ssm_norm[r], eps).reshape(v_heads, v_head) * (zs / (1.0 + np.exp(-zs)))
+                x = x + self.wout[r] @ turned(out.reshape(-1), signs("signs_v"))
+            xb = turned(rmsnorm(x, self.rms_ffn_weight[l], eps), signs("signs_dim"))
+            hb = self.w1[l] @ xb
+            hb = hb / (1.0 + np.exp(-hb)) * (self.w3[l] @ xb)
+            x = x + self.w2[l] @ turned(hb, signs("signs_hidden"))
+        if not need_logits:
+            return None
+        return self.wcls @ turned(rmsnorm(x, self.rms_final_weight, eps), signs("signs_dim"))
 
 
     def kernel_sampler(self, kernels):
