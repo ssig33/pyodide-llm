@@ -17,6 +17,10 @@
 // chose; a count the model page remembers taken with no search.
 // T199: the search's verdict on a made-up clock (forward.js's clock), with one block of every comparison slowed 3 times:
 // the count that is fastest still chosen (4 of the owner's Android's 8 logical cores, 2 of CI's runner's 4).
+// T223: on the same clock, the owner's Android's llm-jp-3 150M (2 threads fastest, 4 a third of 1's speed) chooses 2;
+// a search timed while the GPU gets ready is not remembered, and is searched again once the GPU is ready (the times
+// beside the GPU say 4, those after it 2: 2 is remembered); a count remembered from an earlier visit is searched again
+// on the first generation (not only on the eighth); and the page's key of the count is one a model.
 // T152: the steps of a generation (forward.js's tokenBlock and generateMany, tokenTimes) on the same made-up GPU, whose
 // step sleeps a multiple of the CPU's own ms of a token and writes made-up ids: generations of STEPS steps after a short
 // prompt, as Python takes them (tokenBlock at a time on the GPU, else one on the CPU). Far faster: the first steps on the
@@ -44,7 +48,7 @@ const forwardFile = args.includes("--forward") ? path.resolve(args[args.indexOf(
 // sleep of that long and the answer
 const FAKE = `
 const { parentPort, workerData: line } = require("node:worker_threads");
-let ctl, words, ids, blocks = 0, requests = 0, asked = 0;
+let ctl, words, ids, blocks = 0, requests = 0, asked = 0, held = null;
 const nap = new Int32Array(new SharedArrayBuffer(4)), ms = (n) => line.fixed + line.perToken * n;
 parentPort.on("message", (data) => {
   if (data.type === "start") {
@@ -52,9 +56,14 @@ parentPort.on("message", (data) => {
     words = data.plan.words;
     // T152: where forward.js asked for the steps and the line has a cost of a step
     ids = data.plan.tokens && line.step !== undefined ? new Int32Array(data.memory.buffer, data.plan.tokens.ids, 1 + data.plan.tokens.most) : null;
-    parentPort.postMessage({ type: "ready", adapter: "made up", key: "k", bytes: 1, seconds: 0, form: "made up", attention: "made up",
+    const ready = { type: "ready", adapter: "made up", key: "k", bytes: 1, seconds: 0, form: "made up", attention: "made up",
       forms: [], remembered: false, blocks: [{ count: 16, ms: ms(16) }, { count: 64, ms: ms(64) }],
-      ...(ids ? { tokens: { form: "made up", ms: line.step, forms: [] } } : {}) });
+      ...(ids ? { tokens: { form: "made up", ms: line.step, forms: [] } } : {}) };
+    // T223: a GPU that gets ready only when the test says so ({ type: "go" }, sent to this worker alone)
+    if (line.readyOnGo) held = ready;
+    else parentPort.postMessage(ready);
+  } else if (data.type === "go") {
+    parentPort.postMessage(held);
   } else if (data.type === "prompt") {
     Atomics.wait(nap, 0, 0, ms(data.count));
     if (Atomics.load(ctl, words.wanted) !== data.serial) return;
@@ -284,6 +293,91 @@ if (isMainThread) {
       expect(`${name}, ${slowed === null ? "no block" : `block ${slowed}`} slowed 3 times: the count chosen`, [ended.ended, ended.threads], [true, want]);
     }
     say(`the search on a made-up clock, ${name}: ${chosen.join("; ")}`);
+  }
+  // T223: the owner's Android's writing of llm-jp-3 150M on the CPU alone (/benchmark/, site d531cd5): 1 thread 110,
+  // 2 123, 4 38.6, 8 32.3 tok/s; as ms a token
+  const LLM_JP = { 1: 1000 / 110, 2: 1000 / 123, 4: 1000 / 38.6, 8: 1000 / 32.3 };
+  const madeUpClock = (msNow) => {
+    let starting = false, time = 0;
+    return () => {
+      starting = !starting;  // the search reads the clock as a token starts and as it ends
+      if (!starting) time += msNow();
+      return time;
+    };
+  };
+  const generation = (engine) => {
+    engine.newGeneration();
+    for (let pos = 0; pos < 6; pos++) engine.forward(100 + pos, pos, true);
+  };
+  const verdicts = (engine) => engine.searchLog.map(({ best, candidate, faster, whileGpu }) => `${best} or ${candidate}: ${faster ? candidate : best}${whileGpu ? " (GPU getting ready)" : ""}`);
+  {
+    let engine = null;
+    engine = createForward({ memory, base, size, kernels, plan, spawn, clock: madeUpClock(() => LLM_JP[engine.threads] ?? 40) });
+    const told = [];
+    await engine.findThreads({ from: 8, chose: (count) => told.push(count) });
+    const ended = await endSearch(engine, () => generation(engine));
+    say(`T223, llm-jp-3 150M of the owner's Android on a made-up clock: ${ended.threads} (${verdicts(engine).join(", ")})`);
+    engine.release();
+    expect("T223: llm-jp-3 150M of the owner's Android from its 8 logical cores: 2 threads, remembered", [ended.threads, told], [2, [2]]);
+  }
+  {
+    // the GPU gets ready when told; until then a token's times are those beside it (4 fastest), then llm-jp's
+    let engine = null, gpuReady = false, fake = null;
+    const beside = { 1: 16, 2: 12, 4: 8, 8: 10 };
+    const gpu = () => {
+      fake = new Worker(FAKE, { eval: true, workerData: { fixed: 1e3, perToken: 1e3, readyOnGo: true } });
+      return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
+        set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() };
+    };
+    engine = createForward({ memory, base, size, kernels, plan, spawn, gpu, clock: madeUpClock(() => (gpuReady ? LLM_JP : beside)[engine.threads] ?? 40) });
+    const told = [];
+    await engine.findThreads({ from: 8, chose: (count) => told.push(count) });
+    const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
+    for (let g = 0; g < 200 && engine.searching; g++) {
+      generation(engine);
+      await turn();
+    }
+    const beforeReady = { threads: engine.threads, told: [...told], searched: engine.searchLog.length };
+    for (let g = 0; g < 3; g++) generation(engine);  // no search begins while the GPU gets ready
+    const idle = engine.searching || engine.searchLog.length !== beforeReady.searched;
+    fake.postMessage({ type: "go" });
+    await engine.gpu;
+    gpuReady = true;
+    for (let g = 0; g < 200 && (g === 0 || engine.searching); g++) {
+      generation(engine);
+      await turn();
+    }
+    say(`T223, a search while the GPU gets ready: ${beforeReady.threads} then ${engine.threads}, remembered ${JSON.stringify(told)} (${verdicts(engine).join(", ")})`);
+    const log = engine.searchLog;
+    engine.release();
+    expect("T223: while the GPU gets ready, the search's 4 used and not remembered", [beforeReady.threads, beforeReady.told], [4, []]);
+    expect("T223: no search begins while the GPU gets ready", idle, false);
+    expect("T223: the verdicts beside the GPU marked, those after it not", log.map((v) => v.whileGpu),
+      log.map((_, i) => i < beforeReady.searched));
+    expect("T223: searched again once the GPU is ready: 2, remembered", [engine.threads, told], [2, [2]]);
+  }
+  {
+    // a count remembered from an earlier visit (4, the owner's Android's) is searched again on the first generation
+    let engine = null;
+    engine = createForward({ memory, base, size, kernels, plan, spawn, clock: madeUpClock(() => LLM_JP[engine.threads] ?? 40) });
+    const told = [];
+    await engine.findThreads({ from: 8, remembered: 4, chose: (count) => told.push(count) });
+    const idle = engine.searching;
+    generation(engine);
+    const began = engine.searching;
+    const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
+    for (let g = 0; g < 200 && engine.searching; g++) {
+      generation(engine);
+      await turn();
+    }
+    say(`T223, a remembered 4 on its first generation: ${engine.threads}, remembered ${JSON.stringify(told)} (${verdicts(engine).join(", ")})`);
+    engine.release();
+    expect("T223: a remembered count: no search as it loads, one on the first generation, 2 remembered", [idle, began, engine.threads, told], [false, true, 2, [2]]);
+  }
+  {
+    const { threadsKey } = await import(path.join(root, "src/bench.js"));
+    const device = { hardwareConcurrency: 8, deviceMemory: 8, userAgent: "made up" };
+    expect("T223: the page remembers the count one a model", threadsKey("llm-jp-3-150m", device) !== threadsKey("tiny-lm", device), true);
   }
   // T190's review: a software thread that stops in the search (T120: the engine gives its helpers up and goes on with
   // one) leaves found at 1 as well, so "fewer than found" never says it: the page path's head reads lostThreads. This

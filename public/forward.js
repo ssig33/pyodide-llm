@@ -1028,11 +1028,20 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // another tab, the page on its way to the background) slows a block, never speeds one up, so one block slowed whole
   // leaves the other block's 4 below it and the verdict stands. The upper median it was took that block's time: twice
   // in CI 2 threads 1.24 to 1.34 times as fast as 1 lost to it (T190's review).
+  // T223: a count is remembered only where a search timed it with nothing of the GPU's getting ready beside it (its
+  // upload, its shaders checked against JavaScript and timed use the CPU and the memory: T148 does not time the CPU's
+  // prompts then either). A search on the first texts goes on while the GPU gets ready (the first visit is not left on
+  // the logical cores meanwhile), but its verdict is used only until the GPU is ready: the first generation after that
+  // searches again from it, and that search's verdict is the one remembered. A count remembered from an earlier visit
+  // is searched again the same way once a visit (the first generation with no GPU getting ready), not only every
+  // recheck generations of one load: the owner's Android kept 4 threads for llm-jp-3 150M where 2 wrote 3.2 times as
+  // fast (T223), and a visit seldom writes 8 answers. unchecked: the count in use is not such a search's verdict yet.
   const BLOCK = 4;
-  let search = null, chosen = 0, generations = 0, recheckEvery = 0, onChosen = null, onCompared = null;
+  let search = null, chosen = 0, generations = 0, recheckEvery = 0, onChosen = null, onCompared = null, unchecked = false;
+  const gpuGettingReady = () => settleGpu !== null;
   const searchLog = [];  // every comparison: the counts, their times in ms per token, and the verdict
   function beginSearch(from) {
-    search = { best: Math.max(1, from), direction: from > 1 ? "down" : "up", moved: false, candidate: 0, times: null, step: 0, waiting: false };
+    search = { best: Math.max(1, from), direction: from > 1 ? "down" : "up", moved: false, candidate: 0, times: null, step: 0, waiting: false, whileGpu: false };
     nextCandidate();
   }
   function nextCandidate() {
@@ -1055,9 +1064,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function finish() {
     chosen = lost ? 1 : search ? search.best : threads;
     threads = chosen;
+    unchecked = !lost && Boolean(search?.whileGpu);  // T223: searched again once the GPU is ready, and remembered then
     search = null;
     // one thread after a give-up says nothing about the device: the page would start with it next time (the review of T120)
-    if (!lost) onChosen?.(chosen);
+    if (!lost && !unchecked) onChosen?.(chosen);
   }
   // the count for the next token, and whether it is timed
   function countForToken() {
@@ -1069,15 +1079,19 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   }
   function recordToken(count, milliseconds, timed) {
     if (!search || search.waiting) return;
-    if (timed) search.times[count].push(milliseconds);
+    if (timed) {
+      search.times[count].push(milliseconds);
+      if (gpuGettingReady()) search.whileGpu = true;
+    }
     search.step += 1;
     if (search.step < 4 * (BLOCK + 1)) return;
     const { best, candidate } = search;
     const bestMs = lowerMedian(search.times[best]), candidateMs = lowerMedian(search.times[candidate]);
     const faster = candidateMs < bestMs * BETTER;
-    searchLog.push({ best, candidate, times: search.times, faster });
+    const { whileGpu } = search;
+    searchLog.push({ best, candidate, times: search.times, faster, whileGpu });
     // T114: every verdict, so that a device's choice can be followed afterwards (the page writes it to the console)
-    onCompared?.({ best, candidate, bestMs, candidateMs, faster, tokens: search.times[best].length + search.times[candidate].length });
+    onCompared?.({ best, candidate, bestMs, candidateMs, faster, whileGpu, tokens: search.times[best].length + search.times[candidate].length });
     if (faster) {
       search.best = candidate;
       search.moved = true;
@@ -1464,16 +1478,19 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       threads = start;
       if (remembered) {
         chosen = remembered;
+        unchecked = true;  // T223: searched again from it on this visit
       } else {
         beginSearch(start);
       }
       return threads;
     },
-    /** the page starts a generation: now and then the remembered count is checked against its neighbours again */
+    /** the page starts a generation: now and then the remembered count is checked against its neighbours again (T223:
+     * and first on the first generation of a load with no GPU getting ready, where the count in use is remembered from
+     * an earlier visit or was found while the GPU got ready) */
     newGeneration() {
       gpuTokens = 0;
       generations += 1;
-      if (!search && chosen && recheckEvery && generations % recheckEvery === 0) beginSearch(chosen);
+      if (!search && chosen && recheckEvery && (unchecked || generations % recheckEvery === 0) && !gpuGettingReady()) beginSearch(chosen);
       // T148: halfway between the threads' checks, a prompt goes to the side not chosen, so that its time stays
       // today's (a device that heats up, a GPU timed while the CPU was busy)
       written = 0;

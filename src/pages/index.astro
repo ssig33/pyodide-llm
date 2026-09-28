@@ -876,7 +876,9 @@ const LOCAL_LICENSE = { "sbintuitions/tiny-lm": "models/tiny-lm.LICENSE.txt" };
       const kept = data.faster ? data.candidate : data.best;
       console.info(`threads: ${data.best} at ${data.bestMs.toFixed(2)} ms against ${data.candidate} at ` +
         `${data.candidateMs.toFixed(2)} ms per token (${data.tokens} tokens timed): ${kept} ` +
-        `${data.faster ? "is faster by more than 5%" : "stays, the other is not faster by more than 5%"}`);
+        `${data.faster ? "is faster by more than 5%" : "stays, the other is not faster by more than 5%"}` +
+        // T223: a verdict timed while the GPU got ready is searched again once it is, and not remembered before
+        `${data.whileGpu ? " (timed while the GPU got ready: searched again once it is)" : ""}`);
     } else if (data.type === "threads") {
       console.info(`threads: ${data.count} for ${data.model}, searched from ${data.from === "remembered" ?
         "the count remembered from an earlier visit" : `${data.hint} (the logical cores)`}`);
