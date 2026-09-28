@@ -118,6 +118,13 @@ to 1.12 times. llama2.c's BPE used to grow with the square of the text; it now t
 tokens took 1.7 s. In exchange, loading a Unigram tokenizer takes 11 to 38 ms longer, once per model, and it keeps
 more in Pyodide's memory (llm-jp-3-150m: 9.1 → 15.2 MiB). These speed-ups did not change any ID.
 
+Since 2026-09-28 a sentencepiece model normalizes with its own map (tiny-lm's, rinna's and Swallow-MS's; the others
+have none), walked in Python. That costs back part of the speed-up above: tiny-lm's text of about 64 tokens takes
+0.28 → 0.39 ms on an Intel Xeon 6973P-C and 0.59 → 0.82 ms on the arm64 runner (1000 tokens: 4.9 → 6.6 and
+10.4 → 13.6 ms), rinna's and Swallow-MS's are 0.68 to 0.74 times as fast as before, and the tokenizers without a map
+(llm-jp-3-150m, Llama 2, the byte-level ones) are as fast as before. The map adds about 1 MiB to tiny-lm's tokenizer
+in Pyodide (7.8 → 8.7 MiB).
+
 ## Long texts
 
 By default a model writes until it stops or its context is full; llm-jp-3-150m has 4096 tokens. Its KV cache grows

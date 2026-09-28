@@ -345,3 +345,33 @@ def test_the_maps_of_real_models_normalize_as_sentencepiece_does():
         assert not wrong, f"{rule}: {len(wrong)} of {len(texts)} differ, as {[hex(ord(t[1])) if len(t) == 3 else t for t in wrong[:8]]}"
         sentences = [line for line in CORPUS.splitlines() if line] + texts[-8:]
         assert [mine.encode(text) for text in sentences] == [real.encode(text) for text in sentences], rule
+
+
+def test_a_map_whose_offsets_take_darts_clones_long_form():
+    """The review of T216: Darts-clone keeps an offset of 2^21 or more shifted right by 8, and says so with bit 9
+    (DoubleArrayBuilderUnit::set_offset). The list's maps are far smaller (under 60,000 units), so no test took that
+    path: this map's root has its children past 2^21 (Z -> x and Q -> y). Where sentencepiece is installed, it reads
+    the same map inside a model the same way."""
+    from llama2_numpy import Charsmap
+    B = 1 << 21
+    units = [0] * (B + 768)  # sentencepiece takes whole blocks of 256 units
+    units[0] = (B << 2) | 0x200  # the root's offset 0 ^ B, in the long form
+    for label, below, value in ((ord("Z"), B + 256, 0), (ord("Q"), B + 512, 2)):
+        child = B ^ label
+        units[child] = label | 0x100 | ((child ^ below) << 10)
+        units[below] = (1 << 31) | value
+    array = struct.pack(f"<{len(units)}I", *units)
+    blob = struct.pack("<I", len(array)) + array + b"x\0y\0"
+    assert Charsmap(blob).replaced("aZQbZ") == "axybx"
+    try:
+        import sentencepiece as spm
+    except ImportError:
+        return
+    from make_hf_fixture import field
+    NORMAL, UNKNOWN, CONTROL = 1, 2, 3
+    pieces = [("<unk>", UNKNOWN), ("<s>", CONTROL), ("</s>", CONTROL), ("▁", NORMAL), ("a", NORMAL), ("b", NORMAL),
+              ("x", NORMAL), ("y", NORMAL)]
+    model = b"".join(field(1, field(1, text.encode()) + field(2, -1.0 - i / 10) + field(3, kind))
+                     for i, (text, kind) in enumerate(pieces))
+    model += field(2, field(3, 1)) + field(3, field(1, b"nmt_nfkc") + field(2, blob))
+    assert spm.SentencePieceProcessor(model_proto=model).normalize("aZQbZ") == "▁axybx"
