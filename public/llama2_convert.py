@@ -698,6 +698,13 @@ def next_branch(pieces, start, end):
     return end
 
 
+def config_token(config, name):
+    """The text of a token a tokenizer_config.json names (bos_token ...): a string, or {"content": ...}; "" for none."""
+    token = config.get(name) if isinstance(config, dict) else None
+    token = token.get("content") if isinstance(token, dict) else token
+    return token if isinstance(token, str) else ""
+
+
 def one_turn_template(tokenizer_config, chat_template=None):
     """The template of one user turn from a tokenizer_config.json, or None when there is none this can read.
     chat_template: the text of chat_template.jinja, where the repository has one (T127: transformers now saves the
@@ -716,9 +723,8 @@ def one_turn_template(tokenizer_config, chat_template=None):
         template = template[0].get("template") if template and isinstance(template[0], dict) else None
     if not isinstance(template, str) or not template.strip():
         return None
-    token = lambda name: config.get(name) if isinstance(config.get(name), str) else (config.get(name) or {}).get("content", "")
-    bos = token("bos_token") or ""
-    turn = one_turn(template, {"bos_token": bos, "eos_token": token("eos_token") or ""})
+    bos = config_token(config, "bos_token")
+    turn = one_turn(template, {"bos_token": bos, "eos_token": config_token(config, "eos_token")})
     # generate() starts every run with the BOS token already: one written by the template would be a second one
     return turn[len(bos):] if turn and bos and turn.startswith(bos) else turn
 
@@ -1878,17 +1884,28 @@ class Conversion:
             except ValueError:
                 raise ValueError("tokenizer.json is not JSON.") from None
             options = tokenizer_json_options(parsed)
-            self.tokenizer = tokenizer_bin(tokenizer_json_pieces(parsed), vocab_size, spaces=options["tokenizer_kind"] != "bytebpe")
+            pieces = list(tokenizer_json_pieces(parsed))
+            self.tokenizer = tokenizer_bin(pieces, vocab_size, spaces=options["tokenizer_kind"] != "bytebpe")
             added = parsed.get("added_tokens", [])
             specials = [token["content"] for token in added if token.get("special")]
             # T143: the added tokens it does not call special are read as one token wherever they are too, by the real
             # tokenizers before it splits the text: Qwen3's <think>, Pythia's runs of 2 to 24 spaces (T215's finding)
             added = [token["content"] for token in added if not token.get("special")]
         else:
-            self.tokenizer, options = tokenizer_bin(sentencepiece_pieces(tokenizer), vocab_size), sentencepiece_options(tokenizer)
+            pieces = list(sentencepiece_pieces(tokenizer))
+            self.tokenizer, options = tokenizer_bin(pieces, vocab_size), sentencepiece_options(tokenizer)
             specials, added = sentencepiece_specials(tokenizer), []
+        # T143: the BOS is the token the tokenizer names, which transformers begins a text with, where config.json says
+        # another: DeepSeek-R1's Distill says 151643 there, its end of a sentence, and <｜begin▁of▁sentence｜> (151646)
+        # in tokenizer_config.json (T138's review: perplexity 2.5 to 2.7 times higher with the former)
+        try:
+            named = config_token(json.loads(tokenizer_config) if isinstance(tokenizer_config, (str, bytes)) else tokenizer_config,
+                                 "bos_token")
+        except ValueError:
+            named = ""
+        bos = next((id for id, (text, _, _) in enumerate(pieces) if named and text == named), None)
         self.start(header, base, options, tokenizer_config, dtype, max_seq_len, start, sink, quantize_rows, specials, bfloat16,
-                   chat_template, q8_0, added)
+                   chat_template, q8_0, added, bos)
 
     @classmethod
     def from_gguf(cls, head, dtype="int8", max_seq_len=4096, sink=None, quantize_rows=None, bfloat16=None, q8_0=None):
@@ -1916,14 +1933,17 @@ class Conversion:
         return self
 
     def start(self, header, base, options, tokenizer_config, dtype, max_seq_len, start, sink=None, quantize_rows=None,
-              specials=(), bfloat16=None, chat_template=None, q8_0=None, added=()):
+              specials=(), bfloat16=None, chat_template=None, q8_0=None, added=(), bos=None):
         """sink and quantize_rows: see Writer, bfloat16 and q8_0: see Stream. checkpoint is None with a sink: the bytes went there. specials: the
         tokenizer's special tokens, the ones a chat template writes between the turns. chat_template: the text of
         chat_template.jinja, where there is one (T127). added: the added tokens that are not special, one token
-        wherever they are written (T143)."""
-        bos = self.config.get("bos_token_id", 1)
+        wherever they are written (T143). bos: the id of the BOS the tokenizer names, where it names one (T143)."""
+        own = self.config.get("bos_token_id", 1)
+        bos = bos if isinstance(bos, int) else own
         eos = self.config.get("eos_token_id", 2)
-        stop = [token for token in [bos, *(eos if isinstance(eos, list) else [eos])] if isinstance(token, int)]
+        # the answer stops at the BOS, and at config.json's where that is another (T143)
+        stop = [token for token in [bos, *([own] if own != bos else []), *(eos if isinstance(eos, list) else [eos])]
+                if isinstance(token, int)]
         # a context longer than max_seq_len is cut: the RoPE tables and the scratch of the attention grow with it
         self.stream = Stream(header, int(base), self.config, dtype, int(max_seq_len), start=int(start), sink=sink,
                              quantize_rows=quantize_rows, bfloat16=bfloat16, q8_0=q8_0)

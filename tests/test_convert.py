@@ -343,3 +343,22 @@ def test_a_mistral_is_a_llama_and_its_sliding_window_cuts_the_context():
         windowed = normalize({**mistral, "sliding_window": window})
         assert windowed["model_type"] == "llama" and windowed["max_position_embeddings"] == expected
         assert struct.unpack_from("<7i", converted(Arrays(tensors), {**mistral, "sliding_window": window}, "float32"), 0)[6] == expected
+
+
+def test_the_bos_is_the_one_the_tokenizer_names():
+    """T143: config.json and the tokenizer may name two BOS tokens (DeepSeek-R1's Distill: 151643, its end of a
+    sentence, and <｜begin▁of▁sentence｜> in tokenizer_config.json, which transformers begins a text with). The
+    tokenizer's wins, and the answer stops at both."""
+    from conftest import vocabulary_conversion
+    bos = "<｜begin▁of▁sentence｜>"
+    vocab = [["<unk>", 0.0], ["<s>", 0.0], ["</s>", 0.0], [bos, 0.0]] + [[f"▁w{i}", -1.0 - i / 100] for i in range(316)]
+    tokenizer = json.dumps({"added_tokens": [{"id": i, "content": text, "special": True} for i, (text, _) in enumerate(vocab[:4])],
+                            "model": {"type": "Unigram", "unk_id": 0, "vocab": vocab}}).encode()
+    named = lambda config: vocabulary_conversion(tokenizer, "tokenizer.json", 320, tokenizer_config=config,
+                                                 bos_token_id=2, eos_token_id=2).options
+    for config in (json.dumps({"bos_token": {"content": bos, "special": True}}), json.dumps({"bos_token": bos}), {"bos_token": bos}):
+        options = named(config)
+        assert (options["bos"], options["stop_tokens"]) == (3, [3, 2, 2]), config
+    for config in (None, "", "not json", json.dumps({"bos_token": None}), json.dumps({"bos_token": "<nope>"}), json.dumps({})):
+        options = named(config)
+        assert (options["bos"], options["stop_tokens"]) == (2, [2, 2]), config
