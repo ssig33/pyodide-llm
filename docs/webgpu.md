@@ -58,15 +58,29 @@ at all.
 
 A WebAssembly memory cannot shrink, so the page cannot load a model on both sides, measure, and then drop the CPU's
 copy. It decides before the weights arrive. If the weights on both sides fit in half of the memory the device
-reports (a device that reports 8 GB counts as 8 GB here, so 4 GB for both), the page keeps both and measures, as
-above. Otherwise a Llama-shaped int8 model whose tokens the GPU can write goes on the GPU alone: the layers' matrices
-go to the GPU as they are converted or read, and only the rest (the embedding, the norms) stays in the CPU's memory.
-Nothing then runs on the CPU. If the GPU fails, or if `/benchmark/` has measured this device's CPU and its estimate
-of a token (the model's weights read at the CPU section's speed) is faster than the GPU's measured token, the page
-loads the model again on the CPU. A model converted from Hugging Face is kept as it arrives. 6-bit models are not put
-on the GPU alone: the GPU holds them widened to int8, which is larger. The GPU alone still keeps the embedding and a
-copy of the keys and values on the CPU, so for Llama 3.2 3B it takes about 5.3 GB against 4.4 GB on the CPU alone
-(an estimate, not measured).
+reports, the page keeps both and measures, as above. Chromium reports at most 8, which is read as "8 GB or more";
+there both copies may take up to 6.5 GiB, so the models of the list up to 2B keep both, and those of 3B and more do
+not.
+
+Otherwise a Llama-shaped int8 model whose tokens the GPU can write goes on the GPU alone: the layers' matrices go to
+the GPU as they are converted or read, and only the rest (the embedding, the norms) stays in the CPU's memory. Nothing
+then runs on the CPU. On a device that reports 8 there is no limit to its size, as there is none for the CPU alone (a
+7B model takes about 9.2 GB there); on a smaller device it must fit in half of the memory. A browser that does not
+report the memory (Safari, Firefox) does not put a model on the GPU alone, because it keeps the answer on the CPU.
+
+With the model on the GPU alone, the page cannot time the CPU, so it estimates the CPU from `/benchmark/`. If the
+CPU section has been run on this device, a written token takes the time to read the model's weights at the speed
+that section measured, and a token of a prompt takes the model's multiply-adds at the section's prompt speed. The
+GPU's side is what the GPU worker timed as it started. The two are weighed by how the page has been used recently
+(the tokens of prompts against the tokens written, as many of each until it knows). If the CPU would take less than
+0.95 of the GPU's time, the page loads the model again on the CPU and remembers this for the model on this device,
+browser version and shaders, so the next visit loads it on the CPU at once. A new run of the CPU section, another
+browser version or new shaders make the page weigh the two again. Without a run of `/benchmark/` the model stays on
+the GPU. If the GPU fails, the page also loads the model again on the CPU.
+
+A model converted from Hugging Face is kept as it arrives. 6-bit models are not put on the GPU alone: the GPU holds
+them widened to int8, which is larger. The GPU alone still keeps the embedding and a copy of the keys and values on
+the CPU, so for Llama 3.2 3B it takes about 5.3 GB against 4.4 GB on the CPU alone (an estimate, not measured).
 
 ## Where the GPU is not used
 
@@ -81,10 +95,12 @@ copy of the keys and values on the CPU, so for Llama 3.2 3B it takes about 5.3 G
   uploaded, so they take as much GPU memory as int8. The page chooses 6 bits only where memory is short (a device
   that reports less than 8 GB, or Safari for a model past 4 GB), and there the rule below keeps the model on the
   CPU: today a 6-bit model reaches the GPU in practice only when it is asked for (`?bits=6`).
-- The weights would not fit twice: today they are kept in WebAssembly memory for the CPU and again on the GPU. On
-  phones and Apple devices both are the same memory. If the total is more than half of `navigator.deviceMemory`,
-  the model stays on the CPU. Chromium reports at most 8, which is read as "8 GB or more"; a browser that does not
-  report it (Safari, Firefox) is taken as 4 GB, so the 1B models stay on the CPU there.
+- The weights would not fit twice (in WebAssembly memory for the CPU and again on the GPU; on phones and Apple
+  devices both are the same memory), and the model cannot go on the GPU alone (above): Qwen2, Qwen3, GPT-2,
+  GPT-NeoX and 6-bit models. Twice must fit in half of `navigator.deviceMemory`, or in 6.5 GiB where Chromium
+  reports 8. A browser that does not report it (Safari, Firefox) is taken as 4 GB, so the 1B models stay on the CPU
+  there. The prompts of such a model still go to the GPU where its layers alone fit in the room the CPU's copy
+  leaves (Qwen2.5 3B's do not).
 
 ## The shaders and where they come from
 
@@ -152,8 +168,8 @@ work) and say only that the shaders are right, not how fast a GPU is.
 
 ## Next
 
-In order: keeping the weights once instead of twice; then, with the owner's numbers, the sampling in chunks in the
-page, and whatever the breakdown of a layer shows to be slow. A seed gives the same text again on the same device and the
+In order: keeping less on the CPU for a model on the GPU alone (the embedding and the copy of the keys and values);
+then, with the owner's numbers, the sampling in chunks in the page, and whatever the breakdown of a layer shows to be slow. A seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
 activations to 7 or 8 bits). Either side takes the same random number for the same token; but every 8 answers, the
 first tokens of one go to the side not chosen, so that answer may differ from an earlier one with the same seed. The

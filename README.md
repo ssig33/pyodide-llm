@@ -62,7 +62,9 @@ Firefox and WebKit and in the installed Chrome and Edge: all 23 combinations run
   weights in 6 bits instead of 8. The 7B and 8B models do not fit even then, so they need Chrome or Firefox.
 - The GPU is used by default where the browser has WebGPU. The page measures the GPU against the CPU on your device
   and keeps the CPU where it is faster. A model whose weights would not fit twice in memory (once for the CPU, once
-  for the GPU) stays on the CPU.
+  for the GPU; up to 2B on a device with 8 GB or more) goes on the GPU alone where it can (int8, Llama's shape). The
+  page then estimates the CPU from the device's run of `/benchmark/`, loads the model again on the CPU if that is
+  faster, and remembers it for the next visit. Other models too large to hold twice stay on the CPU.
 - A browser that does not say how much memory the device has (Safari, Firefox) keeps the answer on the CPU, and
   `/benchmark/` skips its round without the kernels there (NumPy widens the weights to float32: for llm-jp-3-150m,
   Pyodide grew to 958 MB in CI's Chromium).
