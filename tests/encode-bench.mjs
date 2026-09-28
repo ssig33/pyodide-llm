@@ -63,7 +63,7 @@ const templates = [...new Set(MODELS.flatMap((m) => [m.prompt, m.template]).filt
 py.globals.set("TEMPLATES", py.toPy(templates));
 py.globals.set("ROUNDS", rounds);
 py.runPython(`
-import cProfile, pstats, io, json, random, statistics, struct, time
+import cProfile, inspect, pstats, io, json, random, statistics, struct, time
 import llama2_numpy, old_numpy, llama2_convert as convert
 clock = time.perf_counter
 ENGLISH = ("Lily and Tom went to the park. They saw a big red ball near the old tree, and Tom said, \\"Let's play!\\" "
@@ -91,19 +91,21 @@ def made(name, data, options):
         parsed = json.loads(data)
         pieces = list(convert.tokenizer_json_pieces(parsed))
         specials = [t["content"] for t in parsed.get("added_tokens", []) if t.get("special")]
-        return convert.tokenizer_bin(pieces, len(pieces)), convert.tokenizer_json_options(parsed), specials
+        return (convert.tokenizer_bin(pieces, len(pieces), charsmap=convert.tokenizer_json_charsmap(parsed)),
+                convert.tokenizer_json_options(parsed), specials)
     if name.endswith(".model"):
         pieces = list(convert.sentencepiece_pieces(data))
-        return (convert.tokenizer_bin(pieces, len(pieces)), convert.sentencepiece_options(data),
-                convert.sentencepiece_specials(data))
+        return (convert.tokenizer_bin(pieces, len(pieces), charsmap=convert.sentencepiece_charsmap(data)),
+                convert.sentencepiece_options(data), convert.sentencepiece_specials(data))
     return data, options, ["</s>", "<s>"]
 
 def build(module, data, options):
-    count, offset = 0, 4  # the pieces, counted
-    while offset < len(data):
+    count, offset = 0, 4  # the pieces, counted, up to a sentencepiece model's map (T216)
+    while offset < len(data) and bytes(data[offset:offset + 8]) != b"charsmap":
         offset += 8 + struct.unpack_from("<i", data, offset + 4)[0]
         count += 1
-    keys = ("nfkc", "nfc", "pretokenizer", "ignore_merges", "nmt", "collapse", "unknown")
+    # what each engine takes (T216 took nmt out: the map is in tokenizer.bin, which an engine before it does not read)
+    keys = set(inspect.signature(module.Tokenizer.__init__).parameters) - {"self", "data", "vocab_size", "kind"}
     return module.Tokenizer(data, count, kind=options.get("tokenizer_kind", "bpe"), **{k: options[k] for k in keys if k in options})
 
 def bench(label, name, data, options):

@@ -12,7 +12,7 @@ import time
 import numpy as np
 
 # the RoPE angles are the engine's, which computes them itself when a file leaves the tables out (int8)
-from llama2_numpy import FORM, RMS_EPS, form_of, pack6, quantize6, rope_frequencies
+from llama2_numpy import CHARSMAP, FORM, RMS_EPS, form_of, pack6, quantize6, rope_frequencies
 
 # Pieces of at most this many values are converted at a time: 4 MB as float32. Measured on llm-jp-3-150m, the
 # peak is the output plus 14 MB with this, plus 52 MB with pieces four times as large, at the same speed.
@@ -1659,10 +1659,12 @@ def gguf_tokenizer(metadata, vocab_size):
 UNMATCHABLE = -1e9  # control, unknown and byte pieces must never match user text: llama2_numpy.py skips such scores
 
 
-def tokenizer_bin(pieces, vocab_size, spaces=True):
+def tokenizer_bin(pieces, vocab_size, spaces=True, charsmap=b""):
     """llama2.c's tokenizer.bin from (text, score, matchable) pieces. spaces: a sentencepiece vocabulary writes a space
     as U+2581, which the engine's pieces spell " ". A byte-level one writes it as its byte's character (Ġ), and a
-    U+2581 there is an added token's own (DeepSeek's <｜begin▁of▁sentence｜>), kept as it is (T143)."""
+    U+2581 there is an added token's own (DeepSeek's <｜begin▁of▁sentence｜>), kept as it is (T143). charsmap: a
+    sentencepiece model's precompiled_charsmap, its normalizer, which goes after the pieces (T216; llama2_numpy's
+    Charsmap reads it, and llama2.c's reader stops at the last piece)."""
     rows = [(score if matchable else UNMATCHABLE, (text.replace("▁", " ") if spaces else text).encode("utf-8"))
             for text, score, matchable in pieces]
     if len(rows) > vocab_size:
@@ -1675,6 +1677,8 @@ def tokenizer_bin(pieces, vocab_size, spaces=True):
     rows += [(UNMATCHABLE, b"")] * (vocab_size - len(rows))
     out = [struct.pack("<i", max(len(text) for _, text in rows))]
     out += [struct.pack("<fi", score, len(text)) + text for score, text in rows]
+    if charsmap:
+        out.append(CHARSMAP + struct.pack("<I", len(charsmap)) + bytes(charsmap))
     return b"".join(out)
 
 
@@ -1723,15 +1727,27 @@ def tokenizer_json_bpe_pieces(tokenizer):
 
 
 def tokenizer_json_options(tokenizer):
-    """What the engine has to know about this tokenizer: Llama(tokenizer_kind=, nfkc=, nfc=, pretokenizer=)."""
+    """What the engine has to know about this tokenizer: Llama(tokenizer_kind=, nfkc=, nfc=, pretokenizer=). A
+    "Precompiled" normalizer is sentencepiece's own map, which goes into tokenizer.bin (tokenizer_json_charsmap)."""
     normalizers = json.dumps(tokenizer.get("normalizer") or {})
-    # "Precompiled" is sentencepiece's character map, nmt_nfkc in practice
-    nfkc = '"NFKC"' in normalizers or '"Precompiled"' in normalizers
+    nfkc = '"NFKC"' in normalizers
     if tokenizer_kind_of(tokenizer) != "BPE":
         return {"tokenizer_kind": "unigram", "nfkc": nfkc}
     return {"tokenizer_kind": "bytebpe", "nfkc": nfkc, "nfc": '"NFC"' in normalizers,
             "pretokenizer": pretokenizer_name(tokenizer.get("pre_tokenizer")),
             "ignore_merges": bool(tokenizer["model"].get("ignore_merges"))}
+
+
+def tokenizer_json_charsmap(tokenizer):
+    """The precompiled_charsmap of a tokenizer.json's "Precompiled" normalizer (sentencepiece's, T216), or b""."""
+    import base64
+    steps = [tokenizer.get("normalizer") or {}]
+    while steps:
+        step = steps.pop()
+        steps += step.get("normalizers") or []
+        if step.get("type") == "Precompiled" and step.get("precompiled_charsmap"):
+            return base64.b64decode(step["precompiled_charsmap"])
+    return b""
 
 
 # The engine writes these out by hand (llama2_numpy.pretokenize), so only the patterns it knows are accepted.
@@ -1820,19 +1836,27 @@ def sentencepiece_specials(model):
     return specials
 
 
-def sentencepiece_options(model):
-    """Llama(tokenizer_kind=, nfkc=, nmt=, collapse=, unknown=) from the pieces and the trainer and normalizer specs
-    of a sentencepiece model.
+def sentencepiece_charsmap(model):
+    """A sentencepiece model's normalizer: its normalizer_spec's precompiled_charsmap (T216), b"" for none (identity:
+    Llama's, Mistral's)."""
+    for field, value in protobuf_fields(model):
+        if field == 3:  # normalizer_spec
+            return bytes(dict(protobuf_fields(value)).get(2, b""))
+    return b""
 
-    nmt: the normalizer is one of the nmt_ kinds, which make tabs, newlines and a few more spaces and drop the other
-    control characters. collapse: remove_extra_whitespaces, runs of spaces made one and the ends trimmed. Both are
-    said only where on: rinna's models are nmt_nfkc with it (and no byte pieces to spell a newline with), Llama's and
-    Mistral's identity without it, tiny-lm's nfkc without it (the review of T126). unknown: the id of the unknown
-    piece, for a model without byte pieces (rinna's): a character the vocabulary lacks is that piece, as in
-    sentencepiece, and not bytes spelled with whatever pieces happen to be at byte + 3."""
+
+def sentencepiece_options(model):
+    """Llama(tokenizer_kind=, collapse=, unknown=) from the pieces and the trainer and normalizer specs of a
+    sentencepiece model. Its normalizer is its own map, in tokenizer.bin (sentencepiece_charsmap, T216).
+
+    collapse: remove_extra_whitespaces, runs of spaces made one and the ends trimmed. Said only where on: rinna's
+    models are nmt_nfkc with it (and no byte pieces to spell a newline with), Llama's and Mistral's identity without
+    it, tiny-lm's nfkc without it (the review of T126). unknown: the id of the unknown piece, for a model without byte
+    pieces (rinna's): a character the vocabulary lacks is that piece, as in sentencepiece, and not bytes spelled with
+    whatever pieces happen to be at byte + 3."""
     UNIGRAM, BPE = 1, 2
     UNKNOWN, BYTE = 2, 6
-    kind, normalizer, collapse = UNIGRAM, "nmt_nfkc", True  # sentencepiece's own defaults
+    kind, collapse = UNIGRAM, True  # sentencepiece's own defaults
     unknown, spelled, index = None, False, 0
     for field, value in protobuf_fields(model):
         if field == 1:  # a piece: its type
@@ -1842,13 +1866,11 @@ def sentencepiece_options(model):
             index += 1
         elif field == 2:  # trainer_spec.model_type
             kind = dict(protobuf_fields(value)).get(3, UNIGRAM)
-        elif field == 3:  # normalizer_spec: its name, and remove_extra_whitespaces
-            spec = dict(protobuf_fields(value))
-            normalizer, collapse = spec.get(1, b"nmt_nfkc").decode("utf-8"), bool(spec.get(4, 1))
+        elif field == 3:  # normalizer_spec: its remove_extra_whitespaces
+            collapse = bool(dict(protobuf_fields(value)).get(4, 1))
     if kind not in (UNIGRAM, BPE):
         raise ValueError("This sentencepiece model is neither unigram nor BPE.")
-    options = {"tokenizer_kind": "unigram" if kind == UNIGRAM else "bpe", "nfkc": "nfkc" in normalizer}
-    return {**options, **({"nmt": True} if normalizer.startswith("nmt") else {}), **({"collapse": True} if collapse else {}),
+    return {"tokenizer_kind": "unigram" if kind == UNIGRAM else "bpe", **({"collapse": True} if collapse else {}),
             **({"unknown": unknown} if unknown is not None and not spelled else {})}
 
 
@@ -1887,7 +1909,8 @@ class Conversion:
                 raise ValueError("tokenizer.json is not JSON.") from None
             options = tokenizer_json_options(parsed)
             pieces = list(tokenizer_json_pieces(parsed))
-            self.tokenizer = tokenizer_bin(pieces, vocab_size, spaces=options["tokenizer_kind"] != "bytebpe")
+            self.tokenizer = tokenizer_bin(pieces, vocab_size, spaces=options["tokenizer_kind"] != "bytebpe",
+                                           charsmap=tokenizer_json_charsmap(parsed))
             added = parsed.get("added_tokens", [])
             specials = [token["content"] for token in added if token.get("special")]
             # T143: the added tokens it does not call special are read as one token wherever they are too, by the real
@@ -1895,7 +1918,8 @@ class Conversion:
             added = [token["content"] for token in added if not token.get("special")]
         else:
             pieces = list(sentencepiece_pieces(tokenizer))
-            self.tokenizer, options = tokenizer_bin(pieces, vocab_size), sentencepiece_options(tokenizer)
+            self.tokenizer = tokenizer_bin(pieces, vocab_size, charsmap=sentencepiece_charsmap(tokenizer))
+            options = sentencepiece_options(tokenizer)
             specials, added = sentencepiece_specials(tokenizer), []
         # T143: the BOS is the token the tokenizer names, which transformers begins a text with, where config.json says
         # another: DeepSeek-R1's Distill says 151643 there, its end of a sentence, and <｜begin▁of▁sentence｜> (151646)

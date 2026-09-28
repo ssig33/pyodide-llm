@@ -126,10 +126,50 @@ def pretokenize(text, pattern):
     return [text[match.start():match.end()] for match in PATTERNS.get(pattern, PATTERNS["gpt2"]).finditer(classes)]
 
 
-# sentencepiece's nmt_ normalizers (nmt_nfkc, nmt_nfkc_cf): these characters become a space, and these go
-NMT_SPACES = (0x09, 0x0A, 0x0C, 0x0D, 0x1680, 0x200B, 0x200C, 0x200E, 0x200F, 0x2028, 0x2029, 0x2581, 0xFEFF, 0xFFFD)
-NMT_DROPPED = (*range(0x01, 0x09), 0x0B, *range(0x0E, 0x20), 0x7F, 0x8F, 0x9F)
-NMT = {**{code: " " for code in NMT_SPACES}, **{code: None for code in NMT_DROPPED}}
+# T216: what may follow the pieces of a tokenizer.bin: this, the length of a sentencepiece model's precompiled_charsmap
+# (uint32) and the charsmap itself
+CHARSMAP = b"charsmap"
+
+
+class Charsmap:
+    """sentencepiece's normalizer, from the model's own precompiled_charsmap (T216): the length of a Darts-clone double
+    array (uint32), the array, and the normalized texts, each ended by a NUL. The array's keys are UTF-8 texts and its
+    values where their normalized text begins. At each place the longest key that begins there is replaced, and where
+    none does, one character is kept: sentencepiece's Normalizer::NormalizePrefix, which walks the array as Darts-clone's
+    commonPrefixSearch does (a unit: bit 31 a value, bits 0-7 its label, bit 8 a leaf below, and its offset from bit 10,
+    shifted by 8 more where bit 9 says). The model's own map: not Python's NFKC, whose Unicode is another version (the
+    four letters T126 found in tiny-lm), and not a table of the nmt_ kinds, which differ between models (rinna's)."""
+
+    def __init__(self, blob):
+        (size,) = struct.unpack_from("<I", blob)
+        self.units = struct.unpack_from(f"<{size // 4}I", blob, 4)
+        self.texts = bytes(blob[4 + size:])
+        self.found = {}  # the normalized text at each value, read once
+
+    def replaced(self, text):
+        data, units, out, i = text.encode("utf-8"), self.units, [], 0
+        offset = lambda unit: (unit >> 10) << ((unit & 0x200) >> 6)
+        root, size = offset(units[0]), len(units)
+        while i < len(data):
+            node, longest, value = root, 0, 0
+            for j in range(i, len(data)):
+                node ^= data[j]
+                if node >= size or units[node] & 0x800000FF != data[j]:
+                    break
+                unit = units[node]
+                node ^= offset(unit)
+                if unit & 0x100:
+                    longest, value = j + 1 - i, units[node] & 0x7FFFFFFF
+            if longest:
+                if value not in self.found:
+                    self.found[value] = self.texts[value:self.texts.index(b"\0", value)]
+                out.append(self.found[value])
+                i += longest
+            else:  # one character as it is (Python's texts are always well-formed UTF-8)
+                length = 1 if data[i] < 0xC0 else 2 if data[i] < 0xE0 else 3 if data[i] < 0xF0 else 4
+                out.append(data[i:i + length])
+                i += length
+        return b"".join(out).decode("utf-8")
 
 
 class Tokenizer:
@@ -145,9 +185,9 @@ class Tokenizer:
     UNMATCHABLE = -1e8  # convert_hf.py gives control and byte pieces a score below this
 
     def __init__(self, data, vocab_size, kind="bpe", nfkc=False, nfc=False, pretokenizer="gpt2", ignore_merges=False,
-                 nmt=False, collapse=False, unknown=None):
+                 collapse=False, unknown=None):
         self.kind, self.nfkc, self.nfc, self.pretokenizer = kind, nfkc, nfc, pretokenizer
-        self.nmt, self.collapse = nmt, collapse  # a sentencepiece model's normalizer: see normalized()
+        self.collapse = collapse  # a sentencepiece model's remove_extra_whitespaces: see normalized()
         # a sentencepiece model without byte pieces (rinna's) writes a character it lacks as its unknown piece, a run
         # of them as one; the others spell it in bytes
         self.unknown = unknown
@@ -160,6 +200,13 @@ class Tokenizer:
             self.vocab.append(bytes(data[offset:offset + length]))
             self.scores.append(score)
             offset += length
+        # T216: the sentencepiece model's own normalizer, where the converter put it after the pieces
+        rest = bytes(data[offset:offset + len(CHARSMAP) + 4])
+        self.charsmap = None
+        if rest[:len(CHARSMAP)] == CHARSMAP:
+            (size,) = struct.unpack_from("<I", rest, len(CHARSMAP))
+            start = offset + len(CHARSMAP) + 4
+            self.charsmap = Charsmap(bytes(data[start:start + size]))
         # first occurrence wins, like list.index() in llama2.py
         self.index = {}
         for i, piece in enumerate(self.vocab):
@@ -206,13 +253,13 @@ class Tokenizer:
         return tokens
 
     def normalized(self, text):
-        """The text as the model's normalizer makes it. nmt: sentencepiece's nmt_ normalizers make tabs, newlines and
-        a few more characters a space, and drop the other control characters (NMT_SPACES and NMT_DROPPED: what
-        sentencepiece 0.2.2 did to each character with rinna's nmt_nfkc, the review of T126). collapse: its
-        remove_extra_whitespaces, runs of spaces one and none at either end. Without them a newline was spelled
-        with byte + 3 in a vocabulary with no byte pieces: rinna's った."""
-        if self.nmt:
-            text = text.translate(NMT)
+        """The text as the model's normalizer makes it: a sentencepiece model's own map (charsmap, T216: nmt_nfkc makes
+        tabs, newlines and a few more characters a space, and drops or keeps the other control characters, as each
+        model's map says), NFKC or NFC (a tokenizer.json's), and collapse: sentencepiece's remove_extra_whitespaces,
+        runs of spaces one and none at either end. Without them a newline was spelled with byte + 3 in a vocabulary
+        with no byte pieces: rinna's った (the review of T126)."""
+        if self.charsmap:
+            text = self.charsmap.replaced(text)
         if self.nfkc:
             text = unicodedata.normalize("NFKC", text)
         if self.nfc:
@@ -221,7 +268,7 @@ class Tokenizer:
             text = re.sub(" {2,}", " ", text).strip(" ")
         if self.kind != "bytebpe":
             # sentencepiece writes a space as U+2581, so one written in the text is a space too (after the collapse,
-            # which sees spaces only; nmt made it one before). The pieces here spell it " " (T216)
+            # which sees spaces only; an nmt_ map made it one before). The pieces here spell it " " (T216)
             text = text.replace("\u2581", " ")
         return text
 
@@ -734,6 +781,11 @@ def check_tokenizer(tokenizer, header):
     vocab_size = abs(int(list(header)[5]))
     offset, pieces = 4, 0
     while offset + 8 <= len(tokenizer):
+        if pieces == vocab_size and bytes(tokenizer[offset:offset + len(CHARSMAP)]) == CHARSMAP:
+            # T216: a sentencepiece model's normalizer after the pieces, to the end
+            (size,) = struct.unpack_from("<I", tokenizer, offset + len(CHARSMAP))
+            offset += len(CHARSMAP) + 4 + size
+            break
         _, length = struct.unpack_from("<fi", tokenizer, offset)
         if length < 0 or offset + 8 + length > len(tokenizer):
             raise ValueError("The smaller file is not a llama2.c tokenizer.bin.")
@@ -765,7 +817,7 @@ class Llama:
     def __init__(self, checkpoint, tokenizer, dtype="float32", rope_theta=10000.0,
                  tokenizer_kind="bpe", nfkc=False, nfc=False, pretokenizer="gpt2", bias=False, arch="llama",
                  rotary=0, parallel_residual=False, bos=BOS, stop_tokens=(BOS,), kernels=None, specials=(),
-                 disable=(), external=None, rope_scaling=None, ignore_merges=False, nmt=False, collapse=False,
+                 disable=(), external=None, rope_scaling=None, ignore_merges=False, collapse=False,
                  unknown=None, qk_norm=False, head_dim=0, rms_norm_eps=RMS_EPS):
         """checkpoint: llama2.c "legacy" format, a 7 int header then the weights.
 
@@ -899,7 +951,7 @@ class Llama:
             # the line has to say what the numbers are the numbers of
             self.backend += " (without " + ", ".join(name for name in SWITCHES if name in disable) + ")"
         self.tokenizer = Tokenizer(tokenizer, self.vocab_size, kind=tokenizer_kind, nfkc=nfkc, nfc=nfc,
-                                   pretokenizer=pretokenizer, ignore_merges=ignore_merges, nmt=nmt, collapse=collapse,
+                                   pretokenizer=pretokenizer, ignore_merges=ignore_merges, collapse=collapse,
                                    unknown=unknown)
         self.bos, self.stop_tokens = bos, {int(token) for token in stop_tokens}
         self.specials = tuple(str(special) for special in specials)  # see Tokenizer.encode()

@@ -32,8 +32,8 @@ assert text.startswith(expected), f"stories260K wrote: {text!r}"
 
 # the default model: converted from Hugging Face, quantized to int8, unigram tokenizer, sampled
 tiny = llama2_numpy.Llama(read("tiny-lm.bin"), read("tiny-lm.tokenizer.bin"), dtype="int8",
-                          tokenizer_kind="unigram", nfkc=True, stop_tokens=(1, 2))
-assert tiny.tokenizer.encode("ＡＢＣ") == tiny.tokenizer.encode("ABC"), "NFKC normalization is off"
+                          tokenizer_kind="unigram", stop_tokens=(1, 2))
+assert tiny.tokenizer.encode("ＡＢＣ") == tiny.tokenizer.encode("ABC"), "NFKC normalization is off (the map of its sentencepiece model, in tokenizer.bin: T216)"
 japanese = "".join(tiny.generate("これからの流行りは", steps=12, temperature=0.7, repetition_penalty=1.3, seed=1))
 assert japanese.startswith("これからの流行りは") and len(japanese) > len("これからの流行りは"), f"tiny-lm wrote: {japanese!r}"
 assert japanese == "".join(tiny.generate("これからの流行りは", steps=12, temperature=0.7, repetition_penalty=1.3, seed=1)), "a seed must reproduce"
@@ -47,7 +47,7 @@ reference = "".join(numpy15.generate("Once upon a time", steps=60))
 assert reference.startswith(story), f"stories15M wrote: {reference!r}"
 assert "".join(simd15.generate("Once upon a time", steps=60)) == reference, "the kernels and NumPy disagree"
 fast = kernel_llama(read("tiny-lm.bin"), read("tiny-lm.tokenizer.bin"), dtype="int8",
-                          tokenizer_kind="unigram", nfkc=True, stop_tokens=(1, 2))
+                          tokenizer_kind="unigram", stop_tokens=(1, 2))
 assert "int8" in fast.backend and len("".join(fast.generate("これからの流行りは", steps=12, temperature=0.7, seed=1))) > 3
 # GPT-2 on the kernels (T65): LayerNorm, GELU and the learned positions must write what NumPy writes
 import numpy as np

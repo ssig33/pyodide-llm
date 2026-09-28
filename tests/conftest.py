@@ -58,6 +58,41 @@ TEXTS = [CORPUS, " ", "  ", "\n", "\r\n", " \n ", "0123", " 42 ", "a", " a", "  
          "a\n  \nb", "\n \n \n", "def f(x):\n    a = 1\n    \n    return a\n", " \t\n \r\n x"]
 
 
+# ------------------------------------------------------------------------------------------- sentencepiece
+def charsmap(mapping):
+    """A sentencepiece precompiled_charsmap for {text: its normalized text} (T216): the length of a Darts-clone double
+    array, the array, and the normalized texts, each ended by a NUL. Built here the simple way (each node takes the
+    first base no other node has and whose children's places are free; a unit: bit 31 a value, bits 0-7 its label,
+    bit 8 a leaf below, bits 10 up the offset to its base), which llama2_numpy.Charsmap walks as Darts-clone does."""
+    trie, texts = {}, bytearray()
+    for key, normal in mapping.items():
+        node = trie
+        for byte in key.encode("utf-8"):
+            node = node.setdefault(byte, {})
+        node[None] = len(texts)
+        texts += normal.encode("utf-8") + b"\0"
+    units, used, bases = {}, {0}, set()
+
+    def place(node, at):
+        labels = sorted(label for label in node if label is not None)
+        places = labels + ([0] if None in node else [])
+        base = 1
+        while base in bases or any(base ^ label in used for label in places):
+            base += 1
+        bases.add(base)
+        used.update(base ^ label for label in places)
+        units[at] = units.get(at, 0) | (at ^ base) << 10 | (0x100 if None in node else 0)
+        if None in node:
+            units[base] = node[None] | 1 << 31
+        for label in labels:
+            units[base ^ label] = label
+            place(node[label], base ^ label)
+
+    place(trie, 0)
+    array = struct.pack(f"<{max(units) + 1}I", *(units.get(i, 0) for i in range(max(units) + 1)))
+    return struct.pack("<I", len(array)) + array + bytes(texts)
+
+
 # ------------------------------------------------------------------------------------- synthetic checkpoints
 
 class NoWeights:

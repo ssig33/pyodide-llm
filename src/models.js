@@ -221,7 +221,7 @@ export const GROUPS = { site: "Models of this site", original: "Unquantized orig
 const LISTED = [
   { id: "tiny-lm", name: "tiny-lm 29M", note: "日本語 / English · int8 · 33 MB",
     source: "sbintuitions/tiny-lm", checkpoint: "tiny-lm.bin", bytes: 32891932, tokenizer: "tiny-lm.tokenizer.bin",
-    options: { dtype: "int8", ...unigram, nfkc: true, stop_tokens: [1, 2] },
+    options: { dtype: "int8", ...unigram, stop_tokens: [1, 2] },
     generation: sampled(1.3), prompt: "これからの流行りは", placeholder: JAPANESE },
   { id: "llm-jp-3-150m", name: "llm-jp-3 150M", note: "日本語 / English · int8 · 171 MB",
     source: "llm-jp/llm-jp-3-150m", checkpoint: "llm-jp-3-150m.bin", bytes: 171395100, tokenizer: "llm-jp-3-150m.tokenizer.bin",
@@ -242,7 +242,7 @@ const LISTED = [
   // the unquantized originals, to compare with int8
   { group: "original", id: "tiny-lm-f16", name: "tiny-lm 29M (original)", note: "日本語 / English · float16 · 59 MB",
     source: "sbintuitions/tiny-lm", checkpoint: "tiny-lm.f16", bytes: 58724892, tokenizer: "tiny-lm.tokenizer.bin",
-    options: { dtype: "float16", ...unigram, nfkc: true, stop_tokens: [1, 2] },
+    options: { dtype: "float16", ...unigram, stop_tokens: [1, 2] },
     generation: sampled(1.3), prompt: "これからの流行りは", placeholder: JAPANESE },
   { group: "original", id: "llm-jp-3-150m-f16", name: "llm-jp-3 150M (original)", note: "日本語 / English · float16 · 305 MB · desktop only",
     source: "llm-jp/llm-jp-3-150m", checkpoint: "llm-jp-3-150m.f16", bytes: 305161244, tokenizer: "llm-jp-3-150m.tokenizer.bin",

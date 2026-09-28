@@ -18,7 +18,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "public"))
 from llama2_convert import (Arrays, Safetensors, Shards, bfloat16, checkpoint_form, checkpoint_header, checkpoint_size,  # noqa: E402
-                            convert_weights, normalize, sentencepiece_pieces, tokenizer_bin, tokenizer_json_pieces)
+                            convert_weights, normalize, sentencepiece_charsmap, sentencepiece_pieces, tokenizer_bin,
+                            tokenizer_json_charsmap, tokenizer_json_options, tokenizer_json_pieces)
 
 
 # ------------------------------------------------------------------------------------------------ weights
@@ -77,8 +78,15 @@ def convert(directory, out_path, dtype, max_seq_len):
 
 def convert_tokenizer(directory, out_path, vocab_size):
     model = next((p for p in (directory / "spiece.model", directory / "tokenizer.model") if p.exists()), None)
-    pieces = sentencepiece_pieces(model.read_bytes()) if model else tokenizer_json_pieces(json.loads((directory / "tokenizer.json").read_text()))
-    Path(out_path).write_bytes(tokenizer_bin(pieces, vocab_size))
+    if model:
+        data = model.read_bytes()
+        vocabulary = tokenizer_bin(sentencepiece_pieces(data), vocab_size, charsmap=sentencepiece_charsmap(data))
+    else:
+        # the page's conversion writes these the same (llama2_convert.Conversion)
+        parsed = json.loads((directory / "tokenizer.json").read_text())
+        vocabulary = tokenizer_bin(tokenizer_json_pieces(parsed), vocab_size, charsmap=tokenizer_json_charsmap(parsed),
+                                   spaces=tokenizer_json_options(parsed)["tokenizer_kind"] != "bytebpe")
+    Path(out_path).write_bytes(vocabulary)
 
 
 if __name__ == "__main__":
