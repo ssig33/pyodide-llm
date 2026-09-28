@@ -4,7 +4,10 @@
 # filled()'s rules) against transformers' apply_chat_template on the files of the pinned revision. Only config.json,
 # the tokenizer files and the safetensors headers (by Range) are fetched; no weights.
 #
-#   python3 tests/format_check.py <directory for the downloads> [model id ...]
+#   python3 tests/format_check.py [--hf] <directory for the downloads> [model id ...]
+#
+# --hf: as ?hf= opens the repository, with what the converter makes alone (T143): the list's options and format are
+# left out. A difference known for the list's format is then no error when it is gone.
 #
 # Needs the reference tools, which the page never uses: a venv with tests/requirements-reference.txt (docs/notes/dev-setup.md).
 # The first BOS may differ (the page always starts with it, T131). The other differences known are in KNOWN, each
@@ -205,7 +208,10 @@ def main():
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     from transformers import AutoTokenizer
 
-    directory, only = Path(sys.argv[1]), sys.argv[2:]
+    arguments = sys.argv[1:]
+    alone = "--hf" in arguments  # T143: the converter's options and format only, as ?hf= has them
+    arguments = [argument for argument in arguments if argument != "--hf"]
+    directory, only = Path(arguments[0]), arguments[1:]
     accepted = set(inspect.signature(llama2_numpy.Tokenizer.__init__).parameters) - {"self", "data", "vocab_size", "kind"}
     failed, stale = [], []
     for entry in entries():
@@ -213,8 +219,8 @@ def main():
             continue
         folder, shards, tokenizers = fetch(entry, directory)
         made = conversion(entry, folder, shards, tokenizers)
-        options = {**made.options, **entry.get("options", {})}
-        template = entry.get("template") or made.options.get("template")
+        options = {**made.options, **({} if alone else entry.get("options", {}))}
+        template = (None if alone else entry.get("template")) or made.options.get("template")
         if not template:
             print(f"none {entry['id']}: no format (what was typed is continued as it is)", flush=True)
             continue
@@ -248,7 +254,7 @@ def main():
             else:
                 diffs.append(f"{prompt!r}\n    page {reference.convert_ids_to_tokens(page)[:60]}"
                              f"\n    real {reference.convert_ids_to_tokens(real)[:60]}")
-        where = "the list" if entry.get("template") else "the converter"
+        where = "the list" if entry.get("template") and not alone else "the converter"
         verdict = "DIFF" if diffs else "known" if explained else "ok  "
         note = f", {explained} as known: {known['why']}" if explained else ""
         print(f"{verdict} {entry['id']}: {same}/{len(PROMPTS)}{note} (format of {where})", flush=True)
@@ -256,7 +262,7 @@ def main():
             print("  ", diff)
         if diffs:
             failed.append(entry["id"])
-        if known and not explained:
+        if known and not explained and not alone:
             print(f"STALE {entry['id']}: the difference known ({known['why']}) is gone: take it out of KNOWN")
             stale.append(entry["id"])
     if failed:
