@@ -727,7 +727,7 @@ def external_tensors(header, dtype, form=None):
     six = str(dtype) == "int6"
     places = Places(np.int8 if six else dtype, six)
     probe.llama_tensors(places.take, vocab_size > 0, True, kv_dim, form["bias"], places.dtype,
-                        lambda width: np.zeros(width // 2), form["qk_norm"])
+                        lambda width: (np.zeros(width // 2), np.zeros(width // 2)), form["qk_norm"])
     return {name: getattr(probe, name).plan() for name in TENSOR_NAMES if isinstance(getattr(probe, name, None), Tensor)}
 
 
