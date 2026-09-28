@@ -375,3 +375,75 @@ def test_a_map_whose_offsets_take_darts_clones_long_form():
                      for i, (text, kind) in enumerate(pieces))
     model += field(2, field(3, 1)) + field(3, field(1, b"nmt_nfkc") + field(2, blob))
     assert spm.SentencePieceProcessor(model_proto=model).normalize("aZQbZ") == "▁axybx"
+
+
+def walked(charsmap, text):
+    """Charsmap.replaced() before T222: the walk from every character, the reference of the skip"""
+    data, units, out, i = text.encode("utf-8"), charsmap.units, [], 0
+    offset = lambda unit: (unit >> 10) << ((unit & 0x200) >> 6)
+    root, size = offset(units[0]), len(units)
+    while i < len(data):
+        node, longest, value = root, 0, 0
+        for j in range(i, len(data)):
+            node ^= data[j]
+            if node >= size or units[node] & 0x800000FF != data[j]:
+                break
+            unit = units[node]
+            node ^= offset(unit)
+            if unit & 0x100:
+                longest, value = j + 1 - i, units[node] & 0x7FFFFFFF
+        if longest:
+            out.append(charsmap.texts[value:charsmap.texts.index(b"\0", value)])
+            i += longest
+        else:
+            length = 1 if data[i] < 0xC0 else 2 if data[i] < 0xE0 else 3 if data[i] < 0xF0 else 4
+            out.append(data[i:i + length])
+            i += length
+    return b"".join(out).decode("utf-8")
+
+
+def test_the_skip_to_where_a_key_may_begin_changes_no_text():
+    """T222: replaced() walks the array only from the bytes a key may begin with and keeps the text between as it is.
+    Its text is the walk's from every character, for the maps at hand: tiny-lm's (`make models`), sentencepiece's nfkc
+    and nmt_nfkc (the kinds of the list's three maps: tiny-lm's and rinna's), two small ones and Darts-clone's long
+    form; on every character of the BMP (and some beyond) between letters, the characters the map changes in random
+    runs with letters and marks around them, and text that has no key at all."""
+    from conftest import CORPUS, ROOT, charsmap
+    from llama2_numpy import Charsmap
+    maps = {"NMT_LIKE": Charsmap(charsmap(NMT_LIKE)), "one key": Charsmap(charsmap({"Ａ": "A"}))}
+    B = 1 << 21  # test_a_map_whose_offsets_take_darts_clones_long_form's map
+    units = [0] * (B + 768)
+    units[0] = (B << 2) | 0x200
+    for label, below, value in ((ord("Z"), B + 256, 0), (ord("Q"), B + 512, 2)):
+        child = B ^ label
+        units[child] = label | 0x100 | ((child ^ below) << 10)
+        units[below] = (1 << 31) | value
+    array = struct.pack(f"<{len(units)}I", *units)
+    maps["long form"] = Charsmap(struct.pack("<I", len(array)) + array + b"x\0y\0")
+    if (ROOT / "tiny-lm.tokenizer.bin").exists():
+        tiny = Tokenizer((ROOT / "tiny-lm.tokenizer.bin").read_bytes(), checkpoint_vocab_size("tiny-lm.bin"), kind="unigram")
+        maps["tiny-lm"] = tiny.charsmap
+    try:
+        import io
+        import sentencepiece as spm
+        from llama2_convert import sentencepiece_charsmap
+        for rule in ("nfkc", "nmt_nfkc"):
+            out = io.BytesIO()
+            spm.SentencePieceTrainer.train(sentence_iterator=iter(CORPUS.splitlines() * 8), model_writer=out, vocab_size=300,
+                                           hard_vocab_limit=False, character_coverage=1.0, normalization_rule_name=rule)
+            maps[rule] = Charsmap(sentencepiece_charsmap(out.getvalue()))
+    except ImportError:
+        pass
+    characters = [chr(code) for code in [*range(1, 0xD800), *range(0xE000, 0x10000), *range(0x10000, 0x40000, 7)]]
+    between = ["".join(f"a{c}b" for c in characters[at:at + 64]) for at in range(0, len(characters), 64)]
+    randomly = random.Random(222)
+    for name, map in maps.items():
+        assert map is not None, name
+        # the characters the map changes, with letters and combining marks: where keys of several characters are
+        changed = [c for c in characters[:0x3400] if walked(map, c) != c]
+        pool = changed + list("aAzZQ 1\n\t") + ["́", "゙", "゚", "ﾞ", "ﾟ", "ｶ", "ﾊ", "é", "日本"]
+        texts = between + ["", "abc", "日本語の文。", "\U0001F600", "a" * 300, CORPUS]
+        texts += ["".join(randomly.choice(pool) for _ in range(randomly.randrange(1, 24))) for _ in range(20000)]
+        wrong = [text for text in texts if map.replaced(text) != walked(map, text)]
+        assert not wrong, f"{name}: {len(wrong)} of {len(texts)} differ, as {wrong[:3]!r}"
+        print(f"{name}: {len(texts)} texts the same, {len(changed)} characters changed")

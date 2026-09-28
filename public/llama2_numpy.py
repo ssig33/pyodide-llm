@@ -145,12 +145,30 @@ class Charsmap:
         self.units = struct.unpack_from(f"<{size // 4}I", blob, 4)
         self.texts = bytes(blob[4 + size:])
         self.found = {}  # the normalized text at each value, read once
+        # T222: the bytes a key may begin with, the root's children (the first step of the walk below). The text
+        # between two of them is kept as it is, without a walk at each byte. No continuation byte of UTF-8 begins a
+        # character, so the text is cut between characters, as the walk cuts it
+        units, root = self.units, self.offset(self.units[0])
+        begins = bytes(byte for byte in [*range(0x80), *range(0xC0, 0x100)]
+                       if root ^ byte < len(units) and units[root ^ byte] & 0x800000FF == byte)
+        self.begins = re.compile(b"[" + re.escape(begins) + b"]") if begins else None
+
+    @staticmethod
+    def offset(unit):
+        return (unit >> 10) << ((unit & 0x200) >> 6)
 
     def replaced(self, text):
         data, units, out, i = text.encode("utf-8"), self.units, [], 0
-        offset = lambda unit: (unit >> 10) << ((unit & 0x200) >> 6)
+        offset, begins = self.offset, self.begins
         root, size = offset(units[0]), len(units)
         while i < len(data):
+            found = begins.search(data, i) if begins else None
+            if not found:
+                out.append(data[i:])
+                break
+            if found.start() > i:
+                out.append(data[i:found.start()])
+                i = found.start()
             node, longest, value = root, 0, 0
             for j in range(i, len(data)):
                 node ^= data[j]
