@@ -21,15 +21,18 @@ export const FULL_ROUNDS = [
  * (navigator.deviceMemory: Safari and Firefox never say). Without the kernels NumPy widens every weight to float32
  * (four bytes a weight, where the kernels keep one): with llm-jp-3 150M the worker's Pyodide grew to 958 MB and the
  * renderer by 0.81 GB in CI's Chromium, and an iPhone's tab went down in that round (T205's review). A page that is
- * not told the memory cannot tell whether it fits (the owner, 2026-09-27: such a device skips the NumPy round). */
-export const MEMORY_UNSAID = "this browser does not say how much memory the device has, and without the kernels " +
-  "NumPy widens every weight to float32 (four bytes a weight: about 1.2 GB in all with llm-jp-3 150M), which took an iPhone's tab down";
+ * not told the memory cannot tell whether it fits (the owner, 2026-09-27: such a device skips the NumPy round;
+ * 2026-09-28: and the round of the kernels with int8 widened, which widens them as well). */
+export const MEMORY_UNSAID = "this browser does not say how much memory the device has, and this round widens every weight " +
+  "to float32 (four bytes a weight: about 1.2 GB in all with llm-jp-3 150M), which took an iPhone's tab down";
 
 /** The rounds as this device runs them (T214): a round without the kernels carries skip (the words of its row) where
  * deviceMemory is not a number. The page decides (both ?bench= and /benchmark/), and the worker writes the row. */
 export function roundsHere(rounds, deviceMemory) {
   const unsaid = typeof deviceMemory !== "number";
-  return rounds.map((round) => (unsaid && round.without.includes("kernels") ? { ...round, skip: MEMORY_UNSAID } : round));
+  // without the kernels NumPy widens them, and without int8 the kernels do (the owner, 2026-09-28: skip it too)
+  const widens = (round) => round.without.includes("kernels") || round.without.includes("int8");
+  return rounds.map((round) => (unsaid && widens(round) ? { ...round, skip: MEMORY_UNSAID } : round));
 }
 
 const number = (value, digits = 1) => (typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "?");
