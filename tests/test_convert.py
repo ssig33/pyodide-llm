@@ -191,6 +191,26 @@ def test_tokenizer_json():
         list(tokenizer_json_pieces({**tokenizer, "model": {"type": "WordPiece"}}))
 
 
+def test_a_tokenizer_json_precompiled_map_goes_into_tokenizer_bin():
+    """T216: a tokenizer.json made from a sentencepiece model says its normalizer as "Precompiled", the model's map in
+    base64, alone or in a Sequence. It goes after the pieces as a tokenizer.model's does (the nfkc option was a guess)."""
+    import base64
+    from conftest import charsmap, vocabulary_conversion
+    from llama2_convert import tokenizer_json_charsmap
+    map = charsmap({"Ａ": "A", "\n": " "})
+    precompiled = {"type": "Precompiled", "precompiled_charsmap": base64.b64encode(map).decode()}
+    vocab = [["<unk>", 0.0], ["<s>", 0.0], ["</s>", 0.0], ["▁A", -1.0]] + [[f"▁w{i}", -2.0 - i / 100] for i in range(316)]
+    for normalizer in (precompiled, {"type": "Sequence", "normalizers": [{"type": "Replace", "pattern": {"String": "x"},
+                                                                          "content": "x"}, precompiled]}):
+        tokenizer = {"added_tokens": [], "normalizer": normalizer, "model": {"type": "Unigram", "unk_id": 0, "vocab": vocab}}
+        assert tokenizer_json_charsmap(tokenizer) == map and tokenizer_json_options(tokenizer) == {"tokenizer_kind": "unigram", "nfkc": False}
+        conversion = vocabulary_conversion(json.dumps(tokenizer).encode(), "tokenizer.json", 320)
+        assert bytes(conversion.tokenizer).endswith(b"charsmap" + struct.pack("<I", len(map)) + map)
+        vocabulary = Tokenizer(bytes(conversion.tokenizer), 320, kind="unigram")
+        assert vocabulary.encode("Ａ\nw1") == vocabulary.encode("A w1") == [3, 5]
+    assert tokenizer_json_charsmap({"normalizer": None}) == b"" and tokenizer_json_charsmap({"normalizer": {"type": "NFKC"}}) == b""
+
+
 def test_a_transform_nobody_wrote_is_refused():
     """transformed() used to take any unknown name for a slice of rows (T77): a typo must fail loudly."""
     import numpy as np

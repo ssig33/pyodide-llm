@@ -217,7 +217,9 @@ def test_added_tokens_that_are_not_special_are_one_token_wherever_they_are():
     from conftest import vocabulary_conversion
     real, _ = trained(None, False)
     real.add_tokens([AddedToken(" " * count, normalized=True) for count in range(24, 1, -1)]
-                    + [AddedToken("<think>", normalized=False), AddedToken("</think>", normalized=False)])
+                    + [AddedToken("<think>", normalized=False), AddedToken("</think>", normalized=False),
+                       # DeepSeek's are written with U+2581, which a byte-level tokenizer.bin keeps as it is
+                       AddedToken("<｜tool▁sep｜>", normalized=False)])
     real.add_special_tokens(["<|im_end|>"])
     vocab_size = real.get_vocab_size()
     options = vocabulary_conversion(real.to_str().encode(), "tokenizer.json", vocab_size).options
@@ -227,7 +229,7 @@ def test_added_tokens_that_are_not_special_are_one_token_wherever_they_are():
     mine = Tokenizer(vocabulary_conversion(real.to_str().encode(), "tokenizer.json", vocab_size).tokenizer, vocab_size,
                      kind="bytebpe", pretokenizer=options["pretokenizer"])
     texts = ["    x ", "def f():\n    return 1\n", " " * 30 + "a", "a  b   c    d", "<think> hi </think>", "x<think>y",
-             "\t    \n  ", "<thin k>", *TEXTS]
+             "\t    \n  ", "<thin k>", "a<｜tool▁sep｜>b", *TEXTS]
     wrong = [text for text in texts if mine.encode(text, specials) != real.encode(text, add_special_tokens=False).ids]
     assert not wrong, f"{len(wrong)} of {len(texts)} texts differ, as {wrong[0]!r}"
     assert mine.encode("    x ", specials)[0] == real.token_to_id("    ")
