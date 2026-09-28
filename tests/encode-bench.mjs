@@ -6,7 +6,11 @@
 //             with Pythia's vocabulary would not be one: SmolLM2 comes as a GGUF, so its pattern is run on GPT-2's)
 // Before timing, the two must give the same IDs for every text: the timed ones, the prompts and templates of
 // src/models.js, and random texts of letters, digits, spaces, line breaks, CJK, emoji and control characters, with
-// and without specials. Any difference fails (exit 1).
+// and without specials. Any difference fails (exit 1). Each side is what a visitor gets from its commit: the old engine
+// with the old converter's tokenizer.bin and options and the old list's options for the site's files (T216 put the
+// sentencepiece model's map into tokenizer.bin and took the nfkc and nmt options out, so the new options and file
+// would leave the old engine without its normalizer). A text the two normalize differently (the map against Python's
+// NFKC and the nmt table) is not compared, and counted.
 //
 // Printed: the constructor's ms (it runs when a model loads), encode()'s ms for a short text (about 64 tokens) and a
 // long one (about 1000), old and new, the medians of the rounds after a warm-up round, and where the old encode()
@@ -25,7 +29,14 @@ const ref = option("--ref", "origin/main"), rounds = Number(option("--rounds", 7
 if (ref === "origin/main") {
   try { execFileSync("git", ["fetch", "-q", "--depth=1", "origin", "+main:refs/remotes/origin/main"], { cwd: root, stdio: "inherit" }); } catch {}
 }
-const old = execFileSync("git", ["show", `${ref}:public/llama2_numpy.py`], { cwd: root });
+const source = (path) => execFileSync("git", ["show", `${ref}:${path}`], { cwd: root });
+const old = source("public/llama2_numpy.py");
+// the old converter, on the old engine
+const oldConvert = source("public/llama2_convert.py").toString().replace(/^from llama2_numpy import/m, "from old_numpy import");
+// the old list's options for the site's tokenizer.bin files (tiny-lm's nfkc, before T216)
+fs.mkdirSync(`${root}.tmp/t200/`, { recursive: true });
+fs.writeFileSync(`${root}.tmp/t200/models-old.mjs`, source("src/models.js"));
+const { MODELS: OLD_MODELS } = await import(`${root}.tmp/t200/models-old.mjs`);
 
 // tokenizer files of Hugging Face at the revisions src/models.js pins, kept in .tmp/t200/
 const cache = `${root}.tmp/t200/hf/`;
@@ -42,15 +53,19 @@ async function hfFile(id) {
   }
   return { name, data: fs.readFileSync(target) };
 }
-const site = (file, options) => ({ name: "tokenizer.bin", data: fs.readFileSync(`${root}public/models/${file}`), options });
+const listed = (models, id) => models.find((m) => m.id === id)?.options ?? {};
+const site = (file, id) => ({ name: "tokenizer.bin", data: fs.readFileSync(`${root}public/models/${file}`),
+                              options: listed(MODELS, id), oldOptions: listed(OLD_MODELS, id) });
 const tokenizers = [
-  ["bpe: Llama 2 (stories15M)", site("tokenizer.bin", {})],
-  ["unigram: tiny-lm", site("tiny-lm.tokenizer.bin", MODELS.find((m) => m.id === "tiny-lm").options)],
-  ["unigram: llm-jp-3 150M", site("llm-jp-3-150m.tokenizer.bin", MODELS.find((m) => m.id === "llm-jp-3-150m").options)],
+  ["bpe: Llama 2 (stories15M)", site("tokenizer.bin", "stories15M")],
+  ["unigram: tiny-lm", site("tiny-lm.tokenizer.bin", "tiny-lm")],
+  ["unigram: llm-jp-3 150M", site("llm-jp-3-150m.tokenizer.bin", "llm-jp-3-150m")],
   ["unigram: rinna gpt2 small (spiece.model)", await hfFile("hf-japanese-gpt2-small")],
+  ["bpe: Swallow-MS (tokenizer.model, a map)", await hfFile("hf-swallow-ms-7b-instruct")],
   ["bytebpe: GPT-2", await hfFile("hf-gpt2")],
   ["bytebpe: Qwen3", await hfFile("hf-qwen3-0.6b")],
   ["bytebpe: Llama 3.2", await hfFile("hf-llama-3.2-1b-instruct")],
+  ["bytebpe: Pythia (runs of spaces added)", await hfFile("hf-pythia-160m")],
 ];
 
 const py = await loadPyodide();
@@ -58,13 +73,14 @@ await py.loadPackage("numpy", { messageCallback: () => {} });
 py.FS.writeFile("llama2_numpy.py", fs.readFileSync(`${root}public/llama2_numpy.py`));
 py.FS.writeFile("old_numpy.py", old);
 py.FS.writeFile("llama2_convert.py", fs.readFileSync(`${root}public/llama2_convert.py`));
+py.FS.writeFile("old_convert.py", oldConvert);
 // every prompt and template of the list, with a prompt of both languages in it
 const templates = [...new Set(MODELS.flatMap((m) => [m.prompt, m.template]).filter((t) => typeof t === "string"))];
 py.globals.set("TEMPLATES", py.toPy(templates));
 py.globals.set("ROUNDS", rounds);
 py.runPython(`
 import cProfile, inspect, pstats, io, json, random, statistics, struct, time
-import llama2_numpy, old_numpy, llama2_convert as convert
+import llama2_numpy, old_numpy, llama2_convert as convert, old_convert
 clock = time.perf_counter
 ENGLISH = ("Lily and Tom went to the park. They saw a big red ball near the old tree, and Tom said, \\"Let's play!\\" "
            "It's 3:45 in the afternoon; the sun was warm, and 12 birds sang in the trees. They'll remember it.\\n\\n")
@@ -85,19 +101,26 @@ def fuzz(n, seed):
     rng = random.Random(seed)
     return ["".join(rng.choice(ALPHABET) for _ in range(rng.randrange(0, 60))) for _ in range(n)]
 
-def made(name, data, options):
-    """tokenizer.bin, the options and the specials of a tokenizer file, as the page's converter makes them"""
+def made(convert, name, data, options):
+    """tokenizer.bin, the options, the specials and the added tokens that are not special of a tokenizer file, as that
+    converter makes them (an older one has no map to write, and writes the spaces of a byte-level vocabulary)"""
+    maps = hasattr(convert, "tokenizer_json_charsmap")
     if name.endswith(".json"):
         parsed = json.loads(data)
         pieces = list(convert.tokenizer_json_pieces(parsed))
-        specials = [t["content"] for t in parsed.get("added_tokens", []) if t.get("special")]
-        return (convert.tokenizer_bin(pieces, len(pieces), charsmap=convert.tokenizer_json_charsmap(parsed)),
-                convert.tokenizer_json_options(parsed), specials)
+        added = parsed.get("added_tokens", [])
+        specials = [t["content"] for t in added if t.get("special")]
+        options = convert.tokenizer_json_options(parsed)
+        extra = dict(charsmap=convert.tokenizer_json_charsmap(parsed), spaces=options["tokenizer_kind"] != "bytebpe") if maps else {}
+        # T143: the converter names the added tokens that are not special as specials, wherever they are written
+        named = sorted({t["content"] for t in added if not t.get("special") and t["content"]}, key=lambda t: (-len(t), t)) if maps else []
+        return convert.tokenizer_bin(pieces, len(pieces), **extra), options, specials, named
     if name.endswith(".model"):
         pieces = list(convert.sentencepiece_pieces(data))
-        return (convert.tokenizer_bin(pieces, len(pieces), charsmap=convert.sentencepiece_charsmap(data)),
-                convert.sentencepiece_options(data), convert.sentencepiece_specials(data))
-    return data, options, ["</s>", "<s>"]
+        extra = dict(charsmap=convert.sentencepiece_charsmap(data)) if maps else {}
+        return (convert.tokenizer_bin(pieces, len(pieces), **extra), convert.sentencepiece_options(data),
+                convert.sentencepiece_specials(data), [])
+    return data, options, ["</s>", "<s>"], []
 
 def build(module, data, options):
     count, offset = 0, 4  # the pieces, counted, up to a sentencepiece model's map (T216)
@@ -108,13 +131,15 @@ def build(module, data, options):
     keys = set(inspect.signature(module.Tokenizer.__init__).parameters) - {"self", "data", "vocab_size", "kind"}
     return module.Tokenizer(data, count, kind=options.get("tokenizer_kind", "bpe"), **{k: options[k] for k in keys if k in options})
 
-def bench(label, name, data, options):
-    data, options, specials = made(name, data, options.to_py() if hasattr(options, 'to_py') else dict(options))
-    old, new = build(old_numpy, data, options), build(llama2_numpy, data, options)
-    specials = [s for s in specials if s and s.encode("utf-8") in old.index][:4]
+def bench(label, name, data, options, old_options):
+    plain = lambda o: o.to_py() if hasattr(o, 'to_py') else dict(o)
+    new_data, new_options, specials, named = made(convert, name, data, plain(options))
+    old_data, old_options, _, _ = made(old_convert, name, data, plain(old_options))
+    old, new = build(old_numpy, old_data, old_options), build(llama2_numpy, new_data, new_options)
+    specials = [s for s in specials if s and s.encode("utf-8") in old.index and s.encode("utf-8") in new.index][:4]
     built = {"old": [], "new": []}
     for r in range(3):
-        for which, module in (("old", old_numpy), ("new", llama2_numpy)):
+        for which, module, data, options in (("old", old_numpy, old_data, old_options), ("new", llama2_numpy, new_data, new_options)):
             began = clock()
             tokenizer = build(module, data, options)
             built[which].append((clock() - began) * 1000)
@@ -125,12 +150,15 @@ def bench(label, name, data, options):
     # and with the tokenizer's specials written in them
     with_specials = [text[:len(text) // 2] + specials[i % len(specials)] + text[len(text) // 2:]
                      for i, text in enumerate(texts)] if specials else []
-    checked = 0
+    checked, differently = 0, []
     for text in texts + with_specials:
-        for named in ((), tuple(specials)):
-            a, b = old.encode(text, named), new.encode(text, named)
+        if old.normalized(text) != new.normalized(text):
+            differently.append(text)  # T216: the model's map against Python's NFKC and the nmt table
+            continue
+        for these in ((), tuple(specials)):
+            a, b = old.encode(text, these), new.encode(text, these)
             if a != b:
-                raise AssertionError(f"{label}: encode({text!r}, {named}) is {b} and was {a}")
+                raise AssertionError(f"{label}: encode({text!r}, {these}) is {b} and was {a}")
             checked += 1
     cells = {}
     for r in range(ROUNDS + 1):
@@ -153,6 +181,21 @@ def bench(label, name, data, options):
         top = sorted(((v[2] / 5 * 1000, f"{k[2]}") for k, v in stats.items()), reverse=True)[:6]
         lines.append(f"  where the {which} encode() of the long text spends its time (tottime ms a call; cProfile slows it): "
                      + ", ".join(f"{name} {ms:.2f}" for ms, name in top))
+    if differently:
+        lines.append(f"  {len(differently)} texts normalized differently, not compared (T216), as "
+                     + ", ".join(repr(text[:24]) for text in differently[:4]))
+    if named:
+        # T143: what the new converter names besides (the list's entry may name its own specials over them)
+        times = {"without": [], "with": []}
+        for r in range(ROUNDS + 1):
+            for which, these in (("without", ()), ("with", tuple(named))):
+                began = clock()
+                for _ in range(20):
+                    new.encode(short, these)
+                if r:
+                    times[which].append((clock() - began) / 20 * 1000)
+        lines.append(f"  the new encode() of the short text with the {len(named)} added tokens its converter names as specials: "
+                     f"{statistics.median(times['with']):.3f} ms, without them {statistics.median(times['without']):.3f} ms")
     row = (f"| {label} | {len(old.encode(short))} | {m[('short', 'old')]:.3f} | {m[('short', 'new')]:.3f} | "
            f"{m[('short', 'old')] / m[('short', 'new')]:.2f}× | {len(old.encode(long))} | {m[('long', 'old')]:.2f} | "
            f"{m[('long', 'new')]:.2f} | {m[('long', 'old')] / m[('long', 'new')]:.2f}× | "
@@ -168,7 +211,8 @@ for (const [label, file] of tokenizers) {
   py.globals.set("NAME", file.name);
   py.FS.writeFile("tokenizer.data", file.data);
   py.globals.set("OPTIONS", py.toPy(file.options ?? {}));
-  const result = py.runPython("bench(LABEL, NAME, open('tokenizer.data', 'rb').read(), OPTIONS)").toJs();
+  py.globals.set("OLD_OPTIONS", py.toPy(file.oldOptions ?? file.options ?? {}));
+  const result = py.runPython("bench(LABEL, NAME, open('tokenizer.data', 'rb').read(), OPTIONS, OLD_OPTIONS)").toJs();
   rows.push(result[0]);
   notes.push(`${label}\n${result[1]}`);
   console.log(result[0]);
