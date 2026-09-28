@@ -85,10 +85,11 @@
 ## これからのタスク
 
 **止めた所（2026-09-28、持ち主の指示「リミットが近い、再開可能な状態で停止」）**: 次の 4 つを途中で止めた。どれもブランチに push 済みで、本線は e359ae1。
-- T129: ブランチ `t129-fetch-edges`（def742d まで push 済み）。持ち主の判断は (2) 案 B（`loadPackage("numpy", { checkIntegrity: false })` で本文を数え、いつも 30 秒の静けさ）、(7) 案 B（"This model is too large for a web page: it needs about N GB of memory, and a browser gives a page 16 GB at most."）。案 A から B への入れ替えは途中（作業ツリー `.claude/worktrees/agent-ac56b78935df3cc6e` に未コミットの変更があるかもしれない）。入れ替えの後に Opus xhigh のレビュー。
+- T129: ブランチ `t129-fetch-edges`（f3cb9a7 まで push 済み）。持ち主の判断は (2) 案 B（`loadPackage("numpy", { checkIntegrity: false })` で本文を数え、いつも 30 秒の静けさ）、(7) 案 B（"This model is too large for a web page: it needs about N GB of memory, and a browser gives a page 16 GB at most."）。案 B への入れ替えはコミット済み（f3cb9a7）。再開したら tests.yml の `full=true` を回してから Opus xhigh のレビュー。
 - T130: ブランチ `t130-kv-unshared`（4f7663e）。Opus xhigh のレビューが途中。持ち主の判断: 隔離されていないページで 64 ビットのメモリが要るモデルは KV を float32 のまま（レビューの直しとして 1 行）。
 - T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
 - T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
+止めた後に確かめた各ブランチの先頭（どれも origin に push 済み）: `t129-fetch-edges` f3cb9a7（案 B への入れ替えはコミット済み。その CI は未確認）、`t130-review` fb04b0b（`t130-kv-unshared` を本線に rebase しただけ、レビューの直しはまだ）、`t224-opus-review` 3ee8738（レビューの途中の AGENTS.md と docs/webgpu.md の書きかけを WIP としてコミット）、`t224-attn-vec-fable` 18d454b（= Fable の確かめ）、`t219-review` f2f421f と `t219-review-probe` 249e2ff（レビューの調べの途中）。
 再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
 
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
