@@ -26,6 +26,8 @@
 // runs it, on the far faster one: sampled and greedy, the steps on the GPU and the counts right (the made-up GPU fails a
 // request whose random numbers, history or settings are not what Python should hand over); and through Python on one
 // that fails on its second request: the generation goes on whole on the CPU (T152's review: JavaScript's null is jsnull).
+// T219: a GPU that samples -1 (SAMPLE's NONE) or an id past the vocabulary: that request refused whole, the CPU from
+// there on, and the status line says why; a model on the GPU alone stops with words and is not loaded again.
 // T205: release() waits for the GPU's worker to say "ended" (a slow one; one that never does, terminated after 5 s; one
 // stopped while it got ready), and so does Llama.release() called from JavaScript through Python, as the page's worker
 // calls it (the review); a browser that does not say the device's memory keeps the steps on the CPU.
@@ -42,7 +44,7 @@ const forwardFile = args.includes("--forward") ? path.resolve(args[args.indexOf(
 // sleep of that long and the answer
 const FAKE = `
 const { parentPort, workerData: line } = require("node:worker_threads");
-let ctl, words, ids, blocks = 0, requests = 0;
+let ctl, words, ids, blocks = 0, requests = 0, asked = 0;
 const nap = new Int32Array(new SharedArrayBuffer(4)), ms = (n) => line.fixed + line.perToken * n;
 parentPort.on("message", (data) => {
   if (data.type === "start") {
@@ -69,8 +71,10 @@ parentPort.on("message", (data) => {
     const odd = data.randoms.length !== (data.settings.temperature ? data.count : 0) || data.history.length > 64 ||
       data.length < data.history.length || data.history.at(-1) !== data.token || !Array.isArray(data.settings.stops);
     const fail = odd || (Boolean(line.failTokensAt) && ++requests >= line.failTokensAt);
+    // T219: a GPU whose outsideAt-th request samples outsideId (-1, SAMPLE's NONE, or one past the vocabulary) last
+    const outside = Boolean(line.outsideAt) && ++asked === line.outsideAt;
     ids[0] = data.count;
-    for (let i = 0; i < data.count; i++) ids[1 + i] = data.token + 1 + i;
+    for (let i = 0; i < data.count; i++) ids[1 + i] = outside && i === data.count - 1 ? line.outsideId : data.token + 1 + i;
     Atomics.store(ctl, words.failed, fail ? 1 : 0);
     Atomics.store(ctl, words.done, data.serial);
     Atomics.notify(ctl, words.done);
@@ -113,7 +117,7 @@ if (isMainThread) {
   process.exit(code);
 } else {
   const { memory, base, size, plan, forwardFile, tokenizer, options } = workerData;
-  const { compileKernels, createForward, endSearch, timePrompts, external } = await import(forwardFile);
+  const { compileKernels, createForward, endSearch, timePrompts, external, OUTSIDE_VOCABULARY } = await import(forwardFile);
   const { pathTable } = await import(path.join(root, "src/bench.js"));
   const kernels = compileKernels(fs.readFileSync(path.join(root, "public/simdkernel_shared.wasm")), fs.readFileSync(path.join(root, "public/simdkernel_relaxed_shared.wasm")));
   const spawn = (data) => new Promise((resolve) => {
@@ -345,8 +349,8 @@ if (isMainThread) {
     }
     return [onGpu, onCpu];
   };
-  const steps = async (name, stepCost, generations, failTokensAt = 0) => {
-    const line = { fixed: 60 * perToken, perToken: 2 * perToken, step: stepCost * cpuStep, failTokensAt };
+  const steps = async (name, stepCost, generations, more = {}) => {
+    const line = { fixed: 60 * perToken, perToken: 2 * perToken, step: stepCost * cpuStep, ...more };
     const gpu = () => {
       const fake = new Worker(FAKE, { eval: true, workerData: line });
       return { postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
@@ -379,10 +383,45 @@ if (isMainThread) {
       /(, answers on the CPU \(faster here\)|^prompts and answers on the CPU \(faster here than WebGPU\))$/.test(seen.status), true);
   }
   {
-    const seen = await steps("the steps, a GPU that fails on its second request", 0.2, 2, 2);
+    const seen = await steps("the steps, a GPU that fails on its second request", 0.2, 2, { failTokensAt: 2 });
     expect("the CPU from the failure on", [...seen], [[4, STEPS - 4], [0, STEPS]]);
     expect(`the status line says why the prompts are on the CPU, and nothing of the answers (${seen.status})`,
       /^prompts on the CPU \(.*failed on a token/.test(seen.status) && !/answers/.test(seen.status), true);
+  }
+  // T219: a GPU whose second request samples an id outside the vocabulary last (what SAMPLE gives for logits that are
+  // not finite: -1, or one past the end): the whole request refused, the CPU takes the steps from there (and would stop
+  // with T195's NOT_FINITE where its own logits were not finite either; here they are), the GPU stopped
+  for (const outsideId of [-1, plan.vocab_size]) {
+    const seen = await steps(`the steps, a GPU that samples ${outsideId} on its second request`, 0.2, 2, { outsideAt: 2, outsideId });
+    expect(`${outsideId}: the CPU from that request on, none of its ids taken`, [...seen], [[4, STEPS - 4], [0, STEPS]]);
+    expect(`${outsideId}: the status line says the GPU sampled outside the vocabulary (${seen.status})`,
+      new RegExp(`^prompts on the CPU \\(the GPU sampled ${outsideId}, outside the vocabulary`).test(seen.status), true);
+  }
+  // T219: a model on the GPU alone (T156's direct) cannot take the step on the CPU: generateMany stops with words (the
+  // page says them), and does not load the model again on the CPU (onLost: the CPU's logits would be those of the same
+  // weights); a request of good ids after it is taken on the GPU as before
+  for (const outsideId of [-1, plan.vocab_size]) {
+    const line = { fixed: 10 * perToken, perToken: 0.05 * perToken, step: 0.2 * cpuStep, outsideAt: 1, outsideId };
+    const fake = new Worker(FAKE, { eval: true, workerData: line });
+    const gpu = () => ({ postMessage: (data) => fake.postMessage(data), set onmessage(f) { fake.on("message", (data) => f({ data })); },
+      set onerror(f) { fake.on("error", (error) => f({ message: error.message })); }, terminate: () => fake.terminate() });
+    let lost = null;
+    const engine = createForward({ memory, base, size, kernels, plan, gpu, direct: { onLost: (why) => { lost = why; } } });
+    await engine.gpu;
+    engine.newGeneration();
+    const fed = prompt(16);
+    engine.forwardMany(fed, 0);
+    let thrown = null, first;
+    try {
+      first = engine.generateMany(100, fed.length, [...fed, 100].slice(-64), fed.length + 1, 4, 0, 0.9, 1, [], []);
+    } catch (error) {
+      thrown = error.message;
+    }
+    const second = thrown ? engine.generateMany(100, fed.length, [...fed, 100].slice(-64), fed.length + 1, 4, 0, 0.9, 1, [], []) : undefined;
+    say(`T219: on the GPU alone, ${outsideId} sampled: ${thrown ?? `no error (${JSON.stringify(first)})`}; lost ${lost}; then ${JSON.stringify(second)}`);
+    expect(`${outsideId} on the GPU alone: stopped with words, not loaded again on the CPU, the GPU still taking the steps`,
+      [thrown === OUTSIDE_VOCABULARY, lost, second], [true, null, [101, 102, 103, 104]]);
+    await engine.release();
   }
   // T205: the next model is read after the GPU's worker let go of its device (an iPhone's tab went down in
   // /benchmark/'s rounds where the one before still held it). release() waits for its "ended": a slow let-go of 400 ms

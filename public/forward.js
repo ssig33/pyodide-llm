@@ -412,6 +412,9 @@ const BINDS_AT = 256;
  * the widened int8 on the GPU, 1.125 bytes a weight against six bits' 0.875, would not fit either: T155's review),
  * heads of a multiple of 4, and q, k and v and gate and up each one range of a buffer the device binds (gpu.js's
  * tokensLayout says the last word: a GPU that refuses then means the model is loaded again on the CPU). */
+// T219: what a model on the GPU alone says where the GPU sampled an id outside the vocabulary (its logits were not
+// finite numbers, most likely: the words of T195's NOT_FINITE, llama2_numpy.py), since no CPU can take the step again
+export const OUTSIDE_VOCABULARY = "The model computed logits on the GPU that are not finite numbers (NaN or infinity), so no token can be drawn: its weights are broken or its numbers overflowed.";
 export function gpuOnlyUnfit(header, dtype, { arch = "llama", bias = false, qk_norm = false, head_dim = 0 } = {}, adapter, force = {}) {
   const [dim, hidden, , heads, kvHeads] = header;
   const headSize = head_dim || dim / heads, qDim = heads * headSize, kvDim = kvHeads * headSize;
@@ -1626,6 +1629,17 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
         stopGpu(`the GPU sampled ${sampled} of ${count} tokens`);
         return undefined;
       }
+      // T219: an id outside the vocabulary is what SAMPLE gives for logits that are not finite numbers (NONE, -1: T195,
+      // WGSL lets a GPU take NaN and infinities as absent). The step is refused, nothing of it written: the CPU takes it
+      // again and stops where its own logits are not finite either (T195's NOT_FINITE), and the GPU, whose numbers are
+      // no longer trusted, stops here. A model on the GPU alone cannot take the step on the CPU: it stops, said in words
+      const ids = Array.from(words.subarray(1, 1 + sampled));
+      const outside = ids.find((id) => !(id >= 0 && id < vocab));
+      if (outside !== undefined) {
+        if (direct) throw new Error(OUTSIDE_VOCABULARY);
+        stopGpu(`the GPU sampled ${outside}, outside the vocabulary of ${vocab}`);
+        return undefined;
+      }
       // the keys and values of the positions sampled, float16 in the staging place as a prompt's block's (T147), into the
       // cache (T160's review of T152: a float32 cache, a grouped-query model's, widens them as a prompt's)
       for (let l = 0; l < layers; l++) {
@@ -1639,7 +1653,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
       gpuSampled += sampled;
       if (sampled === count) steps.gpu((performance.now() - began) / count);
       if (tokenRecheck === "gpu") tokenRecheck = null;
-      return Array.from(words.subarray(1, 1 + sampled));
+      return ids;
     },
     forward(token, pos, needLogits = true) {
       if (search && needLogits) {
