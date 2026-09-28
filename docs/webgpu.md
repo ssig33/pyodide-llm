@@ -62,8 +62,9 @@ reports, the page keeps both and measures, as above. Chromium reports at most 8,
 there both copies may take up to 6.5 GiB, so the models of the list up to 2B keep both, and those of 3B and more do
 not.
 
-Otherwise a Llama-shaped int8 model whose tokens the GPU can write goes on the GPU alone: the layers' matrices go to
-the GPU as they are converted or read, and only the rest (the embedding, the norms) stays in the CPU's memory. Nothing
+Otherwise a Llama-shaped int8 model whose tokens the GPU can write goes on the GPU alone: the layers' matrices and the
+embedding and classifier go to the GPU as they are converted or read, and only the norms stay in the CPU's memory. The
+GPU embeds the prompt's tokens itself and keeps the keys and values; nothing but the chosen tokens comes back. Nothing
 then runs on the CPU. On a device that reports 8 there is no limit to its size, as there is none for the CPU alone (a
 7B model takes about 9.2 GB there); on a smaller device it must fit in half of the memory. A browser that does not
 report the memory (Safari, Firefox) does not put a model on the GPU alone, because it keeps the answer on the CPU.
@@ -79,8 +80,9 @@ browser version or new shaders make the page weigh the two again. Without a run 
 the GPU. If the GPU fails, the page also loads the model again on the CPU.
 
 A model converted from Hugging Face is kept as it arrives. 6-bit models are not put on the GPU alone: the GPU holds
-them widened to int8, which is larger. The GPU alone still keeps the embedding and a copy of the keys and values on
-the CPU, so for Llama 3.2 3B it takes about 5.3 GB against 4.4 GB on the CPU alone (an estimate, not measured).
+them widened to int8, which is larger. On the GPU alone, Llama 3.2 3B takes about 4.1 GB in all (4.09 GB on the GPU
+and 0.02 GB on the CPU's side) against 4.7 GB on the CPU alone, and Llama 3.1 Swallow 8B about 9.0 GB against 10.9 GB
+(estimates for 4096 positions, without the page and Pyodide themselves; not measured).
 
 ## Where the GPU is not used
 
@@ -168,8 +170,7 @@ work) and say only that the shaders are right, not how fast a GPU is.
 
 ## Next
 
-In order: keeping less on the CPU for a model on the GPU alone (the embedding and the copy of the keys and values);
-then, with the owner's numbers, the sampling in chunks in the page, and whatever the breakdown of a layer shows to be slow. A seed gives the same text again on the same device and the
+In order, with the owner's numbers: the sampling in chunks in the page, and whatever the breakdown of a layer shows to be slow. A seed gives the same text again on the same device and the
 same path, but not across the CPU and the GPU, whose forward passes differ in the last digits (the CPU rounds the
 activations to 7 or 8 bits). Either side takes the same random number for the same token; but every 8 answers, the
 first tokens of one go to the side not chosen, so that answer may differ from an earlier one with the same seed. The
