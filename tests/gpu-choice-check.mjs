@@ -182,6 +182,11 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   assert.match(gpuOnlyUnfit(oneB, "int6", {}, adapter), /int6/);
   // stories15M (dim 288, 6 heads): k starts at 288 × 288 weights, no multiple of 2048 (T152)
   assert.match(gpuOnlyUnfit([288, 768, 6, 6, 6, 32000, 256], "int8", {}, adapter), /would not start/);
+  // T220: by the device's 256, not by what the adapter could give: stories15M's k starts on 64 (82944 values, 10368
+  // bytes of scales), and gpu.js's device, which asks for no alignment, binds on 256 and would refuse it
+  const loose = { ...adapter, limits: { ...adapter.limits, minStorageBufferOffsetAlignment: 64 } };
+  assert.match(gpuOnlyUnfit([288, 768, 6, 6, 6, 32000, 256], "int8", {}, loose), /would not start/);
+  assert.equal(gpuOnlyUnfit(oneB, "int8", {}, loose), null);
   // Qwen2.5 7B's shape (no biases here): gate and up are 135.8 MB (T152's (d)), past 128 MiB
   assert.match(gpuOnlyUnfit([3584, 18944, 28, 28, 4, 152064, 4096], "int8", {}, adapter), /past a buffer/);
 }

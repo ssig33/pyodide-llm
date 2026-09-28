@@ -320,9 +320,9 @@ let gpuAdapter = null;
 // (and its key, T148's: what the page kept of the model on this device holds only for the same, shaders.js's deviceKey)
 const adapterAsked = !hasWebGpu ? Promise.resolve() : navigator.gpu.requestAdapter().then(async (adapter) => {
   if (!adapter) return;
-  const { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } = adapter.limits;
+  const { maxStorageBufferBindingSize, maxBufferSize } = adapter.limits;
   gpuAdapter = { fallback: Boolean(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter),
-    limits: { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment } };
+    limits: { maxStorageBufferBindingSize, maxBufferSize } };
   try {
     const wgsl = await import(new URL(`shaders.js${self.location.search}`, import.meta.url));
     gpuAdapter.key = wgsl.deviceKey(adapter);

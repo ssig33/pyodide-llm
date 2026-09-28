@@ -400,6 +400,12 @@ export function aloneVerdict({ size, layerWeights, cpu = {}, gpu = {}, usage = U
 export const aloneHolds = (alone, key, cpu) => Boolean(alone && key && alone.key === key && cpu &&
   alone.cpu?.GBps === cpu.GBps && alone.cpu?.promptGMACs === cpu.promptGMACs);
 
+// T220: where the GPU's device binds a buffer (minStorageBufferOffsetAlignment). gpu.js asks its device for the
+// adapter's limits of size but not for this one, so the device has WebGPU's default, 256, whatever smaller value the
+// adapter says it could give: gpuOnlyUnfit judges by the device's value, the one gpu.js's tokensLayout and piecesOf
+// read (asking the device for the adapter's value instead would move where every model's pieces start on the GPU, the
+// prompt's too, for no model of the list: they all start on 256, T213)
+const BINDS_AT = 256;
 /** T156: why a model cannot go on the GPU alone, from its header, dtype and form before its bytes come, and the
  * adapter the worker asked for ({ fallback, limits }); null where it can. A Llama whose steps the GPU takes (T152: no
  * biases, norms of the heads or a part of a head turned yet), int8 (six bits are for a device short of memory, where
@@ -414,11 +420,11 @@ export function gpuOnlyUnfit(header, dtype, { arch = "llama", bias = false, qk_n
   if (arch !== "llama" || bias || qk_norm) return "the GPU's steps do not take this model yet";
   if (dtype !== "int8") return `${dtype} weights stay on the CPU`;
   if (headSize % 4) return "heads of a size that is no multiple of 4";
-  const { maxStorageBufferBindingSize, maxBufferSize, minStorageBufferOffsetAlignment: at } = adapter.limits;
+  const { maxStorageBufferBindingSize, maxBufferSize } = adapter.limits;
   const binds = Math.min(maxStorageBufferBindingSize, maxBufferSize);
   // (a joined matrix's parts start where the device binds, the scales a quarter of the values' count on)
   const starts = [qDim * dim, (qDim + kvDim) * dim, hidden * dim];
-  if (starts.some((values) => values % at || (values / 8) % at)) return "q, k and v or gate and up would not start where this GPU binds a buffer";
+  if (starts.some((values) => values % BINDS_AT || (values / 8) % BINDS_AT)) return "q, k and v or gate and up would not start where this GPU binds a buffer";
   if ((qDim + 2 * kvDim) * dim > binds || 2 * hidden * dim > binds || dim * Math.max(qDim, hidden) > binds) return "a layer's matrices are past a buffer of this GPU";
   return null;
 }
