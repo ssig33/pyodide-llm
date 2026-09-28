@@ -71,7 +71,7 @@ for (let count = 2; count <= most; count++) {
             const off = Math.abs(F[out / 4 + h * hs + i] - want);
             if (!(off <= worst)) worst = Number.isNaN(off) ? NaN : Math.max(worst, off);
             if (!(off <= LINE)) {
-              if (failed < 5) console.log(`${name}: ${count} positions, the two far largest at ${a} and ${b}, head ${h} (${top > 0 ? "above" : "below"} 0): ${F[out / 4 + h * hs + i]} where ${want.toFixed(6)} is right`);
+              if (failed < 5) console.log(`${name}: ${count} positions, the two far largest at ${a} and ${b}, head ${h} (${levels[h].top > 0 ? "above" : "below"} 0): ${F[out / 4 + h * hs + i]} where ${want.toFixed(6)} is right`);
               failed++;
               break;
             }
