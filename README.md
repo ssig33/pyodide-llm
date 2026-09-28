@@ -117,7 +117,7 @@ files are read where they are: nothing is uploaded. Choose the files together:
 - Optionally a `.json` with what differs from llama2.c's conventions, shaped like an entry of `src/models.js`:
 
 ```json
-{ "name": "tiny-lm", "options": { "tokenizer_kind": "unigram", "nfkc": true, "stop_tokens": [1, 2] },
+{ "name": "tiny-lm", "options": { "tokenizer_kind": "unigram", "stop_tokens": [1, 2] },
   "generation": { "steps": 256, "temperature": 0.7, "topp": 0.9, "repetition_penalty": 1.3 }, "prompt": "これからの流行りは" }
 ```
 
