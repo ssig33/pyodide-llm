@@ -2,7 +2,7 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { aloneHolds, BOTH_ON_8, aloneVerdict, gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, layerWeightsOf, placer, PROMPTS_CPU,
+import { aloneHolds, BOTH_ON_8, aloneVerdict, gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, gpuHoles, layerWeightsOf, placer, PROMPTS_CPU,
   PROMPTS_GPU, PROMPTS_UNTIMED, promptTimes, tokenTimes, USAGE_UNKNOWN, weightsPlace } from "../public/forward.js";
 import { deviceKey, halvesOf } from "../public/shaders.js";
 import { usedAfter } from "../src/bench.js";
@@ -205,9 +205,12 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
     const count = shape.reduce((a, b) => a * b, 1);
     end += int8 ? count + count / 8 : count * 4;
   }
-  const size = end, holes = layerHoles(tensors), place = placer(holes);
-  assert.equal(holes.length, 7);
-  assert.equal(place(tensors.rms_ffn_weight.offset), tensors.wq.offset, "the norm after wo goes where wq began");
+  const size = end, holes = gpuHoles(tensors), place = placer(holes);
+  // (T210: the embedding too, which is the classifier here: one stretch)
+  assert.equal(holes.length, 8);
+  assert.equal(gpuHoles({ ...tensors, wcls: tensors.token_embedding_table }).length, 8, "a shared classifier is one stretch");
+  assert.equal(place(tensors.rms_att_weight.offset), 28, "the first norm goes where the embedding began");
+  assert.equal(place(tensors.rms_ffn_weight.offset), 28 + 2 * 64 * 4, "the norm after wo goes after the first norm");
   const checkpoint = Uint8Array.from({ length: size }, (_, i) => (i * 7 + 3) & 255);
   const memory = new WebAssembly.Memory({ initial: 2, maximum: 4, shared: true }), base = 64;
   let flow;
@@ -235,6 +238,12 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
   // what gpu.js opens with: each layer's values and scales where they start in the checkpoint
   const plan = gpuOnlyPlan([64, 96, 2, 4, 2, 100, 32], tensors);
   assert.deepEqual(plan.matrices.w2.layers[1], [tensors.w2.offset + 64 * 96, tensors.w2.scales + (64 * 96 / 32) * 4]);
+  // T210: and the tables, where they start in the checkpoint (the embedding null where the classifier is it)
+  const e = tensors.token_embedding_table;
+  assert.deepEqual(plan.tables, { classifier: { rows: 100, n: 64, at: [e.offset, e.scales] }, embedding: null });
+  const apart = gpuOnlyPlan([64, 96, 2, 4, 2, 100, 32], { ...tensors, wcls: tensor(end, [100, 64], true) });
+  assert.deepEqual(apart.tables, { classifier: { rows: 100, n: 64, at: [end, end + 6400] }, embedding: { rows: 100, n: 64, at: [e.offset, e.scales] } });
+  assert.equal(gpuHoles({ ...tensors, wcls: tensor(end, [100, 64], true) }).length, 9, "a classifier of its own is a stretch of its own");
 }
 
 // T156 (the owner, 2026-09-27): a model on the GPU alone weighed on the prompts too, by the page's use, and the verdict

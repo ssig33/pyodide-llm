@@ -705,7 +705,7 @@ function gpuOnlyWeightsFor(size, header, options, after, deviceMemory) {
       "on the CPU (a new run of /benchmark/'s CPU section, another browser version or new shaders weigh the two again)");
   }
   if (!eligible) return forwardModule.weightsPlace({ cpu, gpu, deviceMemory });
-  const tensors = placesOf(header, dtype, form), stored = size - forwardModule.layerHoles(tensors).reduce((sum, [a, b]) => sum + b - a, 0);
+  const tensors = placesOf(header, dtype, form), stored = size - forwardModule.gpuHoles(tensors).reduce((sum, [a, b]) => sum + b - a, 0);
   const gpuOnly = stored + afterCheckpoint(header, stored, { ...options, direct: true }, true);
   return { ...forwardModule.weightsPlace({ cpu, gpuOnly, gpu, deviceMemory, eligible, forced: gpuForce.only }), tensors, stored, gpuOnly };
 }

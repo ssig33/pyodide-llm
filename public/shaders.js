@@ -2540,6 +2540,39 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         }
     }
 }`;
+// T210: the rows of a prompt's block from the embedding, for a model on the GPU alone (the CPU holds no embedding
+// then): EMBED's loop, a workgroup a token (workgroup_id.y) of ids, into its row of dst. Bindings: 0 the table, 1 its
+// scales, 2 the block's ids, 3 x (the block's rows, dense), 4 the row's width and (T209) the piece's first row and rows.
+// llama.cpp's get_rows.wgsl reads its row's index from idx and writes a row of dst for each (i_dst1: a row of the
+// output an index); the range of a piece is T209's
+export const EMBED_ROWS = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> table: array<u32>;
+@group(0) @binding(1) var<storage, read> scales: array<f32>;
+@group(0) @binding(2) var<storage, read> ids: array<u32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(4) var<uniform> shape: vec4<u32>;
+
+fn get_byte_i32(value: u32, index: u32) -> i32 {
+    return bitcast<i32>(((value >> (index * 8)) & 0xFF) << 24) >> 24;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let n = shape.x;
+    let words = n / 4u;
+    let row = ids[wid.y] - shape.y;
+    if (shape.z != 0u && row >= shape.z) {
+        return;
+    }
+    let out = wid.y * n;
+    for (var word = lid.x; word < words; word += 256u) {
+        let q_packed = table[row * words + word];
+        let d = scales[(row * n + word * 4u) / 32u];
+        for (var k = 0u; k < 4u; k++) {
+            dst[out + word * 4u + k] = f32(get_byte_i32(q_packed, k)) * d;
+        }
+    }
+}`;
 
 // What SAMPLE and the stages of the sampling in chunks (T191, below) share: the constants, the workgroup's memory of
 // the reductions, and cumsum.wgsl's scan
