@@ -2,7 +2,7 @@
 //   node tests/gpu-choice-check.mjs
 // Made-up times: the CPU's ms a token of its blocks, gpu.js's two blocks timed as it starts, the blocks the GPU then ran.
 import assert from "node:assert/strict";
-import { aloneHolds, aloneVerdict, gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, layerWeightsOf, placer, PROMPTS_CPU,
+import { aloneHolds, BOTH_ON_8, aloneVerdict, gpuBytes, gpuLine, gpuOnlyPlan, gpuOnlyUnfit, gpuOnlyWeights, layerHoles, layerWeightsOf, placer, PROMPTS_CPU,
   PROMPTS_GPU, PROMPTS_UNTIMED, promptTimes, tokenTimes, USAGE_UNKNOWN, weightsPlace } from "../public/forward.js";
 import { deviceKey, halvesOf } from "../public/shaders.js";
 import { usedAfter } from "../src/bench.js";
@@ -139,17 +139,25 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
 // both), else the GPU alone where the model can be and fits (8: no limit, as the CPU alone has none), else the CPU
 {
   const GB = 2 ** 30;
-  // (the owner, 2026-09-27: both up to 6 GiB on a device that says 8. The second review of T156, the list's configs with
-  // footprint() and gpuBytes(), 4096 positions: sarashina2.2 1B 2.81 + 1.94 GB (4.42 GiB) both as before; llm-jp-3.1
-  // 1.8B 3.543 + 2.910 GB (6.010 GiB, no GQA: its keys and values are 0.8 GB on either side) 11 MB past: the GPU alone)
-  assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 4.5 * GB }, "Llama 3.2 1B on 8: both");
+  // (the owner, 2026-09-27: both up to 6.5 GiB on a device that says 8, so that the list's models up to 2B stay as they
+  // were and 3B and larger go on the GPU alone. The second review of T156, the list's configs with footprint() and
+  // gpuBytes(), 4096 positions: sarashina2.2 1B 2.81 + 1.94 GB (4.42 GiB) and llm-jp-3.1 1.8B 3.543 + 2.910 GB (6.010
+  // GiB, no GQA: its keys and values are 0.8 GB on either side; 11 MB past the first line of 6 GiB) both as before;
+  // Qwen2.5 3B 4.10 + 3.63 GB (7.20 GiB, not eligible: its biases) the CPU with its layers past the room left;
+  // Llama 3.2 3B 8.83 GB the GPU alone)
+  assert.equal(BOTH_ON_8, 6.5 * GB, "the line of both on a device that says 8");
+  assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 5 * GB }, "Llama 3.2 1B on 8: both");
   assert.equal(weightsPlace({ cpu: 2.812e9, gpuOnly: 0.98e9, gpu: 1.939e9, deviceMemory: 8, eligible: true }).mode, "both", "sarashina2.2 1B on 8: both");
-  assert.equal(weightsPlace({ cpu: 3.543e9, gpuOnly: 1.72e9, gpu: 2.910e9, deviceMemory: 8, eligible: true }).mode, "gpu", "llm-jp-3.1 1.8B: 6.01 GiB, past 6");
-  assert.equal(weightsPlace({ cpu: 3 * GB, gpuOnly: 0.6 * GB, gpu: 3 * GB, deviceMemory: 8, eligible: true }).mode, "both", "6 GiB: both");
+  assert.equal(weightsPlace({ cpu: 3.543e9, gpuOnly: 1.72e9, gpu: 2.910e9, deviceMemory: 8, eligible: true }).mode, "both", "llm-jp-3.1 1.8B: 6.01 GiB, within 6.5");
+  assert.equal(weightsPlace({ cpu: 3.25 * GB, gpuOnly: 0.6 * GB, gpu: 3.25 * GB, deviceMemory: 8, eligible: true }).mode, "both", "6.5 GiB: both");
+  assert.equal(weightsPlace({ cpu: 3.3 * GB, gpuOnly: 0.6 * GB, gpu: 3.3 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "6.6 GiB: the GPU alone");
+  const qwen3B = weightsPlace({ cpu: 4.103e9, gpu: 3.627e9, deviceMemory: 8 });
+  assert.ok(qwen3B.mode === "cpu" && qwen3B.gpuRoom < 3.273e9, "Qwen2.5 3B on 8: the CPU, its layers (3.27 GB) past the room left");
+  assert.equal(weightsPlace({ cpu: 4.9e9, gpuOnly: 1.3e9, gpu: 3.93e9, deviceMemory: 8, eligible: true }).mode, "gpu", "Llama 3.2 3B on 8: the GPU alone");
   assert.equal(weightsPlace({ cpu: 4.4 * GB, gpuOnly: 1.2 * GB, gpu: 4.1 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "3B on 8: the GPU alone");
   assert.equal(weightsPlace({ cpu: 9.2 * GB, gpuOnly: 1.5 * GB, gpu: 8 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "7B on 8: no limit");
   const notEligible = weightsPlace({ cpu: 4.4 * GB, gpu: 4.1 * GB, deviceMemory: 8 });
-  assert.ok(notEligible.mode === "cpu" && Math.abs(notEligible.gpuRoom - 1.6 * GB) < 1, "not eligible: the CPU, 1.6 GiB for the GPU's layers");
+  assert.ok(notEligible.mode === "cpu" && Math.abs(notEligible.gpuRoom - 2.1 * GB) < 1, "not eligible: the CPU, 2.1 GiB for the GPU's layers");
   assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.7 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "cpu", "1B on 4 GB: 2.1 GB past 2");
   assert.equal(weightsPlace({ cpu: 1.5 * GB, gpuOnly: 0.3 * GB, gpu: 1.4 * GB, deviceMemory: 4, eligible: true }).mode, "gpu", "within 2 GB: the GPU alone");
   assert.equal(weightsPlace({ cpu: 0.1 * GB, gpuOnly: 0.05 * GB, gpu: 0.1 * GB, deviceMemory: 8, eligible: true, forced: true }).mode, "gpu", "?gpuTest=only");

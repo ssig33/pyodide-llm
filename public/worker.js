@@ -631,7 +631,7 @@ function weightsBuffer(size, header, options, keep) {
     // T148: the layers on the GPU are a second copy of them, in the same memory where the GPU is a phone's or an
     // Apple's: both, with the rest of this model, within half of what the device says it has (as src/models.js's
     // weightsFor asks for six bits past half). T156: a model that does not fit so goes on the GPU alone where it can
-    // (the owner's B, 2026-09-27: forward.js's weightsPlace; the double copy held to 6 GiB where the device says 8),
+    // (the owner's B, 2026-09-27: forward.js's weightsPlace; the double copy held to 6.5 GiB where the device says 8),
     // decided before any memory is made for it (a memory of the whole checkpoint would be one too many, T96)
     const deviceMemory = self.navigator?.deviceMemory ?? 4;
     // T205: a browser that does not say (Safari, Firefox) keeps a generation's steps (the classifier and the embedding
