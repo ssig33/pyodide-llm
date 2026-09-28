@@ -84,6 +84,13 @@
 
 ## これからのタスク
 
+**止めた所（2026-09-28、持ち主の指示「リミットが近い、再開可能な状態で停止」）**: 次の 4 つを途中で止めた。どれもブランチに push 済みで、本線は e359ae1。
+- T129: ブランチ `t129-fetch-edges`（def742d まで push 済み）。持ち主の判断は (2) 案 B（`loadPackage("numpy", { checkIntegrity: false })` で本文を数え、いつも 30 秒の静けさ）、(7) 案 B（"This model is too large for a web page: it needs about N GB of memory, and a browser gives a page 16 GB at most."）。案 A から B への入れ替えは途中（作業ツリー `.claude/worktrees/agent-ac56b78935df3cc6e` に未コミットの変更があるかもしれない）。入れ替えの後に Opus xhigh のレビュー。
+- T130: ブランチ `t130-kv-unshared`（4f7663e）。Opus xhigh のレビューが途中。持ち主の判断: 隔離されていないページで 64 ビットのメモリが要るモデルは KV を float32 のまま（レビューの直しとして 1 行）。
+- T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
+- T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
+再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。
+
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
 - 根拠: レビューのサブエージェントが worker.js を Node の `vm` で偽の fetch・Cache API・ストリームの上で動かす試験台を作り（T97・T118・T119、約 70 件）、次を見つけた（直したものは各項のレビューの行）。
 - (1) T118: 版の解決（`resolvePyodideVersion`、data.jsdelivr.com）に期限が無い。つながったまま答えないと「Loading Pyodide」のまま止まる。案: 包み（`watchArrivals()`）を先に入れ、版の解決も段の 1 つにする（そうするとモデルの全部品が数えられ、Pyodide の止まりの発見はモデルの取得が終わってから 30 秒後になる）。
