@@ -30,8 +30,11 @@ export function keptName(model) {
  * model's normalizer (the review of T126: rinna's newlines); 6: a template's strftime_now() as {date:format}, filled
  * when the prompt is sent, and or / and, comments and escapes as Jinja reads them (the review of T127); 7: the
  * rms_norm_eps of a model whose is not 1e-5 (T124: the Qwen2.5 of the list, TinySwallow, DeepSeek-R1 and llm-jp-4, at 1e-6);
- * 8: {prompt:trim} for a template that trims what was typed (T138: Llama 3.1 and 3.2, Swallow 8B). */
-export const CONVERTER = 8;
+ * 8: {prompt:trim} for a template that trims what was typed (T138: Llama 3.1 and 3.2, Swallow 8B); 9: the batch the
+ * owner held for one version (2026-09-28): the added tokens that are not special as specials, the BOS the tokenizer
+ * names, a GGUF's padding as empty pieces, a byte-level tokenizer.bin's own U+2581 (T143), and a sentencepiece
+ * model's charsmap after the pieces in place of the nfkc and nmt options (T216). */
+export const CONVERTER = 9;
 const converterOf = (manifest) => manifest.converter ?? 1;
 /** The names a model's conversion may be kept under: its bits, or with none asked for, either of the two the worker
  * may choose (T115) */
