@@ -1016,8 +1016,12 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 ### T211 [文書] README の「`?hf=` は Q8_0 GGUF も読む」を正す — 状態: 未着手（2026-09-27、T203 のレビューが見つけた。T169 から。規模 小）
 - ページの `?hf=` とフォルダは safetensors しか開かない。文を直すか、`?hf=` に GGUF を足すかを決める（足すなら T203 の「GGUF だけの道は BOS と EOS の無いものを断る」を守る）。
 
-### T212 [試験] Qwen3 の safetensors の道の固定値を残す — 状態: 未着手（2026-09-27、T203 のレビューから。T204 と同じ種類の穴。規模 小）
+### T212 [試験] Qwen3 の safetensors の道の固定値を残す — 状態: **レビュー待ち**（2026-09-27、T203 のレビューから。T204 と同じ種類の穴。規模 小。ブランチ `t212-fixed-qwen3`、Opus medium）
 - T203 で固定値の Qwen3 0.6B が GGUF の道になり、Qwen3 の safetensors の道（`?hf=` の Qwen3）の実物の固定値が無くなった。
+- **やったこと（2026-09-27）**: `tests/fixed_outputs.py` に `SAFETENSORS`（`hf-qwen3-0.6b-safetensors` → `hf-qwen3-0.6b`）を足した: 一覧の項目（書式 `QWEN3_AT_ONCE`・options・プロンプトはそのまま）の重みだけを、語彙の原本（`Qwen/Qwen3-0.6B@c1899de`）の `model.safetensors`・`config.json`・トークナイザの候補（ページの `hfEntry()` と同じ名前）に替えた作り物の項目。一覧に項目は足していない。float32 のチェックポイントは書かせた後に消す（Qwen3 0.6B は 1 つ 2.4 GB で、GGUF の道と合わせて 2 つ）。browsers.yml の小さい組の取得は 1.5 GB 増える。
+- **固定した文**: 「これからの流行りを3つ挙げてください。」→「以下のような3つの今流行りのトレンドを挙げます：\n\n」。T124 で safetensors の道から固定し人が読んだ文と同じ（GGUF の道とも同じ）なので `--write` はしていない（fixture に同じ文を足した）。**人が読む決まりなので、レビューでも読んでほしい。**
+- **CI**（tests.yml の軽い組 + `extra=`、run 36360204245、Xeon 6973P-C）: 軽い組は通り、固定値は 7 つとも ok。**わざと壊して**（`--only=hf-qwen3-0.6b-safetensors`）5 つとも落ちた: 変換器の `has_qk_norm` を偽に（「-mail-mail-mail /*!< Mark-mail …」）、エンジンが head の norm を飛ばす（同じ文）、norm の重みを `("permute", 1)` で並べ替えない（「�śrö flutter Uncategorized …」）、`checkpoint_form` の head_dim を 0 に（変換器が「q_proj.weight is (2048, 1024), not (1024, 1024)」で断る）、attention の尺度を dim / heads の head で（「今後、以下のような**3つの現象やトレンド**が増」: まともな文でも固定値と違えば落ちる）。ランナーの空きは終わりで 80 GB。
+- **CI で回すもの**: browsers.yml の huggingface の small（固定値の段は small のジョブだけ）。
 
 ### T213 [バグ] gpu-prompt.yml の全部の組の Dawn で、stories15M の歩が FAILED — 状態: **レビュー待ち**（2026-09-27、T205 と T156 のレビューが見つけた。T152 からの落ち。ブランチ `t213-gpucheck`、Opus medium。規模 小）
 - 「a token … would not start where this GPU binds a buffer — FAILED」（本線 002112b の run 36345823499 の 4 ジョブで同じ）。stories15M は束ねた範囲が 256 バイトに揃わないので、生成の歩は CPU に置くのが正しい振る舞い。gpu-check の `stepsRight()` がそれを落ちと数えている見込み（T152 のレビューの should 6 の分類器の件と同じ形）。毎晩の全部の組が落ちるので急ぐ。
