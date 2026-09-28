@@ -1136,7 +1136,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 ### T221 [バグ] 一覧の Qwen3 の手書きの `specials` が、変換器の広い並びを上書きしている — 状態: **レビュー待ち**（2026-09-28、T143 のレビューの「あれば良い」(i)。規模 小。ブランチ `t221-qwen3-specials`、Opus medium）
 - T143 で変換器が special でない追加のトークンを全部 `specials` に入れるようになったのに、一覧の Qwen3 の 12 項目の手書きの `specials`（`qwen3`）が項目の options として勝ち、`<tool_call>` などを消している（打つと綴られ、本物は 1 つ）。一覧から外すだけで `CONVERTER` に当たらない。DeepSeek は手書きのまま（変換器が書式から外すので）。format_check で確かめる。
 - **やったこと（2026-09-28）**: 元ネタは無い（一覧の options だけ）。一覧の Qwen3 の 12 項目の `options` を `{}` にし、`qwen3` の定数を外した。変換器（T143）は special でない追加のトークンを全部、special のものは本物の書式に書かれたもの（`<|im_start|>`・`<|im_end|>`）を `specials` に入れるので、すぐ答える形の手書きの書式（`<think>`・`</think>` を書く）もそのまま読める。保存した変換の options は `CONVERTER` 9 の変換器のもの（その前の保存は T143 で使われなくなった）なので、`CONVERTER` は上げない。`tests/format_check.py` に `--prompt <text>`（PROMPTS の後に足すプロンプト、何回でも）を足した: 訪問者が打つ `<tool_call>` などを、そのモデルたちにだけ見る。
-- **CI**: 下に。
+- **CI（run 36367360400、tests.yml の full、EPYC 9V74、`extra=` で format_check）**: 全部通った（suite 265 秒）。format_check の全部の項目は ok 38・known 4・none 11・DIFF 0 で T216 の回と同じ（Qwen3 の 12 項目も 9/9）。足したプロンプト `<tool_call>{"name": "f"}</tool_call> と <|fim_prefix|>x typed` で Qwen3 の 12 項目は 10/10。`--hf` では考える形の 7 つが 10/10、すぐ答える形の 5 つは 0/10（一覧が空の think を手で書く訳そのもの、T143 の記録と同じ）。**わざと戻して**（同じ run で main の `src/models.js` を読む）: 12 項目とも 9/10 で exit 1（足したプロンプトだけが違う）。**あれば良い（やらない）**: DeepSeek の手書きの `specials` も同じく `<tool_call>` などを消している（変換器の並びに `<｜begin▁of▁sentence｜>` を足した並びを書けば直る。今の 9 つのプロンプトには出ない）。
 
 ### T222 [性能] 正規化の map を鍵の始まりうるバイトからだけ辿る — 状態: 未着手（2026-09-28、T143 のレビューの「あれば良い」(ii)。規模 小）
 - 根の子のあるバイトを `re` で探し、間は写すだけ（約 10 行）。Pyodide の arm64 で日本語の `replaced()` 1.35 倍、tiny-lm の 67 トークンの encode 0.425 → 0.381 ms、英語 1.03 倍（レビューの見積もり）。3 つの map の 42 万の文で今の形と同じ文になることを試験で見る。
