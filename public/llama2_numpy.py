@@ -151,6 +151,7 @@ class Charsmap:
         units, root = self.units, self.offset(self.units[0])
         begins = bytes(byte for byte in [*range(0x80), *range(0xC0, 0x100)]
                        if root ^ byte < len(units) and units[root ^ byte] & 0x800000FF == byte)
+        self.starts = frozenset(begins)  # a walk begins at once where one is, without a search
         self.begins = re.compile(b"[" + re.escape(begins) + b"]") if begins else None
 
     @staticmethod
@@ -159,14 +160,14 @@ class Charsmap:
 
     def replaced(self, text):
         data, units, out, i = text.encode("utf-8"), self.units, [], 0
-        offset, begins = self.offset, self.begins
+        offset, begins, starts = self.offset, self.begins, self.starts
         root, size = offset(units[0]), len(units)
         while i < len(data):
-            found = begins.search(data, i) if begins else None
-            if not found:
-                out.append(data[i:])
-                break
-            if found.start() > i:
+            if data[i] not in starts:
+                found = begins.search(data, i) if begins else None
+                if not found:
+                    out.append(data[i:])
+                    break
                 out.append(data[i:found.start()])
                 i = found.start()
             node, longest, value = root, 0, 0
