@@ -89,7 +89,7 @@
 - T130: ブランチ `t130-kv-unshared`（4f7663e）。Opus xhigh のレビューが途中。持ち主の判断: 隔離されていないページで 64 ビットのメモリが要るモデルは KV を float32 のまま（レビューの直しとして 1 行）。
 - T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
 - T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
-再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。
+再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
 
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
 - 根拠: レビューのサブエージェントが worker.js を Node の `vm` で偽の fetch・Cache API・ストリームの上で動かす試験台を作り（T97・T118・T119、約 70 件）、次を見つけた（直したものは各項のレビューの行）。
@@ -103,7 +103,7 @@
 - 手順: 試験台を `tests/worker-check.mjs` として入れ（`vm` と偽物の上で `download()`・`fetchRange()`・`inOrder()`・`watchArrivals()` をそのまま動かす）、(1)〜(6) をそこで確かめる。deploy でも走らせる。
 - 完了条件: 試験台が deploy で走る。`slow.yml` の `slow` と `stall` が今までどおり。持ち主の端末で読み込みが通る。
 
-### T130 [性能] 共有のメモリを断られたときも、KV が文脈の終わりまで入るようにする — 状態: 未着手（2026-09-26、T115 のレビューから。規模 小〜中）
+### T130 [性能] 共有のメモリを断られたときも、KV が文脈の終わりまで入るようにする — 状態: **止めた（2026-09-28、リミット）。実装はブランチ `t130-kv-unshared`（4f7663e、案 (c) と (b)）。Opus xhigh のレビューが途中。持ち主の判断: 隔離されていないページで 64 ビットのメモリが要るモデルは KV を float32 のまま（レビューの直しで 1 行）。再開: 本線に rebase → レビュー → 本線 → `models.yml` の `long`**
 - 根拠: `weightsBuffer()` は forward が置くもの（`after`）を共有のメモリ（KV は float16、T110）として測るが、`weightsMemory()` が共有を 3 つとも断られると共有でないメモリ（KV は float32）になり、KV の分だけ足りない。Qwen2.5-3B の int8: 見積もり 3.818 GiB（32 ビット）に対して実際は 4.029 GiB で、位置 2048 の最後の倍化でメモリ不足。Llama-3.2-3B の int6（Chrome の自動の選択）: 3.664 → 4.320 GiB。上限を下げて取れた共有（使える幅が 1GiB だけ）でも Llama-3.2-3B の int6 は同じ（1070.7 MiB 要る）。断られやすいのはモデルを替えた直後（古いメモリが GC される前、T96）。
 - 案: (a) 共有を断られたら共有でないメモリとして測り直し、32 ビットに入らなければ 64 ビットにする（Safari では分かる文で止める）、(b) 共有でないメモリでも入らないときだけ KV を float16 にする（1 本では attention が遅い、T110: 位置 4000 で 38 → 21 tok/s）、(c) KV をその場で伸ばして峰を下げる（古い塊と新しい塊の和でなく、差の分だけ取って後ろから詰め直す。Qwen2.5-3B の共有なしが 4.029 → 3.888 GiB で 32 ビットに入る）。
 - 完了条件: forward-check に「共有を頼んで断られた」経路の試験。`models.yml` の `long` で 3B 級が文脈の終わりまで書く。
@@ -1136,13 +1136,13 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - 確かめ: 相対リンクと見出しの飛び先（手元の Python で全部ある）。Mermaid は変えたのが引用符の中のラベルだけ（引用符・括弧を足していない）。
 - **T156 の続き（2026-09-28、Opus medium、ブランチ `t156-line-docs`、T156 の線を 6.5 GiB にした後）**: webgpu.md の「Models too large to hold twice」を今の形に（8 と言う端末は 2 重を 6.5 GiB まで・一覧の 2B 以下は 2 重で 3B 以上は違う、GPU だけの大きさの上限は 8 の端末で無し・小さい端末は半分、メモリを言わないブラウザは GPU だけにしない、CPU は `/benchmark/` の CPU の節の値から見積もる（書くトークンは重みの読み、プロンプトのトークンは積和）、直近の使われ方で重みを付けて CPU が GPU の 0.95 倍より短ければ CPU で読み直して覚える、覚えた判定を捨てる条件、ベンチが無ければ GPU のまま）。「Where the GPU is not used」の 2 重の項を「2 重に入らず GPU だけにもできないモデル（Qwen2・Qwen3・GPT-2・NeoX・6 ビット）」に、その層だけが入ればプロンプトは GPU（Qwen2.5 3B は入らない）。「Next」から「重みを 1 つに」を外し、T210（GPU だけのときの CPU の側を減らす）を先頭に。README の表の下の文にも GPU だけ・見積もり・覚えることを足した。変えた英文は報告で持ち主に見せる。
 
-### T219 [バグ] GPU の生成で有限でない logits を見つける — 状態: **(1) は本線に入れた（5412509、レビューは (2) と一緒に）。(2) は作業中（Fable、ブランチ `t219-sample-flag`）**
+### T219 [バグ] GPU の生成で有限でない logits を見つける — 状態: **(1) は本線（5412509）。(2) はブランチ `t219-sample-flag`（f2f421f、Fable）。(1)(2) と T220 をまとめた Opus xhigh のレビューが途中で止めた（2026-09-28、リミット）。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。再開: 本線に rebase → レビュー**
 - 今の穴（コードを読んだだけ、端末では未確認）: logits が全部 NaN だと、SAMPLE は NONE（−1）か語彙の最後の ID を返し、Python は `vocab[-1]` を黙って出し続ける。(1) `generateMany` で返った ID の範囲を見る（forward.js の数行、Opus medium）。(2) SAMPLE の中で TF.js の `isnan` と同じビットの判定で印を立て、印が立てばその歩を断って CPU がやり直し T195 の規則で決める。GPU だけのモデル（T156）では別の文で止める（元ネタは TF.js の `isnan` だが、印の運びは自前なので Fable high）。logits を読み戻す形は 1 歩 0.5〜4.2 ms（見積もり）なので採らない。
 - **(1) やったこと（2026-09-28）**: 元ネタは無い（シェーダではない、forward.js の数行）。`generateMany` は返った ID を全部見て（NONE を最後に置く形もあるので先頭だけではない）、どれかが 0 未満か vocab 以上なら、その頼みを丸ごと断る（K と V を CPU のキャッシュに写さず、`gpuEnd` も動かさない）。**GPU は止める**（`stopGpu`: 隣の「sampled の数が合わない」と同じ扱い。CPU と違う数を出した GPU のプロンプトも信じない）。Python は `None` を受けてその歩を CPU で回し、CPU の logits が有限でなければ T195 の `NOT_FINITE` で止まる。**GPU だけのモデル（T156 の direct）**: CPU でやり直せないので `OUTSIDE_VOCABULARY` の文（`NOT_FINITE` と同じ言い方で「on the GPU」）を投げ、ページはその文を出す（worker.js は `JsException` の `Error` の文をそのまま出す）。`onLost` を呼ばないので CPU で読み直さない（同じ重みの logits になるので読み直しても同じ所で止まる見込み、ベンチの無い端末では読み直しに数分）。次のプロンプトはまた GPU で回す。**(1) で見えないもの**: logits が全部 NaN のとき SAMPLE が語彙の最後の ID を返す形（範囲の中）。これは (2) の SAMPLE の中の印で。
 - **(1) の試験**（`tests/gpu-default-check.mjs`、偽の GPU の Worker が `outsideAt` 番目の頼みの最後の ID を `outsideId` にする）: −1 と vocab（語彙の 1 つ外）のそれぞれで、(a) 2 つ目の頼みで外れる GPU: 1 つ目の生成は [GPU 4, CPU 16]・2 つ目は [0, 20]（外れた頼みの ID は 1 つも使わない）、ステータス行が「prompts on the CPU (the GPU sampled −1, outside the vocabulary …」、(b) GPU だけ（`direct`）: 1 つ目の頼みで `OUTSIDE_VOCABULARY` を投げ、`onLost` は呼ばれず、次の頼みは GPU で [101, 102, 103, 104]。わざと壊す（範囲の見張りを外す、最初の ID だけを見る）と (a)(b) が落ちる。
 - **(1) の CI（run 36365689581、tests.yml の full）**: gpu-default-check は通り、GPU だけの 2 回は「The model computed logits on the GPU that are not finite numbers …; lost null; then [101,102,103,104]」。`extra=` の壊した forward.js: 見張りを外すと 6 行とも落ち（外れた ID を返し [[18,2],[20,0]]、GPU だけは投げずに [101,102,103,−1]）、最初の ID だけを見る形も 6 行とも落ちた（−1 を最後に置いたのを見逃す。vocab の回は次の頼みの先頭の 99585 で止まり、止まる頼みがずれて [[8,12],[0,20]]）。gpu-prompt.yml の軽い組（run 36365689450）は成功、FAILED 0。
 
-### T220 [バグ] GPU だけの判定の揃えを device の値にそろえる — 状態: **本線に入れた（5412509）。レビューは T219 の (2) と一緒に**
+### T220 [バグ] GPU だけの判定の揃えを device の値にそろえる — 状態: **本線（5412509）。レビューは T219 と一緒（止めた、2026-09-28）**
 - `gpuOnlyUnfit()` は束ねる範囲の揃えをアダプタの値で見るが、gpu.js の device は既定の 256 のまま頼んでいる。どちらかにそろえる（device に頼む値を使うか、判定も 256 で見る）。
 - **やったこと（2026-09-28）**: 判定を 256 で見る側にそろえた（`forward.js` の `BINDS_AT`）。元ネタは無い（シェーダではない）。**理由**: gpu.js の `openDevice()` は `requiredLimits` に大きさの上限（`maxStorageBufferBindingSize` など 5 つ）だけを頼み、`minStorageBufferOffsetAlignment` を頼まないので、device はアダプタが何を言っても WebGPU の既定の 256（揃えの上限は小さいほど良い側で、アダプタの値は 256 以下）。塊の始まりを決める `tokensLayout()`・`piecesOf()` と、gpu-check の `unbound()`（T213）はどれも device の値（= 256）で見ている。device にアダプタの値を頼む形は、プロンプトの道も含めてどのモデルの塊の始まりも端末ごとに動かし、一覧のモデルはどれも 256 に揃う（T213）ので得るものが無い。worker.js が `gpuAdapter.limits` に写していた揃えの値は使う所が無くなったので外した。持ち主の Android（バインドの上限 256 MiB、揃え 256）では判定は変わらない。
 - **試験**: `tests/gpu-choice-check.mjs` に、揃えを 64 と言うアダプタで stories15M（k の始まりが値 82944・スケール 10368 バイトで 64 には揃い 256 には揃わない）を「would not start」と断り、Llama 3.2 1B の形は通すことを足した。わざと壊す（判定をアダプタの値に戻す）と、その行が落ちる。
@@ -1167,7 +1167,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - **CI の結果（2026-09-28）**: tests.yml `full=true` run 36368487003 は全部通った（suite full 324 秒）。偽の時計: 持ち主の値で「8 か 4: 4、4 か 2: 2、2 か 1: 2」→ 2 本を覚える。GPU の準備の前後で「4 then 2」（準備中の 2 つの判定に印、準備の後の 2 つは印なし）、覚えるのは [2] だけ。覚えた 4 本は最初の生成で「4 か 2: 2、2 か 1: 2」→ 2 本。**わざと壊して**（run 36368281232、`extra=`、試験の読み違いを直す前のコミットで）: 印を付けない形は準備中の 4 本を覚えて落ち（「[4,[4]], not [4,[]]」）、準備中にも検索を始める形は「no search begins while the GPU gets ready: true」で落ち、覚えた本数を最初に確かめない形は「[false,false,…], not [false,true,…]」で落ちた。同じ run の正しい形の 2 つの落ち（「1, not 2」）は試験が `release()` の後に本数を読んでいた誤りで、d07716a で直した（run 36368487003 で通った）。
 - **持ち主の端末で確かめること**: モデルのページで llm-jp-3 150M を開き、1 つ答えを書かせてからコンソールの `threads:` の行（覚えた 4 本から「4 or 2: 2」になるか）と、ステータス行の本数。そのあと `/benchmark/` のモデルの節で、頭が「2 software threads, as the model page remembers」になり、「as chosen」の書くことが CPU で約 120 tok/s になるか。
 
-### T224 [性能] 1 トークンの attention を llama.cpp の `flash_attn_vec` の形に — 状態: **作業中**（ブランチ `t224-attn-vec`）
+### T224 [性能] 1 トークンの attention を llama.cpp の `flash_attn_vec` の形に — 状態: **止めた（2026-09-28、リミット）。実装はブランチ `t224-attn-vec`（fc75dbe〜9607942、Fable の確かめ 18d454b: 直しなし）。Opus xhigh のレビューが途中。再開: 本線に rebase → レビュー → 本線 → 持ち主の Android の /benchmark/ の GPU の節で attention の段（前は 0.90 ms）**
 - 持ち主の Android で、1 トークンの層 2.6 ms のうち attention だけで 0.90 ms（位置 127）。行列は 1.90 ms で帯域の 91.5%。GPU の生成が CPU に勝つ線は 1 層 2.72〜2.9 ms 以下（T152 のレビュー）なので、attention を縮めれば届く見込み。今の生成は prompt 用の flashTile（Q_TILE の 3/4 が空、ワークグループは head の数だけ）。llama.cpp の WebGPU の decode は `flash_attn_vec`（KV を分けて reduce、`ggml-webgpu.cpp` の 2078〜2113 行、MIT）で、長い文脈では層あたり 6 回（T152 の申し送り (a)）。それを元ネタに 1 トークンの attention を書き、エンジンの生成とベンチの層の表・段の表の両方で使う。GPU の K と V は float16（T147）のまま。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **完了（本線に入れた 48f8ee5、レビュー済み T217）**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）
