@@ -90,7 +90,7 @@
 - T224: ブランチ `t224-attn-vec`（Fable の確かめ 18d454b まで、直しなし）。Opus xhigh のレビューが途中（ブランチに直しを push していれば `t224-review` か同じブランチ）。
 - T219 の (2): ブランチ `t219-sample-flag`（f2f421f）。T219 の (1) と T220 と合わせた Opus xhigh のレビューが途中。SAMPLE が lavapipe で 1.6 倍遅い件の見積もりを含む。
 止めた後に確かめた各ブランチの先頭（どれも origin に push 済み）: `t129-fetch-edges` f3cb9a7（案 B への入れ替えはコミット済み。その CI は未確認）、`t130-review` fb04b0b（`t130-kv-unshared` を本線に rebase しただけ、レビューの直しはまだ）、`t224-opus-review` 3ee8738（レビューの途中の AGENTS.md と docs/webgpu.md の書きかけを WIP としてコミット）、`t224-attn-vec-fable` 18d454b（= Fable の確かめ）、`t219-review` f2f421f と `t219-review-probe` 249e2ff（レビューの調べの途中）。
-再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。**再開のとき最初に T225（NVIDIA の層の検査が WRONG）、次に T226（Qwen3 などの答えも GPU で）を見る。T227（報告に警告を全部）は T225 の切り分けに要るので一緒に。** ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
+再開の手順: 各ブランチを本線に rebase してから、レビューを頼み直す（T129 は先に案 B への入れ替え）。ほかに走っているものは無い。**週明けは Bonsai 2 の T228 から（持ち主の指示）。** **再開のとき最初に T225（NVIDIA の層の検査が WRONG）、次に T226（Qwen3 などの答えも GPU で）を見る。T227（報告に警告を全部）は T225 の切り分けに要るので一緒に。** ほかに持ち主の端末で見てもらうもの: T223（llm-jp-3 150M が 2 本を選ぶか）、T173（iPhone と Android の Page memory）、T210（Llama 3.2 3B を GPU だけで、8B が入るか）、T156 の (c)（ベンチの CPU の節の後に 3B を 2 回開いて CPU に倒れるか）。ブランチを本線に入れるとき、本会話は `.tmp/merge-branch.sh <ブランチ>`（rebase して AGENTS.md と TODO.md の衝突だけを両方残して解き、main を早送りして push し、ブランチを消す。`.tmp/resolve.py` を使う）を使っていた。`.tmp/` は git に入らないので、無ければ同じことを手で。
 
 ### T129 [運用] 取得と読み込みの境界の残り（2026-09-26 の Opus xhigh のレビューから）— 状態: 未着手（規模 小。**読み込みの経路に触るものは持ち主の端末で見る回に**）
 - 根拠: レビューのサブエージェントが worker.js を Node の `vm` で偽の fetch・Cache API・ストリームの上で動かす試験台を作り（T97・T118・T119、約 70 件）、次を見つけた（直したものは各項のレビューの行）。
@@ -1182,6 +1182,31 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 
 ### T227 [バグ] /benchmark/ の警告（WRONG と、その訳）が写した報告に全部入らない — 状態: 未着手（2026-09-28、持ち主「警告もコピペするようになってないの、不備では？」。規模 小。再開のとき T225 と一緒に）
 - 持ち主の PC の回で、画面に出た検査の WRONG とその訳（どの検査がどの数で落ちたか、tokens on the GPU の「token 2: 48, the CPU 483」など）が、写した Markdown（と Issue の要約、T185）から読み取れず、持ち主が行を拾って貼り直すことになった。報告の頭に、その回で WRONG・failed・unsteady・skipped になったものを 1 か所に全部並べる（節・検査の名前・訳の文そのまま）。要約（`shortReport()`）にも同じものを入れる。持ち主の決まり: 計測のページは詳しい説明でよい。`tests/bench.mjs` に、WRONG のある報告の頭と要約にその行が出る試験。
+
+### T228〜T234: Bonsai 2（prism-ml の 3 値の 27B）に対応する — 週明けに着手（2026-09-28、持ち主「緊急対応、新しいモデルに対応して本番更新してほしい」→「分割してタスクに積んでくれ、週明けに対応だ」）
+- 出どころ: https://huggingface.co/collections/prism-ml/bonsai-2 。中身は `prism-ml/Ternary-Bonsai-2-27B-gguf`（apache-2.0、base は Qwen/Qwen3.8-27B、sha b072e1d3…）: `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.95 GB、1.75 ビット / 重み）・`-PQ2_0.gguf`（7.21 GB、2.13 ビット）・`-F16.gguf`・mmproj（視覚、BF16 と Q8_0）。ほかに `-gguf-dev`（Q2_0、prism の fork が要る）と `-mlx-2bit`。カードの要点: 27.36B（言語 24.35B・64 ブロック、埋め込みと LM head 2.54B、視覚 0.46B）、Qwen3.8 の hybrid attention（約 75% が linear attention）、262K の文脈、埋め込み・attention・MLP・LM head まで全部 3 値、カーネルは Prism ML の llama.cpp の fork（CUDA・Metal）。
+- 順（前にやるべきことは採番する、の決まり）: T228 → T229 → T230 → T231 → T232 → T233 → T234。T228 の調べで無理と分かれば、そこで持ち主に判断を仰ぐ。
+
+### T228 [調査] Bonsai 2 と Qwen3.8 の形を調べる — 状態: 未着手（週明け。規模 小〜中）
+- Qwen3.8 の hybrid attention の中身（linear attention の種類: Gated DeltaNet などか、層の並び、状態の大きさ、RoPE の有無）、tokenizer と chat_template（思考の形）、config の項目。PTQ1_0・PQ2_0 のブロックの並び（Prism の llama.cpp の fork の `ggml` の型の定義と、CPU の参照の dequant）。ライセンス（apache-2.0、NOTICE）と KNOWN_ISSUES.md。prism-ml のほかの小さいモデル（前の版の Bonsai など）が一覧に入れやすいか。結果として、T229〜T234 の規模と、ブラウザの上限（64 ビットのメモリ 16 GB、iPhone）で動く見込みを数字で出す。元ネタの許諾（fork は MIT のはず、確かめる）。
+
+### T229 [追加] linear attention（Qwen3.8 の hybrid attention）をエンジンの CPU の道に — 状態: 未着手（T228 の後。規模 大）
+- NumPy の参照（`llama2_numpy.py`）と `forward.js` の両方。状態（再帰の状態）を KV キャッシュの代わりに持つ層と、普通の attention の層の混ぜ方。legacy 形式に層の種類をどう持たせるか（`FORM` に足す、T144 の決まり）。元ネタは transformers の Qwen3.8 の実装と llama.cpp（MIT）。
+
+### T230 [追加] 3 値の重み（PTQ1_0・PQ2_0）を読む — 状態: 未着手（T228 の後。規模 中〜大）
+- GGUF の読み手（`gguf_model()`）に 2 つの型。int8 に広げると 27B で 27 GB になり 16 GB に入らないので、**3 値のまま持つ**新しい dtype を legacy 形式と変換器に足す（`CONVERTER` を上げる回。T143 の決まりどおり、待っている変換器の直しを同じ回に）。`gguf_check.py` に参照の読み（F16 の GGUF と比べる）。
+
+### T231 [性能] 3 値の行列 × ベクトルと行列 × 行列の CPU のカーネル — 状態: 未着手（T230 の後。規模 大）
+- WASM SIMD で 3 値のまま掛ける（T98 の 6 ビットの広げと同じ考え方で、グループを int8 に広げて relaxed_dot か、3 値の加減算で）。元ネタは Prism の fork の CPU のカーネル（MIT なら行を写せる）、BitNet の TL1/TL2（MIT）。スレッド（jobs.js）、タイル（T159）、補正（T197）。
+
+### T232 [性能] 3 値の GPU の道 — 状態: 未着手（T231 の後。規模 大）
+- 行列 × ベクトル（答え）とタイル（プロンプト）のシェーダ、linear attention の層の GPU の段。WebGPU の元ネタは Hugging Face の space `webml-community/ternary-bonsai-2-webgpu-kernels`（コレクションに入っている。許諾を確かめる）。重みを GPU だけに（T156・T210）。
+
+### T233 [追加] 一覧に Bonsai 2 を足す — 状態: 未着手（T229〜T231 の後、GPU は T232 の後でもよい。規模 小〜中）
+- `src/models.js` の項目（PTQ1_0 か PQ2_0、語彙と config は原本 Qwen3.8 から T136 の段 ② の形で、書式、思考の形の 2 つ）、`LICENSES`、`gguf.yml` の突き合わせ、固定値、format_check。大きさの警告（64 ビットのメモリ、Chrome と Firefox のみ、iPhone は不可の見込み）。本番の `models.yml` で答えること。
+
+### T234 [文書] Bonsai 2 の結果を docs と gist に — 状態: 未着手（T233 の後。規模 小）
+- 速さ・メモリ・品質（perplexity か固定値）を記録のあるものだけで。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **完了（本線に入れた 48f8ee5、レビュー済み T217）**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）
 - CI で 2 回、2 本のほうが 1.24〜1.34 倍速いのに 1 本を選んだ（8 つの時間を 4 つずつ 2 塊から取る上側の中央値なので、1 塊が乱れると判定が返る）。検索の判定を 1 塊の乱れに強い形にする。偽の時計の試験（gpu-default-check の形）で、乱れた 1 塊があっても正しく選ぶことを見る。持ち主の Android（的の端末）で 4 本を選ぶことは変えない。
