@@ -695,11 +695,41 @@ def quantize6(values):
     return (six * 4).astype(np.int8), scales / np.float32(4)
 
 
+# T230: ternary weights (Prism's Bonsai: -1, 0 or +1 times a scale a block) as Prism's PQ2_0 holds them: a block of
+# TERNARY_BLOCK values is a float16 scale d and a byte for every four values, value j at bits 2 (j % 4) of byte j // 4,
+# a code q worth (q - 1) d (3 is left unused). The checkpoint keeps its matrices so ("ternary"): a quarter of int8's
+# bytes, and a 27B model within a browser's 16 GB, which int8 (27 GB) is not.
+TERNARY_BLOCK, TERNARY_BYTES = 128, 34
+
+
+def unpack_ternary(raw):
+    """Ternary blocks (bytes) -> their values, float32 (d as float16 widened, times q - 1)."""
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, TERNARY_BYTES)
+    scales = np.ascontiguousarray(blocks[:, :2]).view(np.float16).astype(np.float32)
+    codes = blocks[:, 2:, None] >> np.array([0, 2, 4, 6], dtype=np.uint8) & 3
+    return ((codes.reshape(-1, TERNARY_BLOCK).astype(np.int8) - 1) * scales).reshape(-1)
+
+
+def pack_ternary(values):
+    """float32 values that are ternary (every block -d, 0 or +d, d a float16) -> the blocks. A value that is not is a
+    ValueError: the format cannot hold it, and rounding it would change the model."""
+    groups = np.asarray(values, dtype=np.float32).reshape(-1, TERNARY_BLOCK)
+    d = np.abs(groups).max(axis=1)
+    scales = d.astype(np.float16)
+    safe = np.where(d > 0, d, np.float32(1))
+    trits = np.rint(groups / safe[:, None])
+    if not (np.array_equal(trits * d[:, None], groups) and np.array_equal(scales.astype(np.float32), d)):
+        raise ValueError("These weights are not ternary (-1, 0 or +1 times a float16 scale a block of 128).")
+    q = (trits + 1).astype(np.uint8).reshape(-1, TERNARY_BLOCK // 4, 4)
+    packed = q[:, :, 0] | q[:, :, 1] << 2 | q[:, :, 2] << 4 | q[:, :, 3] << 6
+    return np.concatenate([scales.view(np.uint8).reshape(-1, 2), packed], axis=1).reshape(-1)
+
+
 class Tensor:
     """Where a tensor of the checkpoint is, when the weights live outside Python (T93: the forward pass runs in
     public/forward.js on its own WebAssembly memory). kind: "int8" (values, then one float32 scale per group of
-    the last dimension at scales), "int6" (the same with the values packed, see pack6), "f32" or "f16". Offsets count
-    from the start of the checkpoint file."""
+    the last dimension at scales), "int6" (the same with the values packed, see pack6), "t2" (T230: ternary, blocks of
+    TERNARY_BLOCK values, see unpack_ternary), "f32" or "f16". Offsets count from the start of the checkpoint file."""
 
     __slots__ = ("kind", "offset", "shape", "group", "scales")
 
@@ -713,13 +743,18 @@ class Tensor:
 
 class Places:
     """Where the tensors of a checkpoint are, taken in file order (Llama's take() with external=, T93): a Tensor for
-    each, from the header's 28 bytes on. dtype: the checkpoint's as numpy has it (int6 is int8 with six=True)."""
+    each, from the header's 28 bytes on. dtype: the checkpoint's as numpy has it (int6 is int8 with six=True, ternary
+    int8 with ternary=True: T230)."""
 
-    def __init__(self, dtype, six=False):
-        self.dtype, self.six, self.offset = np.dtype(dtype), six, 28
+    def __init__(self, dtype, six=False, ternary=False):
+        self.dtype, self.six, self.ternary, self.offset = np.dtype(dtype), six, ternary, 28
 
     def take(self, *shape, matrix=True, widen=True):
         count = math.prod(shape)
+        if self.ternary and matrix:
+            tensor = Tensor("t2", self.offset, shape, TERNARY_BLOCK)
+            self.offset += count // TERNARY_BLOCK * TERNARY_BYTES
+            return tensor
         if self.dtype == np.int8 and matrix:
             group = 32
             while shape[-1] % group:
@@ -746,8 +781,8 @@ def external_tensors(header, dtype, form=None):
     probe.vocab_size = abs(vocab_size)
     probe.head_size = int(form["head_dim"]) or probe.dim // probe.n_heads
     probe.q_dim, kv_dim = probe.n_heads * probe.head_size, probe.n_kv_heads * probe.head_size
-    six = str(dtype) == "int6"
-    places = Places(np.int8 if six else dtype, six)
+    six, ternary = str(dtype) == "int6", str(dtype) == "ternary"
+    places = Places(np.int8 if six or ternary else dtype, six, ternary)
     probe.llama_tensors(places.take, vocab_size > 0, True, kv_dim, form["bias"], places.dtype,
                         lambda width: (np.zeros(width // 2), np.zeros(width // 2)), form["qk_norm"])
     return {name: getattr(probe, name).plan() for name in TENSOR_NAMES if isinstance(getattr(probe, name, None), Tensor)}
@@ -811,7 +846,8 @@ def qwen35_layout(dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, se
                ("wv", (full, kv_dim, dim), True), ("wo", (full, dim, q_dim), True),
                ("q_norm", (full, head), False), ("k_norm", (full, head), False),
                ("wqkv", (linear, 2 * k_dim + v_dim, dim), True), ("wz", (linear, v_dim, dim), True),
-               ("wb", (linear, v_heads, dim), True), ("wa", (linear, v_heads, dim), True),
+               # (the two gates of the DeltaNet stay float32, a few rows: Bonsai 2 keeps them in bfloat16, not ternary)
+               ("wb", (linear, v_heads, dim), False), ("wa", (linear, v_heads, dim), False),
                ("conv", (linear, 2 * k_dim + v_dim, int(form["conv"])), False), ("ssm_a", (linear, v_heads), False),
                ("ssm_dt", (linear, v_heads), False), ("ssm_norm", (linear, int(form["v_head"])), False),
                ("wout", (linear, dim, v_dim), True),
@@ -890,6 +926,10 @@ def checkpoint_dtype(header, size, form=None):
     if all(length % 32 == 0 for _, length in matrices):
         # T98: 24 bytes and a float32 scale per group of 32 (only rows of whole groups can be int6)
         sizes.setdefault(28 + sum(rows * length // 32 * 28 for rows, length in matrices) + 4 * vectors, "int6")
+    if all(length % TERNARY_BLOCK == 0 for _, length in matrices):
+        # T230: blocks of 128 ternary values (only rows of whole blocks can be ternary)
+        sizes.setdefault(28 + sum(rows * length // TERNARY_BLOCK * TERNARY_BYTES for rows, length in matrices)
+                         + 4 * vectors, "ternary")
     if size not in sizes:
         raise ValueError(f"This is not a llama2.c checkpoint: its header asks for {28 + 4 * floats} bytes as float32, "
                          f"{28 + 2 * floats} as float16 or {28 + int8} as int8, and the file has {size}.")
@@ -1001,7 +1041,9 @@ class Llama:
         self.disabled = disable
         # int6 (T98) is int8 with its values packed: from here on it is int8, except where the bytes are read
         six = str(dtype) == "int6"
-        dtype = np.dtype(np.int8 if six else dtype)
+        # T230: ternary is int8 too where the file leaves the RoPE tables out and forward.js keeps the matrices as they are
+        ternary = str(dtype) == "ternary"
+        dtype = np.dtype(np.int8 if six or ternary else dtype)
         offset = 28
         # The int8 kernels work on groups of 32 only
         suitable = dtype != np.int8 or (dim % 32 == 0 and self.q_dim % 32 == 0 and kv_dim % 32 == 0 and hidden_dim % 32 == 0)
@@ -1012,7 +1054,7 @@ class Llama:
         keep_int8 = external is not None and suitable and dtype == np.int8 and "int8" not in disable
 
         # only where it is: public/forward.js reads it (and widens what has to be widened) itself
-        places = Places(dtype, six) if external is not None else None
+        places = Places(dtype, six, ternary) if external is not None else None
 
         def take(*shape, matrix=True, widen=True):
             nonlocal offset
@@ -1021,6 +1063,11 @@ class Llama:
                 tensor = places.take(*shape, matrix=matrix)
                 offset = places.offset
                 return tensor
+            if ternary and matrix:  # the NumPy forward widens every matrix
+                stored = count // TERNARY_BLOCK * TERNARY_BYTES
+                values = unpack_ternary(bytes(checkpoint[offset:offset + stored])).reshape(shape)
+                offset += stored
+                return values
             if dtype == np.int8 and matrix:
                 # quantize.py: int8 values, then one float32 scale per group
                 group = 32

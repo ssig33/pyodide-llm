@@ -277,7 +277,8 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   const qwen35 = arch === "qwen35", layers = qwen35 ? allLayers / interval : allLayers;
   const vDim = v_heads * v_head, convDim = 2 * k_heads * k_head + vDim;
   if (qwen35) outliers = 0;
-  const quantized = dtype === "int8" || dtype === "int6", six = dtype === "int6";
+  // (T230: ternary matrices are multiplied as they are: nothing is made beside them, not even relaxed SIMD's corrections)
+  const ternary = dtype === "ternary", quantized = dtype === "int8" || dtype === "int6" || ternary, six = dtype === "int6";
   // the int8 kernels take rows of whole groups of 32 (llama2_numpy widens the others)
   const onInt8 = int8 && dim % 32 === 0 && qDim % 32 === 0 && kvDim % 32 === 0 && hidden % 32 === 0;
   let bytes = 0;
@@ -288,7 +289,7 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   const tables = (signedVocab < 0 ? vocab * dim : 0) + (arch === "gpt2" ? seqLen * dim : 0);
   // (T156, direct: the layers' matrices are on the GPU alone; T210: so are the embedding and the classifier, and none
   // of their corrections or outlier columns is here)
-  const weights = !quantized ? 0 : size * (six ? 32 / 28 : 32 / 36) - tables, matrices = quantized && !direct;
+  const weights = !quantized || ternary ? 0 : size * (six ? 32 / 28 : 32 / 36) - tables, matrices = quantized && !direct && !ternary;
   if (matrices && onInt8) bytes += (relaxed ? weights / 8 : 0) + Math.min(outliers, dim) * (vocab + 1) * 4;
   else if (matrices) bytes += weights * 4;
   else if (dtype === "float16") bytes += size * 2;
@@ -670,6 +671,10 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // layout of llama2_numpy.pack6 (six bits, then two zero bits)
   function weightAt(t, i) {
     if (t.kind === "int8") return I[base + t.offset + i];
+    if (t.kind === "t2") {  // T230: -1, 0 or +1 (its block's scale: scaleAt)
+      const block = base + t.offset + ((i / 128) | 0) * 34, j = i % 128;
+      return ((U[block + 2 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1;
+    }
     const group = base + t.offset + ((i / 32) | 0) * 24, j = i % 32;
     const low = j < 16 ? U[group + j] & 15 : U[group + j - 16] >> 4;
     const top = (U[group + 16 + (j % 8)] >> (2 * ((j / 8) | 0))) & 3;
@@ -679,13 +684,15 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // float32 product NumPy computes)
   function widen(t) {
     const n = count(t), at = alloc(n * 4);
-    if (t.kind === "f16") {
-      for (let i = 0; i < n; i++) F[at / 4 + i] = halfToFloat(H[(base + t.offset) / 2 + i]);
-    } else {
-      const g = t.group;
-      for (let i = 0; i < n; i++) F[at / 4 + i] = Math.fround(weightAt(t, i) * F[(base + t.scales) / 4 + ((i / g) | 0)]);
-    }
+    for (let i = 0; i < n; i++) F[at / 4 + i] = valueAt(t, i);
     return at;
+  }
+  // value i of a tensor as float32: float16 converted, int8, int6 and ternary times the scale of their group or block
+  // (Math.fround is the float32 product NumPy computes)
+  function valueAt(t, i) {
+    if (t.kind === "f16") return halfToFloat(H[(base + t.offset) / 2 + i]);
+    if (t.kind === "t2") return Math.fround(weightAt(t, i) * halfToFloat(H[(base + t.offset + ((i / 128) | 0) * 34) / 2]));
+    return Math.fround(weightAt(t, i) * F[(base + t.scales) / 4 + ((i / t.group) | 0)]);
   }
   const widened = new Map();
   // the address of a float32 tensor, widened once if the file does not hold float32
@@ -715,6 +722,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (direct && GPU_ALONE.includes(source)) {
       return { rows, n, int8: true, six: false, group: t.group, onGpu: true,
         layer: (l) => [t.offset + l * rows * n, t.scales + l * rows * (n / t.group) * 4] };
+    }
+    if (t.kind === "t2" && plan.int8) {
+      // T230: ternary blocks, their scales in them: matmul_t2 takes the rows as they are, nothing is made beside them
+      const rowBytes = n / 128 * 34, values = base + t.offset;
+      return { rows, n, int8: true, t2: true, layer: (l) => [values + l * rows * rowBytes] };
     }
     if ((t.kind === "int8" || t.kind === "int6") && plan.int8) {
       const six = t.kind === "int6", rowBytes = six ? n / 32 * 24 : n;
@@ -853,6 +865,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   const jobOf = (m, out, outStride, input, l, count) => {
     const [w, s, c] = m.layer(l);
     if (!m.int8) return [2, out, input, 0, w, 0, 0, m.n, 0, m.rows, count, outStride, S, 0];
+    if (m.t2) return [7, out, xq, xs, w, 0, 0, m.n, bias, m.rows, count, outStride, S, S];
     const kind = m.six ? (relaxed ? 5 : 6) : (relaxed ? 0 : 1);
     return [kind, out, xq, xs, w, s, relaxed ? c : 0, m.n, 0, m.rows, count, outStride, S, S];
   };
@@ -949,11 +962,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   function embed(tokens, pos0, rows = x, stride = S) {
     for (let t = 0; t < tokens.length; t++) {
       const row = tokens[t] * dim, to = (rows + t * stride) / 4;
-      if (embedding.kind === "int8" || embedding.kind === "int6") {
-        const g = embedding.group;
-        for (let i = 0; i < dim; i++) {
-          F[to + i] = Math.fround(weightAt(embedding, row + i) * F[(base + embedding.scales) / 4 + (((row + i) / g) | 0)]);
-        }
+      if (embedding.kind === "int8" || embedding.kind === "int6" || embedding.kind === "t2") {
+        for (let i = 0; i < dim; i++) F[to + i] = valueAt(embedding, row + i);
       } else {
         const from = embedding.kind === "f32" ? base + embedding.offset : embeddingRows;
         F.copyWithin(to, from / 4 + row, from / 4 + row + dim);
@@ -1660,7 +1670,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   }
 
   let bound = null;
-  const backend = (plan.int8 ? `SIMD kernels, ${T.wq?.kind === "int6" ? "int6" : "int8"}${relaxed ? ", relaxed SIMD" : ""}` : "SIMD kernels, float32") +
+  const packing = { int6: "int6", t2: "ternary" }[T.w1?.kind] ?? "int8";  // (T230: ternary)
+  const backend = (plan.int8 ? `SIMD kernels, ${packing}${relaxed ? ", relaxed SIMD" : ""}` : "SIMD kernels, float32") +
     (wide ? ", 64-bit memory" : "");  // T101: the status line says so, as it says every other way the model runs
   return {
     backend,

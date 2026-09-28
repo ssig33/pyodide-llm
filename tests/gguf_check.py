@@ -46,13 +46,13 @@ STRING, ARRAY = 8, 9
 F32, F16, Q8_0, BF16 = 0, 1, 8, 30
 # T98: the 4- and 5-bit types of the GGUF files that are about int4, read only to measure them (widened to float32)
 Q4_0, Q4_1, Q5_0, Q4_K, Q6_K = 2, 3, 6, 12, 14
-# T235: Prism's ternary PQ2_0 of their llama.cpp fork (the ternary Bonsai)
-PQ2_0 = 142
+# T235 and T230: Prism's ternary PQ2_0 and PTQ1_0 of their llama.cpp fork (the ternary Bonsai, Bonsai 2)
+PQ2_0, PTQ1_0 = 142, 143
 TYPE_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1", Q5_0: "Q5_0",
-              Q4_K: "Q4_K", Q6_K: "Q6_K", PQ2_0: "PQ2_0"}
-# bytes per value: a block of 32 values (or a super-block of 256, or PQ2_0's 128) and its scales
+              Q4_K: "Q4_K", Q6_K: "Q6_K", PQ2_0: "PQ2_0", PTQ1_0: "PTQ1_0"}
+# bytes per value: a block of 32 values (or a super-block of 256, or the ternary blocks of 128) and its scales
 BYTES = {F32: 4, F16: 2, BF16: 2, Q8_0: 34 / 32, Q4_0: 18 / 32, Q4_1: 20 / 32, Q5_0: 22 / 32, Q4_K: 144 / 256, Q6_K: 210 / 256,
-         PQ2_0: 34 / 128}
+         PQ2_0: 34 / 128, PTQ1_0: 28 / 128}
 
 
 def half(raw):
@@ -119,8 +119,25 @@ def widen_pq2_0(raw):
     return (codes.astype(np.float32) - 1) * half(blocks[:, :2])
 
 
+def widen_ptq1_0(raw):
+    """T230: blocks of 128 in 28 bytes: 24 bytes of five base-3 digits (qs), 2 of four (qh), a float16 d last. The fork's
+    dequantize_row_ptq1_0 as it reads: qs in stages of 16 then 8 bytes, each byte's digits one after another across the
+    stage (digit n of every byte, then n + 1), then qh the same; digit n of a byte is the top trit of byte * 3^n
+    (mod 256): ((that * 3) >> 8), worth that minus 1."""
+    blocks = raw.reshape(-1, 28)
+    out = np.empty((len(blocks), 128), dtype=np.float32)
+    column = 0
+    for start, stop, digits in ((0, 16, 5), (16, 24, 5), (24, 26, 4)):
+        for n in range(digits):
+            shifted = (blocks[:, start:stop].astype(np.uint32) * 3 ** n) % 256
+            out[:, column:column + stop - start] = ((shifted * 3) >> 8).astype(np.float32) - 1
+            column += stop - start
+    return out * half(blocks[:, 26:28])
+
+
 WIDEN = {Q4_0: (32, 18, widen_q4_0), Q4_1: (32, 20, widen_q4_1), Q5_0: (32, 22, widen_q5_0),
-         Q4_K: (256, 144, widen_q4_k), Q6_K: (256, 210, widen_q6_k), PQ2_0: (128, 34, widen_pq2_0)}
+         Q4_K: (256, 144, widen_q4_k), Q6_K: (256, 210, widen_q6_k), PQ2_0: (128, 34, widen_pq2_0),
+         PTQ1_0: (128, 28, widen_ptq1_0)}
 
 
 class Reader:

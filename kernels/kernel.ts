@@ -277,6 +277,55 @@ export function matmul_q6(xout: usize, xq: usize, xs: usize, wq: usize, ws: usiz
   }
 }
 
+// T230: 16 ternary weights, -1, 0 or +1 as int8, from 4 bytes of 2-bit codes (llama2_numpy.pack_ternary: value j at bits
+// 2 (j % 4) of byte j / 4, code q worth q - 1). Each byte is copied to four lanes and masked to its lane's two bits; the
+// lanes whose bits are 0 are -1 (a compare's all ones) and those whose bits are 2 are +1 (minus a compare's all ones)
+// @ts-ignore: decorator
+@inline function trits16(four: v128): v128 {
+  const spread = i8x16.shuffle(four, four, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+  const bits = v128.and(spread, i32x4.splat(0xc0300c03));
+  return i8x16.sub(i8x16.eq(bits, i32x4.splat(0)), i8x16.eq(bits, i32x4.splat(0x80200802)));
+}
+
+// the four int32 lanes of each of four groups added up into one lane a group: [sum a, sum b, sum c, sum d]
+// (kernel_relaxed.ts's groupSums, T167; integers, so the order of the adds does not matter)
+// @ts-ignore: decorator
+@inline function groupTotals(a: v128, b: v128, c: v128, d: v128): v128 {
+  const ab = i32x4.add(v128.shuffle<i32>(a, b, 0, 4, 1, 5), v128.shuffle<i32>(a, b, 2, 6, 3, 7));
+  const cd = i32x4.add(v128.shuffle<i32>(c, d, 0, 4, 1, 5), v128.shuffle<i32>(c, d, 2, 6, 3, 7));
+  return i32x4.add(v128.shuffle<i32>(ab, cd, 0, 1, 4, 5), v128.shuffle<i32>(ab, cd, 2, 3, 6, 7));
+}
+
+// T230: one group of 32 ternary weights (8 bytes of codes at c) against its 32 activations (at x): the products in
+// four int32 lanes (dot32), less bias times the weights' sum in four lanes (the activations' bias comes off)
+// @ts-ignore: decorator
+@inline function groupT2(c: usize, x: usize, bias: v128): v128 {
+  const w0 = trits16(v128.load32_zero(c)), w1 = trits16(v128.load32_zero(c + 4));
+  const sums = i32x4.extadd_pairwise_i16x8_s(i16x8.add(i16x8.extadd_pairwise_i8x16_s(w0), i16x8.extadd_pairwise_i8x16_s(w1)));
+  return i32x4.sub(dot32(w0, v128.load(x), w1, v128.load(x + 16)), i32x4.mul(sums, bias));
+}
+
+// T230: ternary weights (wq: blocks of 128, a float16 scale then 32 bytes of codes) against activations of
+// quantize_x(bias), rows [r0, r1). A block's four groups each come to one exact integer, dot(w, q - bias) (|32 × 127|
+// at most), which is scaled once, by the block's scale times the group's activation scale, into lane g % 4 of the
+// accumulator; the lanes are added in order at the end (matmul_q8r's order, T167).
+export function matmul_t2(xout: usize, xq: usize, xs: usize, wq: usize, n: i32, r0: i32, r1: i32, bias: i32): void {
+  const blocks = n >> 7, rowBytes = <usize>blocks * 34, offset = i32x4.splat(bias);
+  for (let i = r0; i < r1; i++) {
+    const row = wq + <usize>i * rowBytes;
+    let facc = f32x4.splat(0);
+    for (let b = 0; b < blocks; b++) {
+      const block = row + <usize>b * 34, c = block + 2, x = xq + (<usize>b << 7);
+      const totals = groupTotals(groupT2(c, x, offset), groupT2(c + 8, x + 32, offset), groupT2(c + 16, x + 64, offset),
+                                 groupT2(c + 24, x + 96, offset));
+      const scales = f32x4.mul(f32x4.splat(halfToFloat(<u32>load<u16>(block))), v128.load(xs + (<usize>b << 4)));
+      facc = f32x4.add(facc, f32x4.mul(f32x4.convert_i32x4_s(totals), scales));
+    }
+    store<f32>(xout + (<usize>i << 2), f32x4.extract_lane(facc, 0) + f32x4.extract_lane(facc, 1) +
+                                       f32x4.extract_lane(facc, 2) + f32x4.extract_lane(facc, 3));
+  }
+}
+
 // eps: the model's (config.json's rms_norm_eps): Qwen3's 1e-6 against 1e-5 moved its perplexity by 0.12% (T124)
 export function rmsnorm(out: usize, x: usize, w: usize, n: i32, eps: f32): void {
   let acc = f32x4.splat(0);

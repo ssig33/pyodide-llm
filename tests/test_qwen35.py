@@ -21,7 +21,9 @@ VOCABULARY = json.dumps({"added_tokens": [], "model": {"type": "Unigram", "unk_i
 def conversion(tensors, config=CONFIG, dtype="float32"):
     file = safetensors_file(tensors)
     size = struct.unpack("<Q", file[:8])[0]
-    made = llama2_convert.Conversion(file[8:8 + size].decode(), 8 + size, json.dumps(config), VOCABULARY,
+    vocabulary = json.dumps({"added_tokens": [], "model": {"type": "Unigram", "unk_id": 0,
+                             "vocab": [[f"w{i}", -float(i)] for i in range(config["vocab_size"])]}}).encode()
+    made = llama2_convert.Conversion(file[8:8 + size].decode(), 8 + size, json.dumps(config), vocabulary,
                                      "tokenizer.json", dtype=dtype, max_seq_len=64, start=8 + size)
     made.feed(file[8 + size:])
     made.finish()
@@ -114,16 +116,18 @@ GGUF_NAMES = {"input_layernorm": "attn_norm", "post_attention_layernorm": "post_
               "mlp.down_proj": "ffn_down"}
 
 
-def tiled(w, axis, start, head, k_heads=2, per_k=2):
-    """convert_hf_to_gguf.py's _reorder_v_heads: the heads of v from grouped by the head of k to tiled."""
-    moved = np.moveaxis(w, axis, 0)
-    rest = moved[start:].reshape(k_heads, per_k, head, *moved.shape[1:]).swapaxes(0, 1).reshape(moved[start:].shape)
-    return np.moveaxis(np.concatenate([moved[:start], rest]), 0, axis)
-
-
-def llama_cpp_tensors(tensors, grouped_out=False):
+def llama_cpp_tensors(tensors, grouped_out=False, config=CONFIG):
     """What convert_hf_to_gguf.py makes of transformers' tensors, by llama.cpp's names: the norms 1 + weight (not the
     DeltaNet's gated one), A_log as -exp(A_log), the conv without its middle 1, the heads of v tiled."""
+    k_heads, per_k = config["linear_num_key_heads"], config["linear_num_value_heads"] // config["linear_num_key_heads"]
+    k_dim, v_head = k_heads * config["linear_key_head_dim"], config["linear_value_head_dim"]
+
+    def tiled(w, axis, start, head):
+        """convert_hf_to_gguf.py's _reorder_v_heads: the heads of v from grouped by the head of k to tiled."""
+        moved = np.moveaxis(w, axis, 0)
+        rest = moved[start:].reshape(k_heads, per_k, head, *moved.shape[1:]).swapaxes(0, 1).reshape(moved[start:].shape)
+        return np.moveaxis(np.concatenate([moved[:start], rest]), 0, axis)
+
     out = {}
     for name, w in tensors.items():
         w = np.asarray(w, dtype=np.float32)
@@ -135,7 +139,7 @@ def llama_cpp_tensors(tensors, grouped_out=False):
         _, _, layer, *rest = name.split(".")
         kind, what = ".".join(rest[:-1]), rest[-1]
         if kind == "linear_attn" and what == "A_log":
-            out[f"blk.{layer}.ssm_a"] = tiled(-np.exp(w), 0, 0, 1)
+            out[f"blk.{layer}.ssm_a"] = tiled((-np.exp(w)).astype(np.float32), 0, 0, 1)
             continue
         if kind == "linear_attn" and what == "dt_bias":
             out[f"blk.{layer}.ssm_dt.bias"] = tiled(w, 0, 0, 1)
@@ -144,15 +148,15 @@ def llama_cpp_tensors(tensors, grouped_out=False):
         if gguf in ("attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm"):
             w = w + 1
         if gguf == "ssm_conv1d":
-            w = tiled(w.reshape(w.shape[0], -1), 0, 64, 16)
+            w = tiled(w.reshape(w.shape[0], -1), 0, 2 * k_dim, v_head)
         elif gguf == "attn_qkv":
-            w = tiled(w, 0, 64, 16)
+            w = tiled(w, 0, 2 * k_dim, v_head)
         elif gguf == "attn_gate":
-            w = tiled(w, 0, 0, 16)
+            w = tiled(w, 0, 0, v_head)
         elif gguf in ("ssm_beta", "ssm_alpha"):
             w = tiled(w, 0, 0, 1)
         elif gguf == "ssm_out" and not grouped_out:
-            w = tiled(w, 1, 0, 16)
+            w = tiled(w, 1, 0, v_head)
         out[f"blk.{layer}.{gguf}.{what}"] = w
     return out
 
@@ -198,8 +202,36 @@ def rotated(tensors, config=CONFIG):
     return folded, metadata
 
 
-def gguf(tensors, config=CONFIG, more=(), grouped_out=False):
-    """A GGUF v3 of these tensors (float32) and metadata as llama.cpp writes a Qwen3.5's."""
+def ternary_file(w, kind):
+    """T230: rows of ternary values (-1, 0 or +1 times a float16 scale a block of 128) as a GGUF's PQ2_0 or PTQ1_0 blocks,
+    written as the fork's quantize_row_pq2_0 and quantize_row_ptq1_0_ref write them (d = the block's largest |value|;
+    PTQ1_0: five base-3 digits a byte, the first the most significant, the byte the ceiling of the number times 256 /
+    243; 16 bytes of digits n * 16 + m, 8 of 80 + n * 8 + m, 2 of 120 + n * 2 + h with a digit 0 after them)."""
+    blocks = np.asarray(w, dtype=np.float32).reshape(-1, 128)
+    d = np.abs(blocks).max(axis=1)
+    q = np.rint(blocks / np.where(d > 0, d, 1)[:, None]).astype(np.int64) + 1
+    scales = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    if kind == "PQ2_0":
+        packed = (q.reshape(-1, 32, 4) << np.array([0, 2, 4, 6])).sum(axis=2).astype(np.uint8)
+        return np.concatenate([scales, packed], axis=1).tobytes()
+
+    def number(digits):  # (blocks, count, bytes) digits, the first the most significant
+        total = np.zeros(digits.shape[::2], dtype=np.int64)
+        for n in range(digits.shape[1]):
+            total = total * 3 + digits[:, n]
+        return total
+
+    ceiling = lambda total: ((total * 256 + 242) // 243).astype(np.uint8)
+    qs16 = ceiling(number(q[:, :80].reshape(-1, 5, 16)))
+    qs8 = ceiling(number(q[:, 80:120].reshape(-1, 5, 8)))
+    qh = ceiling(number(q[:, 120:].reshape(-1, 4, 2)) * 3)
+    return np.concatenate([qs16, qs8, qh, scales], axis=1).tobytes()
+
+
+def gguf(tensors, config=CONFIG, more=(), grouped_out=False, ternary=None):
+    """A GGUF v3 of these tensors (float32) and metadata as llama.cpp writes a Qwen3.5's. ternary (T230): the matrices
+    but the DeltaNet's two gates as Prism's "PQ2_0" or "PTQ1_0" (ternary_file(), they must be ternary), the gates in BF16
+    (their values must be bfloat16's), as Bonsai 2 has them."""
     string = lambda text: struct.pack("<Q", len(text.encode())) + text.encode()
     scalar = {4: "<I", 5: "<i", 6: "<f", 7: "<?"}
 
@@ -219,23 +251,33 @@ def gguf(tensors, config=CONFIG, more=(), grouped_out=False):
                 (f"{arch}.attention.head_count", 4, config["num_attention_heads"]),
                 (f"{arch}.attention.head_count_kv", 4, config["num_key_value_heads"]),
                 (f"{arch}.attention.key_length", 4, config["head_dim"]), (f"{arch}.attention.value_length", 4, config["head_dim"]),
-                (f"{arch}.rope.freq_base", 6, 10000.0), (f"{arch}.rope.dimension_count", 4, 8),
-                (f"{arch}.attention.layer_norm_rms_epsilon", 6, 1e-6), (f"{arch}.ssm.conv_kernel", 4, 4),
-                (f"{arch}.ssm.state_size", 4, 16), (f"{arch}.ssm.group_count", 4, 2), (f"{arch}.ssm.time_step_rank", 4, 4),
-                (f"{arch}.ssm.inner_size", 4, 64), (f"{arch}.full_attention_interval", 4, 4),
+                (f"{arch}.rope.freq_base", 6, 10000.0), (f"{arch}.rope.dimension_count", 4, config["head_dim"] // 4),
+                (f"{arch}.attention.layer_norm_rms_epsilon", 6, 1e-6),
+                (f"{arch}.ssm.conv_kernel", 4, config["linear_conv_kernel_dim"]),
+                (f"{arch}.ssm.state_size", 4, config["linear_key_head_dim"]),
+                (f"{arch}.ssm.group_count", 4, config["linear_num_key_heads"]),
+                (f"{arch}.ssm.time_step_rank", 4, config["linear_num_value_heads"]),
+                (f"{arch}.ssm.inner_size", 4, config["linear_num_value_heads"] * config["linear_value_head_dim"]),
+                (f"{arch}.full_attention_interval", 4, 4),
                 ("tokenizer.ggml.model", 8, "gpt2"), ("tokenizer.ggml.pre", 8, "qwen2"),
                 ("tokenizer.ggml.tokens", (9, 8), [f"w{i}" for i in range(config["vocab_size"])]),
                 ("tokenizer.ggml.merges", (9, 8), []), ("tokenizer.ggml.bos_token_id", 4, 1),
                 ("tokenizer.ggml.eos_token_id", 4, 2), *more]
-    held = llama_cpp_tensors(tensors, grouped_out)
+    held = llama_cpp_tensors(tensors, grouped_out, config)
     out = [b"GGUF", struct.pack("<IQQ", 3, len(held), len(metadata))]
     for key, kind, v in metadata:
         out.append(string(key) + struct.pack("<I", 9 if isinstance(kind, tuple) else kind) + value(kind, v))
     blobs, offset = [], 0
     for name, w in held.items():
-        blob = np.ascontiguousarray(w, dtype=np.float32).tobytes()
+        type_, blob = 0, np.ascontiguousarray(w, dtype=np.float32).tobytes()
+        if ternary and w.ndim == 2 and name.endswith((".ssm_beta.weight", ".ssm_alpha.weight")):
+            wide = np.ascontiguousarray(w, dtype=np.float32)
+            assert np.array_equal(((wide.view(np.uint32) >> 16) << 16).view(np.float32), wide), "not bfloat16's values"
+            type_, blob = 30, (wide.view(np.uint32) >> 16).astype(np.uint16).tobytes()
+        elif ternary and w.ndim == 2 and not name.endswith(".ssm_conv1d.weight"):
+            type_, blob = {"PQ2_0": 142, "PTQ1_0": 143}[ternary], ternary_file(w, ternary)
         out.append(string(name) + struct.pack("<I", w.ndim) + struct.pack(f"<{w.ndim}Q", *reversed(w.shape))
-                   + struct.pack("<IQ", 0, offset))
+                   + struct.pack("<IQ", type_, offset))
         blobs.append(blob + b"\0" * (-len(blob) % 32))
         offset += len(blobs[-1])
     head = b"".join(out)
@@ -295,6 +337,66 @@ def test_a_rotation_the_engine_does_not_do_is_refused(change, what):
         changed.append((key, kind, v))
     with pytest.raises(ValueError, match="rotation"):
         from_gguf(gguf(folded, more=changed, grouped_out=True))
+
+
+# ---- T230: ternary weights (Bonsai 2), kept as ternary blocks
+# rows of whole blocks of 128 everywhere: dim 128, hidden 256, q_dim 4 x 32 and the DeltaNet's v 4 x 32
+TERNARY_CONFIG = {**CONFIG, "hidden_size": 128, "intermediate_size": 256, "linear_key_head_dim": 32,
+                  "linear_value_head_dim": 32}
+
+
+def ternarized(tensors):
+    """The model made ternary as Bonsai is: every matrix but the DeltaNet's two gates -1, 0 or +1 times a float16 scale
+    a block of 128 (the scale the block's mean size), the gates bfloat16."""
+    out = {}
+    for name, w in tensors.items():
+        if w.ndim != 2:
+            out[name] = w
+        elif name.endswith(("in_proj_b.weight", "in_proj_a.weight")):
+            out[name] = ((w.view(np.uint32) >> 16) << 16).view(np.float32)
+        else:
+            blocks = w.reshape(-1, 128)
+            d = np.abs(blocks).mean(axis=1).astype(np.float16).astype(np.float32)
+            # (+ 0 makes the -0 of a small negative value the 0 a file's code 1 reads as)
+            out[name] = (np.clip(np.rint(blocks / d[:, None]), -1, 1) * d[:, None] + 0.0).reshape(w.shape).astype(np.float32)
+    return out
+
+
+def made_ternary(file, dtype):
+    made = llama2_convert.Conversion.from_gguf(file, dtype=dtype, max_seq_len=64)
+    made.feed(file[made.base:])
+    made.finish()
+    return made
+
+
+@pytest.mark.parametrize("kind", ["PQ2_0", "PTQ1_0"])
+def test_a_ternary_gguf_keeps_its_blocks_and_computes_what_float32_does(kind):
+    """Prism's two packings read to the same values as the safetensors of those values; a ternary checkpoint holds the
+    very blocks (PTQ1_0's digits two bits each), whatever the packing or the source, and computes what float32 does."""
+    tensors = ternarized(weights(TERNARY_CONFIG))
+    file = gguf(tensors, TERNARY_CONFIG, ternary=kind)
+    wide, narrow = conversion(tensors, TERNARY_CONFIG), conversion(tensors, TERNARY_CONFIG, dtype="ternary")
+    assert bytes(made_ternary(file, "float32").checkpoint) == bytes(wide.checkpoint)
+    assert bytes(made_ternary(file, "ternary").checkpoint) == bytes(narrow.checkpoint)
+    assert len(bytes(narrow.checkpoint)) < len(bytes(wide.checkpoint)) / 8
+    assert np.array_equal(logits(engine(narrow)), logits(engine(wide)))
+
+
+@pytest.mark.parametrize("kind", ["PQ2_0", "PTQ1_0"])
+def test_the_packings_read_back_as_written_by_both_readers(kind):
+    """The converter's reader and tests/gguf_check.py's (written apart, from the fork's dequantizers) read what the fork's
+    quantizers write, every value of every block."""
+    from gguf_check import widen_pq2_0, widen_ptq1_0
+    values = ternarized({"m": (np.random.default_rng(7).standard_normal((6, 256)) * 0.2).astype(np.float32)})["m"]
+    raw = ternary_file(values, kind)
+    ours = {"PQ2_0": llama2_convert.pq2_0, "PTQ1_0": llama2_convert.ptq1_0}[kind](raw)
+    theirs = {"PQ2_0": widen_pq2_0, "PTQ1_0": widen_ptq1_0}[kind](np.frombuffer(raw, dtype=np.uint8))
+    assert np.array_equal(ours.reshape(values.shape), values) and np.array_equal(theirs.reshape(values.shape), values)
+
+
+def test_weights_that_are_not_ternary_are_refused():
+    with pytest.raises(ValueError, match="not ternary"):
+        conversion(weights(TERNARY_CONFIG), TERNARY_CONFIG, dtype="ternary")
 
 
 def test_hadamard_is_its_own_inverse_and_sylvesters():

@@ -12,8 +12,8 @@ import time
 import numpy as np
 
 # the RoPE angles are the engine's, which computes them itself when a file leaves the tables out (int8)
-from llama2_numpy import (CHARSMAP, FORM, RMS_EPS, form_of, pack6, qwen35_layout, quantize6, rope_frequencies,
-                          rope_tables)
+from llama2_numpy import (CHARSMAP, FORM, RMS_EPS, TERNARY_BLOCK, TERNARY_BYTES, form_of, pack6, pack_ternary,
+                          qwen35_layout, quantize6, rope_frequencies, rope_tables)
 
 # Pieces of at most this many values are converted at a time: 4 MB as float32. Measured on llm-jp-3-150m, the
 # peak is the output plus 14 MB with this, plus 52 MB with pieces four times as large, at the same speed.
@@ -83,25 +83,31 @@ def layout(dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, 
 
 
 QUANTIZED = ("int8", "int6")  # the dtypes with groups and scales; int6 is T98's, see llama2_numpy.pack6
+# T230: ternary, blocks of 128 weights of -1, 0 or +1 and a float16 scale (llama2_numpy.pack_ternary): only for weights
+# that are ternary already (Prism's Bonsai), asked for by name
+TERNARY = "ternary"
+PACKED = (*QUANTIZED, TERNARY)  # the dtypes whose matrices are packed, and whose files leave the RoPE tables out
 
 
 def dtype_name(dtype):
-    """"float32", "float16", "int8" or "int6" from a name or a NumPy dtype (NumPy has no six-bit type)."""
-    return "int6" if str(dtype) == "int6" else np.dtype(dtype).name
+    """"float32", "float16", "int8", "int6" or "ternary" from a name or a NumPy dtype (NumPy has neither of the last two)."""
+    return str(dtype) if str(dtype) in ("int6", TERNARY) else np.dtype(dtype).name
 
 
 def check_dtype(dtype):
-    if str(dtype) != "int6" and np.dtype(dtype) not in (np.float32, np.float16, np.int8):
-        raise ValueError(f"dtype must be float32, float16, int8 or int6, not {dtype}.")
+    if str(dtype) not in ("int6", TERNARY) and np.dtype(dtype) not in (np.float32, np.float16, np.int8):
+        raise ValueError(f"dtype must be float32, float16, int8, int6 or ternary, not {dtype}.")
 
 
 def tensor_bytes(shape, is_matrix, dtype):
     """How many bytes a tensor of layout() takes in a checkpoint of that dtype."""
     count, dtype = int(np.prod(shape)), dtype_name(dtype)
-    if dtype not in QUANTIZED:
+    if dtype not in PACKED:
         return count * np.dtype(dtype).itemsize
     if is_matrix is None:
-        return 0  # int8 and int6 checkpoints leave the RoPE tables out
+        return 0  # int8, int6 and ternary checkpoints leave the RoPE tables out
+    if dtype == TERNARY:
+        return count // TERNARY_BLOCK * TERNARY_BYTES if is_matrix else 4 * count
     if dtype == "int6":
         # 24 bytes of values and a float32 scale per group of 32; the norm weights stay float32
         return count // 32 * 28 if is_matrix else 4 * count
@@ -140,6 +146,8 @@ class Writer:
         tensors = layout(*header, **form)
         if self.dtype == "int6" and any(is_matrix and shape[-1] % 32 for shape, is_matrix in tensors):
             raise ValueError("Six bits a weight needs rows of whole groups of 32, and this model has other rows.")
+        if self.dtype == TERNARY and any(is_matrix and shape[-1] % TERNARY_BLOCK for shape, is_matrix in tensors):
+            raise ValueError("Ternary weights need rows of whole blocks of 128, and this model has other rows.")
         size = checkpoint_size(header, dtype, form)
         if sink is not None:
             self.out = None
@@ -163,8 +171,10 @@ class Writer:
     def write(self, index, first, values):
         """values: whole rows of tensor number index, beginning at its element number first."""
         offset, shape, is_matrix = self.tensors[index]
-        if self.dtype not in QUANTIZED:
+        if self.dtype not in PACKED:
             self.put(offset + first * np.dtype(self.dtype).itemsize, np.asarray(values).astype(self.dtype, copy=False))
+        elif is_matrix and self.dtype == TERNARY:
+            self.put(offset + first // TERNARY_BLOCK * TERNARY_BYTES, pack_ternary(values))
         elif is_matrix and self.dtype == "int6":
             rows = np.asarray(values, dtype=np.float32).reshape(-1, shape[-1])
             if self.quantize_rows is not None:
@@ -181,6 +191,13 @@ class Writer:
             self.put(offset + int(np.prod(shape)) + 4 * (first // group_size(shape[-1])), scales)
         elif is_matrix is False:
             self.put(offset + 4 * first, np.asarray(values, dtype=np.float32))
+
+    def write_blocks(self, index, first, blocks):
+        """T230: rows of tensor number index as ternary blocks already (a GGUF's PQ2_0 or PTQ1_0, blocks()), from its
+        element number first, into a ternary checkpoint as they are."""
+        offset, shape, is_matrix = self.tensors[index]
+        assert self.dtype == TERNARY and is_matrix, "only a ternary checkpoint's matrices take blocks"
+        self.put(offset + first // TERNARY_BLOCK * TERNARY_BYTES, np.asarray(blocks, dtype=np.uint8))
 
 
 # ---------------------------------------------------------------------------------- the chat template
@@ -801,12 +818,42 @@ def pq2_0(raw):
     return ((codes.reshape(-1, 128).astype(np.int8) - 1) * scales).reshape(-1)
 
 
+def ptq1_0_codes(raw):
+    """T230: Prism's PTQ1_0 (their fork's dequantize_row_ptq1_0): blocks of 128 values in 28 bytes, 24 bytes of five
+    base-3 digits each (qs), 2 of four each (qh), then the float16 scale d. Digit n of a byte b is ((b 3^n mod 256) 3)
+    >> 8 (upstream TQ1_0's packing), worth that minus 1; the values go 16 bytes of qs digit by digit, then its other 8
+    bytes, then qh. Returns the digits (0, 1 or 2) as (blocks, 128) and the scales' raw float16 (blocks, 2 bytes)."""
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 28)
+
+    def digits(part, count):
+        return np.stack([((part.astype(np.uint16) * 3 ** n & 255) * 3) >> 8 for n in range(count)], axis=1)
+
+    codes = np.concatenate([digits(blocks[:, 0:16], 5).reshape(-1, 80), digits(blocks[:, 16:24], 5).reshape(-1, 40),
+                            digits(blocks[:, 24:26], 4).reshape(-1, 8)], axis=1).astype(np.uint8)
+    return codes, np.ascontiguousarray(blocks[:, 26:28])
+
+
+def ptq1_0(raw):
+    codes, scales = ptq1_0_codes(raw)
+    return ((codes.astype(np.int8) - 1) * scales.view(np.float16).astype(np.float32)).reshape(-1)
+
+
+def ternary_blocks(raw, kind):
+    """T230: a GGUF's ternary rows (PQ2_0 or PTQ1_0) as the ternary checkpoint's blocks (llama2_numpy.pack_ternary's,
+    which are PQ2_0's): PQ2_0's bytes as they are, PTQ1_0's digits packed two bits each."""
+    if kind == "PQ2_0":
+        return np.frombuffer(raw, dtype=np.uint8)
+    codes, scales = ptq1_0_codes(raw)
+    q = codes.reshape(-1, TERNARY_BLOCK // 4, 4)
+    return np.concatenate([scales, q[:, :, 0] | q[:, :, 1] << 2 | q[:, :, 2] << 4 | q[:, :, 3] << 6], axis=1).reshape(-1)
+
+
 # bytes per value (Q8_0: 34 bytes for 32 of them), and how to read them
 READERS = {"F32": (4, lambda raw: np.frombuffer(raw, dtype=np.float32)),
            "F16": (2, lambda raw: np.frombuffer(raw, dtype=np.float16)), "BF16": (2, bfloat16),
-           "Q8_0": (34 / 32, q8_0), "PQ2_0": (34 / 128, pq2_0)}
+           "Q8_0": (34 / 32, q8_0), "PQ2_0": (34 / 128, pq2_0), "PTQ1_0": (28 / 128, ptq1_0)}
 # how many values a block of each GGUF type holds: a row of a tensor is whole blocks (ggml requires it)
-BLOCKS = {"Q8_0": 32, "PQ2_0": 128}
+BLOCKS = {"Q8_0": 32, "PQ2_0": 128, "PTQ1_0": 128}
 
 
 class Safetensors:
@@ -1509,9 +1556,20 @@ class Stream:
             rows = stored[0] if len(stored) > 1 else 1  # a vector is one row of its own length
         if rows == 0 or (len(self.pending) < PIECE and not last):
             return
-        values = reader(bytes(self.pending[:rows * row]))
+        # T230: ternary rows go into a ternary checkpoint as blocks, never through float32 (27 billion weights of Bonsai
+        # 2); the plan's steps that move whole rows (the heads' order, q and its gate apart, the tiled heads of v) move
+        # a row's blocks as well. One whose columns move (a DeltaNet's output without Prism's rotation) goes through
+        # float32 and is packed again (pack_ternary: the same blocks)
+        columns = info.get("transposed") or info.get("split") or (info.get("untile") or [0])[0]
+        blocks = self.dtype == TERNARY and info["dtype"] in ("PQ2_0", "PTQ1_0") and not columns and \
+            all(self.writer.tensors[index][2] for index, _, _ in targets)
+        raw = bytes(self.pending[:rows * row])
+        values = ternary_blocks(raw, info["dtype"]) if blocks else reader(raw)
         del self.pending[:rows * row]
-        if len(stored) > 1:
+        width = int(np.prod(stored[1:])) if len(stored) > 1 else int(stored[0])  # values a row
+        if blocks:
+            values = values.reshape(rows, width // TERNARY_BLOCK * TERNARY_BYTES)
+        elif len(stored) > 1:
             values = values.reshape(rows, *stored[1:])
         if info.get("transposed"):
             values = values.T  # back to (in, out), which the plan transposes as it does a safetensors' own
@@ -1525,9 +1583,13 @@ class Stream:
             values = untiled(values, info["untile"])
         for index, first, transform in targets:
             out = transformed(values, transform, self.head_size)
-            self.writer.write(index, first + self.first, out)
-            self.done += out.size
-        self.first += 0 if whole else values.size
+            if blocks:
+                self.writer.write_blocks(index, first + self.first, out)
+                self.done += out.shape[0] * width
+            else:
+                self.writer.write(index, first + self.first, out)
+                self.done += out.size
+        self.first += 0 if whole else (values.shape[0] * width if blocks else values.size)
 
     def finish(self):
         if self.step < len(self.steps) or self.done != self.total:
@@ -1555,8 +1617,9 @@ class Incomplete(Exception):
 
 
 GGUF_VALUES = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
-# ggml's types; the K-quants and the rest are refused. 142 is Prism's PQ2_0 (T235), in their fork of llama.cpp only
-GGUF_TENSORS = {0: "F32", 1: "F16", 8: "Q8_0", 142: "PQ2_0"}
+# ggml's types; the K-quants and the rest are refused. 142 and 143 are Prism's PQ2_0 (T235) and PTQ1_0 (T230), in
+# their fork of llama.cpp only; BF16 (T230) is Bonsai 2's for the two gates of its DeltaNet
+GGUF_TENSORS = {0: "F32", 1: "F16", 8: "Q8_0", 30: "BF16", 142: "PQ2_0", 143: "PTQ1_0"}
 # llama.cpp's names of the pre-tokenizers, as the engine knows them (llama2_numpy.pretokenize)
 GGUF_PRETOKENIZERS = {"gpt-2": "gpt2", "gpt2": "gpt2", "smollm": "gpt2-digits", "qwen2": "qwen", "llama-bpe": "llama3"}
 GGUF_LAYER = {"attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm", "attn_q": "self_attn.q_proj",
@@ -1726,8 +1789,8 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
     turns = {"attn_q": heads, "attn_k": config.get("num_key_value_heads")}
     for name, info in tensors.items():
         if info["type"] not in GGUF_TENSORS:
-            raise ValueError(f"{name} is stored as ggml type {info['type']}: only F32, F16, Q8_0 and PQ2_0 GGUF files "
-                             f"are supported (not the K-quants).")
+            raise ValueError(f"{name} is stored as ggml type {info['type']}: only F32, F16, BF16, Q8_0, PQ2_0 and PTQ1_0 "
+                             f"GGUF files are supported (not the K-quants).")
         parts = name.split(".")
         if name in names:
             target = names[name]

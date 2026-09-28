@@ -10,15 +10,17 @@ from pathlib import Path
 
 import numpy as np
 from qwen35_model import weights
-from test_qwen35 import conversion, from_gguf, gguf, rotated
+from test_qwen35 import TERNARY_CONFIG, conversion, from_gguf, gguf, rotated, ternarized
 
 out = Path(sys.argv[1])
 out.mkdir(parents=True, exist_ok=True)
-tame = {name: (w / 3 if w.ndim == 2 and "norm" not in name and "embed" not in name else w).astype(np.float32)
-        for name, w in weights().items()}
-folded, metadata = rotated(tame)
-made = {"qwen35-float32": conversion(tame), "qwen35-int8": conversion(tame, dtype="int8"),
-        "qwen35-rotated-int8": from_gguf(gguf(folded, more=metadata, grouped_out=True), dtype="int8", with_config=True)}
+tame = lambda tensors: {name: (w / 3 if w.ndim == 2 and "norm" not in name and "embed" not in name else w).astype(np.float32)
+                        for name, w in tensors.items()}
+folded, metadata = rotated(tame(weights()))
+made = {"qwen35-float32": conversion(tame(weights())), "qwen35-int8": conversion(tame(weights()), dtype="int8"),
+        "qwen35-rotated-int8": from_gguf(gguf(folded, more=metadata, grouped_out=True), dtype="int8", with_config=True),
+        # T230: ternary weights kept as ternary blocks
+        "qwen35-ternary": conversion(ternarized(tame(weights(TERNARY_CONFIG))), TERNARY_CONFIG, dtype="ternary")}
 for name, conversion in made.items():
     (out / f"{name}.bin").write_bytes(bytes(conversion.checkpoint))
     (out / f"{name}.tokenizer.bin").write_bytes(bytes(conversion.tokenizer))

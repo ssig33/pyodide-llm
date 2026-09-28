@@ -67,6 +67,55 @@ const file = (f) => (path.isAbsolute(f) ? f : root + f);
   }
 }
 
+// T230: matmul_t2 (ternary weights, blocks of 128 with a float16 scale) to the bit against its sums taken here: each
+// group's 32 products less the activations' bias times the weights' sum, one exact integer, times the block's scale
+// times the group's activation scale rounded once, added into lane g % 4 and the lanes added in order at the end. At 1,
+// 2, 3 and 7 blocks, with the activations of quantize_x(bias = 0) (-127..127) and of bias = 64 (0..127), the codes all
+// three values in every block and every row
+{
+  const memory = new WebAssembly.Memory({ initial: 8 });
+  const k = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(`${root}public/simdkernel_plain.wasm`)), { env: { memory } }).exports;
+  const I = new Int8Array(memory.buffer), U = new Uint8Array(memory.buffer), F = new Float32Array(memory.buffer);
+  const rows = 9, x = 4096, xs = 8192, w = 16384, out = 65536;
+  let seed = 12345;
+  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8;
+  const half = (h) => {  // a float16's bits as a number, exactly
+    const exp = (h >> 10) & 31, frac = h & 1023, sign = h & 0x8000 ? -1 : 1;
+    return sign * (exp ? (1 + frac / 1024) * 2 ** (exp - 15) : frac * 2 ** -24);
+  };
+  const round = Math.fround;
+  for (const blocks of [1, 2, 3, 7]) {
+    const n = blocks * 128;
+    for (let i = 0; i < rows * blocks; i++) {
+      const at = w + i * 34, h = 0x2000 + (next() % 0x3000);  // a normal float16 between about 1e-4 and 8
+      U[at] = h & 255; U[at + 1] = h >> 8;
+      for (let j = 0; j < 32; j++) U[at + 2 + j] = (next() % 3) | (next() % 3) << 2 | (next() % 3) << 4 | (next() % 3) << 6;
+    }
+    for (let g = 0; g < n / 32; g++) F[xs / 4 + g] = round(1e-2 * (1 + (next() % 1000)));
+    for (const bias of [0, 64]) {
+      for (let j = 0; j < n; j++) I[x + j] = bias ? next() % 128 : (next() % 255) - 127;
+      F.fill(-7, out / 4, out / 4 + rows);
+      k.matmul_t2(out, x, xs, w, n, 0, rows, bias);
+      for (let i = 0; i < rows; i++) {
+        const lanes = [0, 0, 0, 0];
+        for (let b = 0; b < blocks; b++) {
+          const at = w + (i * blocks + b) * 34, d = half(U[at] | U[at + 1] << 8);
+          for (let g = 0; g < 4; g++) {
+            let dot = 0;
+            for (let j = 0; j < 32; j++) {
+              const v = b * 128 + g * 32 + j, code = (U[at + 2 + ((g * 32 + j) >> 2)] >> (2 * (j & 3))) & 3;
+              dot += (code - 1) * (I[x + v] - bias);
+            }
+            lanes[g] = round(lanes[g] + round(dot * round(d * F[xs / 4 + b * 4 + g])));
+          }
+        }
+        const expected = round(round(round(lanes[0] + lanes[1]) + lanes[2]) + lanes[3]);
+        if (F[out / 4 + i] !== expected) throw new Error(`matmul_t2 differs at row ${i} of ${blocks} blocks, bias ${bias}: ${F[out / 4 + i]} against ${expected}`);
+      }
+    }
+  }
+}
+
 // T165: matmul_q8 and matmul_q6 (the path without relaxed SIMD) to the bit against their sums taken here: each group's
 // 32 products are exact integers in four int32 lanes (lane k holds products 2k, 2k + 1, 2k + 8, 2k + 9 of each half of
 // 16), scaled and added lane by lane in float32, the four lanes added last. The weights take every int8 (-128 too) and
@@ -373,7 +422,7 @@ llama.release(); del llama; gc.collect()
   const verdict = py.runPython(`
 page = kernel_llama(data, vocabulary, **OPTIONS)
 numpy = Llama(data, vocabulary, **{k: v for k, v in OPTIONS.items() if k != "disable"})
-int8 = "int8" in page.backend or "int6" in page.backend  # both quantize the activations (T98)
+int8 = any(kind in page.backend for kind in ("int8", "int6", "ternary"))  # these quantize the activations (T98, T230)
 sequence, agree, largest, nll = [page.bos], 0, 0.0, [0.0, 0.0]
 for pos in range(${positions}):
     a, b = page.forward(sequence[pos], pos).astype(np.float64), numpy.forward(sequence[pos], pos).astype(np.float64)

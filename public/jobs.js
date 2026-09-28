@@ -41,6 +41,7 @@ if (JOB_TABLE <= JOBS * 4 || JOB_TABLE % 8 || JOB_TABLE + BATCH * JOB * 8 > SCRA
 //   4 attention_f16  the same over a cache of float16 (T110)
 //   5 matmul_q6r     as 0, on int6 weights (T98)
 //   6 matmul_q6      as 1, on int6 weights
+//   7 matmul_t2      out, xq, xs, w, -, -, n, the activations' bias   (T230: ternary weights, their scales in the blocks)
 // count > 1 (T108): the same rows for count tokens, whose out, a and b are that many bytes apart. The rows then go in
 // blocks small enough to stay in the cache while every token uses them: each (row, token) is the one kernel call it
 // is for a single token, so the numbers are the same as one token at a time. Kind 0 takes the count tokens in one
@@ -48,7 +49,7 @@ if (JOB_TABLE <= JOBS * 4 || JOB_TABLE % 8 || JOB_TABLE + BATCH * JOB * 8 > SCRA
 // then one frame apart, the same stride). Attention is always one token a job.
 export const ROWS = 9, COUNT = 10, SIZE = 14, FIRST = 15;
 const BLOCK_BYTES = 16384;
-export const blockRows = (kind, n) => Math.max(1, Math.floor(BLOCK_BYTES / (kind === 2 ? 4 * n : n)));
+export const blockRows = (kind, n) => Math.max(1, Math.floor(BLOCK_BYTES / (kind === 2 ? 4 * n : kind === 7 ? n / 4 : n)));
 
 /** T101: which arguments of each kernel are addresses (usize in kernels/*.ts; tests/forward-check.mjs holds this
  * table to the source). On a 64-bit memory the kernels take them as BigInt. */
@@ -57,7 +58,7 @@ export const ADDRESSES = {
   matmul_q6: [0, 1, 2, 3, 4], rmsnorm: [0, 1, 2], rope: [0, 1, 2], attention: [0, 1, 2, 3, 4], attention_f16: [0, 1, 2, 3, 4],
   to_f16: [0, 1], from_f16: [0, 1], layernorm: [0, 1, 2, 3], gelu: [0, 1, 2], swiglu: [0, 1, 2], add_columns: [0, 1, 2], add_inplace: [0, 1],
   argmax: [0], penalize: [0, 1], sample: [0, 5, 6], matmul_q8r: [0, 1, 2, 3, 4, 5], matmul_q6r: [0, 1, 2, 3, 4, 5],
-  matmul_q8r_tile: [0, 1, 2, 3, 4, 5],
+  matmul_q8r_tile: [0, 1, 2, 3, 4, 5], matmul_t2: [0, 1, 2, 3],
 };
 /** A kernel module's exports as they are, or on a 64-bit memory (wide) with the addresses made BigInt on the way
  * in: the rest of the code keeps its addresses in Numbers (exact up to 2^53). */
@@ -84,6 +85,7 @@ export function runner(k, r) {
     else if (kind === 1) k.matmul_q8(out, a, b, a4, a5, a7, r0, r1);
     else if (kind === 5) r.matmul_q6r(out, a, b, a4, a5, a6, a7, r0, r1);
     else if (kind === 6) k.matmul_q6(out, a, b, a4, a5, a7, r0, r1);
+    else if (kind === 7) k.matmul_t2(out, a, b, a4, a7, r0, r1, a8);
     else if (kind === 2) k.matmul_f32(out, a, a4, a7, r0, r1);
     else if (kind === 3) k.attention(out, a, b, a4, a5, a6, rows, a7, a8, r0, r1);
     else k.attention_f16(out, a, b, a4, a5, a6, rows, a7, a8, r0, r1);
@@ -107,6 +109,7 @@ export function warmUp(k, r) {
   for (let i = 0; i < 4000; i++) {
     k.matmul_q8(out, xq, xs, w, s, 32, 0, 1);
     k.matmul_q6(out, xq, xs, w, s, 32, 0, 1);
+    k.matmul_t2?.(out, xq, xs, w, 128, 0, 1, 0);  // (one row of one block; its 128 activations run past xq's 64: thrown away)
     k.matmul_f32(out, out + 64, w, 8, 0, 1);
     if (r) {
       r.matmul_q8r(out, xq, xs, w, s, c, 32, 0, 1);

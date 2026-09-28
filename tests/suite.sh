@@ -56,10 +56,11 @@ if [ "$suite" = full ]; then
   part "forward.js against NumPy, not shared" node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --plain
   # T101: the 64-bit memory and its kernels
   part "forward.js against NumPy, 64-bit" node tests/forward-check.mjs stories260K tiny-lm --rounds 1 --positions 128 --wide
-  # T229: a small Qwen3.5 (attention and Gated DeltaNet), in float32, int8, and stored in Prism's rotation (Bonsai 2)
+  # T229: a small Qwen3.5 (attention and Gated DeltaNet), in float32, int8, and stored in Prism's rotation (Bonsai 2);
+  # T230: and its weights ternary, kept as ternary blocks
   part "a Qwen3.5's files" env PYTHONPATH=tests:public python tests/qwen35_prepare.py .tmp/qwen35
   part "forward.js against NumPy, a Qwen3.5" node tests/forward-check.mjs .tmp/qwen35/qwen35-float32 \
-    .tmp/qwen35/qwen35-int8 .tmp/qwen35/qwen35-rotated-int8 --rounds 1 --positions 64
+    .tmp/qwen35/qwen35-int8 .tmp/qwen35/qwen35-rotated-int8 .tmp/qwen35/qwen35-ternary --rounds 1 --positions 64
   # T148: the default choice of the GPU or the CPU for a prompt's blocks, with a made-up GPU's worker
   part "the GPU or the CPU by default" node tests/gpu-default-check.mjs
   part "the software threads" node tests/threads-check.mjs
