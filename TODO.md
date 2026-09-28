@@ -1183,7 +1183,7 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 ### T227 [バグ] /benchmark/ の警告（WRONG と、その訳）が写した報告に全部入らない — 状態: 未着手（2026-09-28、持ち主「警告もコピペするようになってないの、不備では？」。規模 小。再開のとき T225 と一緒に）
 - 持ち主の PC の回で、画面に出た検査の WRONG とその訳（どの検査がどの数で落ちたか、tokens on the GPU の「token 2: 48, the CPU 483」など）が、写した Markdown（と Issue の要約、T185）から読み取れず、持ち主が行を拾って貼り直すことになった。報告の頭に、その回で WRONG・failed・unsteady・skipped になったものを 1 か所に全部並べる（節・検査の名前・訳の文そのまま）。要約（`shortReport()`）にも同じものを入れる。持ち主の決まり: 計測のページは詳しい説明でよい。`tests/bench.mjs` に、WRONG のある報告の頭と要約にその行が出る試験。
 
-### T228〜T234: Bonsai 2（prism-ml の 3 値の 27B）に対応する — 週明けに着手（2026-09-28、持ち主「緊急対応、新しいモデルに対応して本番更新してほしい」→「分割してタスクに積んでくれ、週明けに対応だ」）
+### Bonsai 2 の列（T228〜T234）: Bonsai 2（prism-ml の 3 値の 27B）に対応する — 週明けに着手（2026-09-28、持ち主「緊急対応、新しいモデルに対応して本番更新してほしい」→「分割してタスクに積んでくれ、週明けに対応だ」）
 - 出どころ: https://huggingface.co/collections/prism-ml/bonsai-2 。中身は `prism-ml/Ternary-Bonsai-2-27B-gguf`（apache-2.0、base は Qwen/Qwen3.8-27B、sha b072e1d3…）: `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.95 GB、1.75 ビット / 重み）・`-PQ2_0.gguf`（7.21 GB、2.13 ビット）・`-F16.gguf`・mmproj（視覚、BF16 と Q8_0）。ほかに `-gguf-dev`（Q2_0、prism の fork が要る）と `-mlx-2bit`。カードの要点: 27.36B（言語 24.35B・64 ブロック、埋め込みと LM head 2.54B、視覚 0.46B）、Qwen3.8 の hybrid attention（約 75% が linear attention）、262K の文脈、埋め込み・attention・MLP・LM head まで全部 3 値、カーネルは Prism ML の llama.cpp の fork（CUDA・Metal）。
 - 順（前にやるべきことは採番する、の決まり）: T228 → T229 → T230 → T231 → T232 → T233 → T234。T228 の調べで無理と分かれば、そこで持ち主に判断を仰ぐ。
 
