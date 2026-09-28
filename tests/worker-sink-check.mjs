@@ -19,14 +19,18 @@ const root = new URL("..", import.meta.url);
 const FORM = JSON.parse(execFileSync(process.env.PYTHON ?? "python3", ["-c",
   "import json, sys; sys.path.insert(0, 'public'); import llama2_numpy; print(json.dumps(llama2_numpy.FORM))"],
 { cwd: fileURLToPath(root) }).toString());
-assert.deepEqual(Object.keys(FORM).sort(), ["arch", "bias", "head_dim", "qk_norm"],
+// footprint() reads arch, head_dim and a Qwen3.5's (T229), not bias nor qk_norm
+const QWEN35_KEYS = ["conv", "hadamard", "interval", "k_head", "k_heads", "v_head", "v_heads"];
+assert.deepEqual(Object.keys(FORM).sort(), ["arch", "bias", "head_dim", "qk_norm", ...QWEN35_KEYS].sort(),
   "FORM has other keys now: say here which of them footprint() reads");
 
 // (7) footprint()'s defaults are FORM's: a form without arch or head_dim (the options of a model converted before
 // T124, a manifest) is counted as the engine reads it
 const defaults = forward.footprint.toString();
 assert.equal(/\barch = "(\w+)"/.exec(defaults)?.[1], FORM.arch, "footprint()'s default arch is not FORM's");
-assert.equal(Number(/\bhead_dim = (\d+)/.exec(defaults)?.[1]), FORM.head_dim, "footprint()'s default head_dim is not FORM's");
+for (const key of ["head_dim", ...QWEN35_KEYS]) {
+  assert.equal(Number(new RegExp(`\\b${key} = (\\d+)`).exec(defaults)?.[1]), FORM[key], `footprint()'s default ${key} is not FORM's`);
+}
 const QWEN3 = [1024, 3072, 28, 16, 8, 151936, 4096];  // Qwen3 0.6B: heads of 128, not 1024 / 16
 const GPT2 = [768, 3072, 12, 12, 12, 50257, 1024];
 for (const header of [QWEN3, GPT2, [288, 768, 6, 6, 6, 32000, 256]]) {

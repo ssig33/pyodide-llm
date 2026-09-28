@@ -268,9 +268,15 @@ const frameBytes = (arrays) => arrays.reduce((size, [, bytes]) => size + align(b
  * GPU, whose keys and values of a block come back through a place of their own. direct (T156, T210): a model on the
  * GPU alone, whose matrices, tables and keys and values are all there. */
 export function footprint(header, size, { dtype = "float32", arch = "llama", int8 = true, relaxed = true, halfKV = false,
-  kvStart = 256, outliers = 8, head_dim = 0, gpu = false, direct = false } = {}) {
-  const [dim, hidden, layers, heads, kvHeads, signedVocab, seqLen] = header;
+  kvStart = 256, outliers = 8, head_dim = 0, gpu = false, direct = false, interval = 0, k_heads = 0, v_heads = 0, k_head = 0,
+  v_head = 0, conv = 0, hadamard = 0 } = {}) {
+  const [dim, hidden, allLayers, heads, kvHeads, signedVocab, seqLen] = header;
   const vocab = Math.abs(signedVocab), headSize = head_dim || dim / heads, kvDim = kvHeads * headSize, qDim = heads * headSize;
+  // T229: a Qwen3.5 keeps keys and values for its layers of attention only, and the Gated DeltaNet's states for the
+  // others: its conv's last conv - 1 inputs and k_head x v_head a head of v, float32; its buffers besides the frame
+  const qwen35 = arch === "qwen35", layers = qwen35 ? allLayers / interval : allLayers;
+  const vDim = v_heads * v_head, convDim = 2 * k_heads * k_head + vDim;
+  if (qwen35) outliers = 0;
   const quantized = dtype === "int8" || dtype === "int6", six = dtype === "int6";
   // the int8 kernels take rows of whole groups of 32 (llama2_numpy widens the others)
   const onInt8 = int8 && dim % 32 === 0 && qDim % 32 === 0 && kvDim % 32 === 0 && hidden % 32 === 0;
@@ -290,7 +296,12 @@ export function footprint(header, size, { dtype = "float32", arch = "llama", int
   if (quantized) bytes += arch === "gpt2" ? seqLen * dim * 4 : seqLen * headSize * 4;
   // the frames of BATCH tokens, their attention scores, the logits; the keys and values of a block from the GPU (in
   // float16) and its rows
-  bytes += BATCH * (frameBytes(frameArrays(dim, hidden, kvDim, qDim)) + align(seqLen * heads * 4)) + vocab * 4;
+  bytes += BATCH * (frameBytes(frameArrays(dim, hidden, kvDim, Math.max(qDim, vDim))) + align(seqLen * heads * 4)) + vocab * 4;
+  if (qwen35) {
+    const recurrent = allLayers - layers;
+    bytes += recurrent * (convDim * (conv - 1) + v_heads * k_head * v_head) * 4 +
+      (qDim + convDim + vDim + 2 * v_heads + (hadamard ? Math.max(dim, hidden, qDim, vDim) : 0)) * 4;
+  }
   if (gpu) bytes += 2 * layers * GPU_BLOCK * kvDim * 2 + GPU_BLOCK * dim * 4;
   // the KV cache doubles from kvStart: at its largest step, the smaller blocks are still there next to the larger
   let capacity = Math.min(kvStart, seqLen), most = capacity;
@@ -622,6 +633,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     seq_len: seqLen, rotary, arch } = plan;
   const hidden = plan.hidden_dim, kvDim = kvHeads * headSize, qDim = heads * headSize;
   const gpt2 = arch === "gpt2", layerNorm = arch === "gpt2" || arch === "neox", parallel = plan.parallel_residual;
+  // T229: a Qwen3.5 attends in every interval-th layer and runs Gated DeltaNet in the others (llama2_numpy's
+  // forward_qwen35 is what this follows); only its layers of attention keep keys and values
+  const qwen35 = arch === "qwen35", form = plan.form ?? {};
+  const interval = qwen35 ? form.interval : 1, kvLayers = qwen35 ? layers / interval : layers;
+  const vDim = qwen35 ? form.v_heads * form.v_head : 0, kDim = qwen35 ? form.k_heads * form.k_head : 0;
   const imports = { env: { memory } };
   const wide = Boolean(kernels.wide);  // T101: a 64-bit memory, whose kernels take their addresses as BigInt
   // a page that is not cross-origin isolated has no SharedArrayBuffer to ask about: its memory is not shared
@@ -733,7 +749,8 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // KV: the bytes of one position's keys in the cache; KF: in float32.
   const halfKV = Boolean(plan.half_kv) && sharedMemory && (halfKeys ?? kvHeads >= heads);
   const D = dim * 4, HD = hidden * 4, KF = kvDim * 4, QF = qDim * 4, KV = kvDim * (halfKV ? 2 : 4);
-  const inFrame = frameArrays(dim, hidden, kvDim, qDim), S = frameBytes(inFrame);
+  // (T229: a Qwen3.5's DeltaNet writes its output, v's width, where the attention's goes, and it is multiplied too)
+  const inFrame = frameArrays(dim, hidden, kvDim, Math.max(qDim, vDim)), S = frameBytes(inFrame);
   const frames = alloc(BATCH * S), at = {};
   inFrame.reduce((offset, [name, bytes]) => { at[name] = frames + offset; return offset + align(bytes); }, 0);
   // kNow, vNow: this token's key and value in float32, before they go into the cache
@@ -751,6 +768,21 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   const positions = gpt2 ? floats("positions") : 0;
   const embedding = T.token_embedding_table;
   const embeddingRows = embedding.kind === "f16" ? floats("token_embedding_table") : 0;
+
+  // ---- T229: a Qwen3.5's own: the output gate of its attention, the Gated DeltaNet's matrices and vectors, the last
+  // conv - 1 inputs of its conv and its states (k_head x v_head a head of v, float32) for every layer of it, Prism's
+  // rotation (the signs of each width of input and a place for the rotated input)
+  const wg = qwen35 ? matrix("wg") : null, wqkv = qwen35 ? matrix("wqkv") : null, wz = qwen35 ? matrix("wz") : null;
+  const wb = qwen35 ? matrix("wb") : null, wa = qwen35 ? matrix("wa") : null, wout = qwen35 ? matrix("wout") : null;
+  const convW = floats("conv"), ssmA = floats("ssm_a"), ssmDt = floats("ssm_dt"), ssmNorm = floats("ssm_norm");
+  const block = qwen35 ? form.hadamard : 0;
+  const signs = block ? { dim: floats("signs_dim"), q: floats("signs_q"), v: floats("signs_v"), hidden: floats("signs_hidden") } : null;
+  const recurrent = layers - kvLayers, convDim = 2 * kDim + vDim, taps = qwen35 ? form.conv : 0;
+  const convState = qwen35 ? alloc(recurrent * convDim * (taps - 1) * 4) : 0;
+  const states = qwen35 ? alloc(recurrent * form.v_heads * form.k_head * form.v_head * 4) : 0;
+  const gate = qwen35 ? alloc(qDim * 4) : 0, mixed = qwen35 ? alloc(convDim * 4) : 0, zs = qwen35 ? alloc(vDim * 4) : 0;
+  const betas = qwen35 ? alloc(form.v_heads * 4) : 0, alphas = qwen35 ? alloc(form.v_heads * 4) : 0;
+  const rot = block ? alloc(Math.max(dim, hidden, qDim, vDim) * 4) : 0;
 
   // the outlier channels of the classifier's input (T92): their columns in float32, multiplied apart (T210: not of a
   // classifier on the GPU alone, which is not here: a model with them does not stay there, tokensUnfit)
@@ -785,21 +817,21 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   // so that growing it (KV_START, doubling) can take the space of the smaller one. T210: none on the GPU alone, whose
   // keys and values are the GPU's alone (no step runs here, and one that fails is loaded again on the CPU)
   let capacity = direct ? 0 : Math.min(plan.kv_start, seqLen);
-  let keys = alloc(layers * capacity * KV), values = alloc(layers * capacity * KV);
+  let keys = alloc(kvLayers * capacity * KV), values = alloc(kvLayers * capacity * KV);
   function grow(pos) {
     const larger = Math.min(Math.max(2 * capacity, pos + 1), seqLen);
     const oldLayer = capacity * KV, newLayer = larger * KV;
-    const newKeys = alloc(layers * newLayer), newValues = alloc(layers * newLayer);
-    for (let l = 0; l < layers; l++) {
+    const newKeys = alloc(kvLayers * newLayer), newValues = alloc(kvLayers * newLayer);
+    for (let l = 0; l < kvLayers; l++) {
       U.copyWithin(newKeys + l * newLayer, keys + l * oldLayer, keys + (l + 1) * oldLayer);
       U.copyWithin(newValues + l * newLayer, values + l * oldLayer, values + (l + 1) * oldLayer);
     }
     // move both down onto the old blocks, which were the last thing in memory
     const start = keys;
-    U.copyWithin(start, newKeys, newValues + layers * newLayer);
+    U.copyWithin(start, newKeys, newValues + kvLayers * newLayer);
     keys = start;
     values = start + (newValues - newKeys);
-    top = align(values + layers * newLayer);
+    top = align(values + kvLayers * newLayer);
     capacity = larger;
   }
 
@@ -976,6 +1008,11 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (pos0 + count - 1 >= capacity) grow(pos0 + count - 1);
     views();
     gpuEnd = Math.min(gpuEnd, pos0);  // T135: from here on the cache holds what the GPU does not
+    if (qwen35) {
+      // T229: one token at a time (the DeltaNet's state takes them in turn)
+      tokens.forEach((token, t) => runQwen35(token, pos0 + t, needLogits && t === count - 1));
+      return;
+    }
     embed(tokens, pos0);
     for (let l = 0; l < layers; l++) {
       const layerKeys = keys + l * capacity * KV, layerValues = values + l * capacity * KV;
@@ -1042,6 +1079,130 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
     if (channels.length) k.add_columns(logits, columns, picked, channels.length, vocab);
   }
   const forward = (token, pos, needLogits) => run([token], pos, needLogits);
+
+  // ---- T229: a Qwen3.5, one token at a time (llama2_numpy's forward_qwen35 in the same order). Prism's rotation
+  // (Bonsai 2): every block of an input times the normalized Walsh-Hadamard matrix after its signs, into rot
+  function walshHadamard(at, n) {
+    const a = at / 4, scale = Math.fround(Math.sqrt(block));
+    for (let b0 = a; b0 < a + n; b0 += block) {
+      for (let h = 1; h < block; h *= 2) {
+        for (let i = b0; i < b0 + block; i += 2 * h) {
+          for (let j = i; j < i + h; j++) {
+            const u = F[j], v = F[j + h];
+            F[j] = u + v;
+            F[j + h] = u - v;
+          }
+        }
+      }
+    }
+    for (let i = a; i < a + n; i++) F[i] /= scale;
+  }
+  // the input at `at` as the matrices that take n values were stored for: rotated (into rot), or as it is
+  function rotated(at, n, sign) {
+    if (!block) return at;
+    for (let i = 0; i < n; i++) F[rot / 4 + i] = F[at / 4 + i] * F[sign / 4 + i];
+    walshHadamard(rot, n);
+    return rot;
+  }
+  const sigmoid = (v) => 1 / (1 + Math.exp(-v));
+  // the Gated DeltaNet of layer r (its r-th) after its four matrices: mixed (q, k, v), zs, betas and alphas. The causal
+  // conv and SiLU, q and k normalized, and per head of v (head h reads head h / (v_heads / k_heads) of q and k, as
+  // transformers' repeat_interleave) the state decayed, the delta rule, the state read by q; each head's output
+  // normalized and times SiLU of its part of z, into xb
+  function deltaNet(r) {
+    const K1 = taps - 1, cs = convState / 4 + r * convDim * K1, cw = convW / 4 + r * convDim * taps, m = mixed / 4;
+    for (let c = 0; c < convDim; c++) {
+      let sum = 0;
+      for (let j = 0; j < K1; j++) sum += F[cs + c * K1 + j] * F[cw + c * taps + j];
+      sum += F[m + c] * F[cw + c * taps + K1];
+      for (let j = 0; j < K1 - 1; j++) F[cs + c * K1 + j] = F[cs + c * K1 + j + 1];
+      if (K1) F[cs + c * K1 + K1 - 1] = F[m + c];
+      F[m + c] = sum * sigmoid(sum);
+    }
+    const { k_heads: kHeads, v_heads: vHeads, k_head: kHead, v_head: vHead } = form;
+    for (let h = 0; h < 2 * kHeads; h++) {  // q's heads, then k's: over their length (transformers' l2norm, eps 1e-6)
+      let sum = 0;
+      for (let i = 0; i < kHead; i++) sum += F[m + h * kHead + i] ** 2;
+      const inverse = 1 / Math.sqrt(sum + 1e-6) / (h < kHeads ? Math.sqrt(kHead) : 1);
+      for (let i = 0; i < kHead; i++) F[m + h * kHead + i] *= inverse;
+    }
+    const per = vHeads / kHeads, out = xb / 4, delta = new Float64Array(vHead);
+    for (let h = 0; h < vHeads; h++) {
+      const qh = m + ((h / per) | 0) * kHead, kh = qh + kDim, vh = m + 2 * kDim + h * vHead;
+      const a = F[alphas / 4 + h] + F[ssmDt / 4 + r * vHeads + h];
+      const decay = Math.exp(F[ssmA / 4 + r * vHeads + h] * (a > 20 ? a : Math.log1p(Math.exp(a))));
+      const beta = sigmoid(F[betas / 4 + h]), s = states / 4 + (r * vHeads + h) * kHead * vHead;
+      for (let j = 0; j < vHead; j++) delta[j] = 0;
+      for (let i = 0; i < kHead; i++) {
+        const ki = F[kh + i], row = s + i * vHead;
+        for (let j = 0; j < vHead; j++) {
+          F[row + j] *= decay;
+          delta[j] += F[row + j] * ki;
+        }
+      }
+      for (let j = 0; j < vHead; j++) delta[j] = (F[vh + j] - delta[j]) * beta;
+      for (let j = 0; j < vHead; j++) F[out + h * vHead + j] = 0;
+      for (let i = 0; i < kHead; i++) {
+        const ki = F[kh + i], qi = F[qh + i], row = s + i * vHead;
+        for (let j = 0; j < vHead; j++) {
+          F[row + j] += ki * delta[j];
+          F[out + h * vHead + j] += F[row + j] * qi;
+        }
+      }
+      let sum = 0;
+      for (let j = 0; j < vHead; j++) sum += F[out + h * vHead + j] ** 2;
+      const inverse = 1 / Math.sqrt(sum / vHead + eps);
+      for (let j = 0; j < vHead; j++) {
+        const z = F[zs / 4 + h * vHead + j];
+        F[out + h * vHead + j] = F[out + h * vHead + j] * inverse * F[ssmNorm / 4 + r * vHead + j] * z * sigmoid(z);
+      }
+    }
+  }
+  function runQwen35(token, pos, needLogits) {
+    if (pos === 0) {  // a new sequence: nothing learnt
+      F.fill(0, convState / 4, convState / 4 + recurrent * convDim * (taps - 1));
+      F.fill(0, states / 4, states / 4 + recurrent * form.v_heads * form.k_head * form.v_head);
+    }
+    embed([token], pos);
+    if (block) {  // the embedding's rows are stored rotated: back
+      walshHadamard(x, dim);
+      for (let i = 0; i < dim; i++) F[x / 4 + i] *= F[signs.dim / 4 + i];
+    }
+    const HS = headSize * 4;
+    for (let l = 0, f = 0, r = 0; l < layers; l++) {
+      k.rmsnorm(xb, x, attW + l * D, dim, eps);
+      const input = rotated(xb, dim, signs?.dim);
+      if ((l + 1) % interval === 0) {
+        matmuls(input, 1, [[wq, q, S, f], [wg, gate, S, f], [wk, kNow, S, f], [wv, vNow, S, f]]);
+        for (let h = 0; h < heads; h++) k.rmsnorm(q + h * HS, q + h * HS, qNorm + f * HS, headSize, eps);
+        for (let h = 0; h < kvHeads; h++) k.rmsnorm(kNow + h * HS, kNow + h * HS, kNorm + f * HS, headSize, eps);
+        const cos = cosTable + pos * (headSize / 2) * 4, sin = sinTable + pos * (headSize / 2) * 4;
+        k.rope(q, cos, sin, heads, headSize, rotary);
+        k.rope(kNow, cos, sin, kvHeads, headSize, rotary);
+        const layerKeys = keys + f * capacity * KV, layerValues = values + f * capacity * KV;
+        cache(layerKeys + pos * KV, layerValues + pos * KV, kNow, vNow);
+        phase([attentionJob(0, pos, layerKeys, layerValues)]);
+        for (let i = 0; i < qDim; i++) F[xb / 4 + i] *= sigmoid(F[gate / 4 + i]);
+        matmuls(rotated(xb, qDim, signs?.q), 1, [[wo, xb2, S, f]]);
+        f += 1;
+      } else {
+        matmuls(input, 1, [[wqkv, mixed, S, r], [wz, zs, S, r]]);
+        matmuls(xb, 1, [[wb, betas, S, r], [wa, alphas, S, r]]);
+        deltaNet(r);
+        matmuls(rotated(xb, vDim, signs?.v), 1, [[wout, xb2, S, r]]);
+        r += 1;
+      }
+      k.add_inplace(x, xb2, dim);
+      k.rmsnorm(xb, x, ffnW + l * D, dim, eps);
+      matmuls(rotated(xb, dim, signs?.dim), 1, [[w1, hb, S, l], [w3, hb2, S, l]]);
+      k.swiglu(hb, hb, hb2, hidden);
+      matmuls(rotated(hb, hidden, signs?.hidden), 1, [[w2, xb2, S, l]]);
+      k.add_inplace(x, xb2, dim);
+    }
+    if (!needLogits) return;
+    k.rmsnorm(xb, x, finalW, dim, eps);
+    matmuls(rotated(xb, dim, signs?.dim), 1, [[wcls, logits, 0, 0]]);
+  }
 
   // ---- the number of threads (stage 2b): found by measuring, never written down. The search starts from a hint
   // (navigator.hardwareConcurrency, which counts the little cores of a big.LITTLE phone too) and compares the best
@@ -1218,6 +1379,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
   }
   // (T155: int6 weights too, widened to int8 on the GPU, and a model in a 64-bit memory: gpu.js)
   function gpuUnfit() {
+    if (qwen35) return "a Qwen3.5's layers are not on the GPU yet";  // (T232)
     if (!sharedMemory) return "the page is not cross-origin isolated";
     if (headSize % 4) return "heads of a size that is no multiple of 4 are not on the GPU";
     if (!Object.values(gpuMatrices()).every((m) => m.int8 && m.group === 32)) return "float32 weights are not on the GPU yet";

@@ -1199,7 +1199,7 @@ class Llama:
         derived = {name: np.ascontiguousarray(getattr(self, name), dtype=np.float32).tobytes()
                    for name in ("freq_cis_real", "freq_cis_imag") if isinstance(getattr(self, name), np.ndarray)}
         channels = []
-        if int8:
+        if int8 and self.arch != "qwen35":  # (T229: a Qwen3.5's classifier may take its input rotated: none there)
             final = self.rms_final_weight
             raw = external.read(final.offset, self.dim * 4)
             weight = np.frombuffer(bytes(raw.to_py() if hasattr(raw, "to_py") else raw), dtype=np.float32)
@@ -1211,7 +1211,9 @@ class Llama:
                 "shared_classifier": self.wcls is self.token_embedding_table, "int8": bool(int8),
                 "relaxed": "relaxed" not in disable, "tensors": tensors, "derived": derived, "outliers": channels,
                 # T110: the keys and values of an int8 model may be float16 (forward.js uses that on a shared memory)
-                "half_kv": bool(int8) and "kv16" not in disable}
+                "half_kv": bool(int8) and "kv16" not in disable,
+                # T229: a Qwen3.5's layers of Gated DeltaNet and Prism's rotation (FORM)
+                "form": dict(self.form)}
         engine = external.start(plan)
         self.backend = str(engine.backend)
         logits = np.zeros(self.vocab_size, dtype=np.float32)
