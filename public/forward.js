@@ -1292,7 +1292,7 @@ export function createForward({ memory, base, size, kernels, plan, spawn, gpu, g
           if (verdict.cpuFaster) {
             direct.verdict = { key: data.key, cpu: direct.cpu };  // the page keeps it: the next load goes on the CPU at once
             return stopGpu(`the CPU as /benchmark/ measured it (${direct.cpu.GBps?.toFixed(1)} GB/s): ${verdict.cpu.toFixed(0)} ms ` +
-              `against the GPU's ${verdict.gpu.toFixed(0)} ms for ${direct.usage.prompt.toFixed(0)} tokens of prompts and ${direct.usage.written.toFixed(0)} written`);
+              `against the GPU's ${verdict.gpu.toFixed(0)} ms for ${Number(direct.usage.prompt).toFixed(0)} tokens of prompts and ${Number(direct.usage.written).toFixed(0)} written`);
           }
         }
         settleGpu?.(always ? PROMPTS_GPU : PROMPTS_UNTIMED);
