@@ -11,7 +11,7 @@ from test_gguf import gguf_file
 
 import llama2_convert
 from llama2_convert import Arrays, Conversion, check_config, gguf_model, gguf_read, rope_table, tokenizer_json_options
-from llama2_numpy import Llama, Tokenizer, pretokenize, rope_frequencies
+from llama2_numpy import Llama, Tokenizer, pretokenize, rope_amplitude, rope_frequencies, rope_tables
 
 LLAMA3_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
                   r"|\s*[\r\n]+|\s+(?!\S)|\s+")
@@ -33,8 +33,9 @@ def test_the_llama3_frequencies_are_llama_cpps():
 
 def test_without_scaling_the_frequencies_are_what_they_were():
     assert np.array_equal(rope_frequencies(64, 10000.0), 1.0 / 10000.0 ** (np.arange(0, 64, 2) / 64))
-    with pytest.raises(ValueError, match="yarn"):
-        rope_frequencies(64, 10000.0, {"rope_type": "yarn", "factor": 4.0})
+    assert rope_amplitude(None) == rope_amplitude(SCALING) == rope_amplitude(LINEAR) == 1.0
+    with pytest.raises(ValueError, match="dynamic"):
+        rope_frequencies(64, 10000.0, {"rope_type": "dynamic", "factor": 4.0})
 
 
 def test_the_linear_frequencies_are_the_plain_ones_over_the_factor():
@@ -42,14 +43,50 @@ def test_the_linear_frequencies_are_the_plain_ones_over_the_factor():
     assert np.allclose(rope_frequencies(64, 100000.0) / rope_frequencies(64, 100000.0, LINEAR), 4.0, rtol=1e-12)
 
 
-def test_only_the_llama3_and_linear_kinds_of_scaling_are_let_through():
+# T235: config.json of prism-ml/Ternary-Bonsai-1.7B-unpacked@3aca8400 (head_dim 128, rope_theta 1e6), and the same
+# with the optional keys. The frequencies are what transformers 5.16.1's _compute_yarn_parameters made of them (with
+# PyTorch 2.14, in float32), its attention_factor 1.138629436111989 for both
+YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 8192}
+YARN_KEYS = {**YARN, "original_max_position_embeddings": 16384, "beta_fast": 16, "beta_slow": 2, "truncate": False}
+FAST = [1.0, 0.805842221, 0.649381638, 0.523299158, 0.421696514, 0.339820832, 0.273841977, 0.220673397, 0.177827939,
+        0.143301263, 0.115478203, 0.0930572003, 0.0749894157, 0.0604296438, 0.0486967526, 0.0392418988, 0.0316227786,
+        0.0254829675]
+SLOW = [0.000162345415, 0.000130824774, 0.000105424122, 8.49552089e-05, 6.84604893e-05, 5.51683552e-05, 4.44569851e-05,
+        3.58253164e-05, 2.88695483e-05, 2.32643015e-05, 1.87473561e-05, 1.51074091e-05, 1.21741887e-05, 9.81047469e-06,
+        7.90569356e-06, 6.37074163e-06, 5.13381246e-06, 4.13704265e-06, 3.33380353e-06, 2.68651957e-06, 2.16491094e-06,
+        1.74457659e-06, 1.40585337e-06, 1.13289593e-06, 9.1293532e-07, 7.35681795e-07, 5.92843435e-07, 4.7773824e-07,
+        3.84981632e-07, 3.10234441e-07]
+TRANSFORMERS_YARN = FAST + [0.0196292847, 0.0150880395, 0.0115702599, 0.00884971209, 0.00674942741, 0.00513110729,
+                            0.00388677069, 0.00293220137, 0.0022017851, 0.00164446514, 0.00122056005, 0.000899271923,
+                            0.000656733348, 0.000474476255, 0.000338235288, 0.000237012428] + SLOW
+TRANSFORMERS_YARN_KEYS = FAST + [0.0205352511, 0.0165481716, 0.0133352149, 0.0107460786, 0.00865964312, 0.00697830599,
+                                 0.00544650853, 0.00403620768, 0.00296823028, 0.00216281135, 0.00155825494, 0.00110692508,
+                                 0.000772111875, 0.000525583862, 0.000345679902, 0.000215822452] + SLOW
+
+
+@pytest.mark.parametrize("scaling, expected", [(YARN, TRANSFORMERS_YARN), (YARN_KEYS, TRANSFORMERS_YARN_KEYS)],
+                         ids=["bonsai", "keys"])
+def test_the_yarn_frequencies_are_transformers(scaling, expected):
+    """T235: the fast pairs as they were, the slow ones factor times slower (SLOW is the plain frequency over 4), the
+    ones between on a line; and the tables scaled by 0.1 ln(4) + 1."""
+    assert np.allclose(rope_frequencies(128, 1e6, scaling), expected, rtol=3e-7)
+    assert rope_amplitude(scaling) == pytest.approx(1.138629436111989, rel=1e-15)
+    assert rope_amplitude({**scaling, "attention_factor": 1.5}) == 1.5
+    cos, sin = rope_tables(8, 128, 1e6, scaling)
+    angles = np.arange(8)[:, None] * rope_frequencies(128, 1e6, scaling)
+    assert np.allclose(cos, np.cos(angles) * 1.138629436111989) and np.allclose(sin, np.sin(angles) * 1.138629436111989)
+
+
+def test_only_the_kinds_of_scaling_the_tables_know_are_let_through():
     config, weights = synthetic_weights()
     _, published = hugging_face(config, weights, True)
     check_config({**published, "rope_scaling": SCALING})
     check_config({**published, "rope_scaling": LINEAR})
-    for kind in ("dynamic", "yarn"):
-        with pytest.raises(ValueError, match="RoPE scaling"):
-            check_config({**published, "rope_scaling": {"rope_type": kind, "factor": 2.0}})
+    check_config({**published, "rope_scaling": YARN})
+    with pytest.raises(ValueError, match="RoPE scaling"):
+        check_config({**published, "rope_scaling": {"rope_type": "dynamic", "factor": 2.0}})
+    with pytest.raises(ValueError, match="YaRN"):
+        check_config({**published, "rope_scaling": {"rope_type": "yarn", "factor": 2.0}})
 
 
 def llama3(max_seq_len=64, scaling=None):
@@ -61,7 +98,8 @@ def llama3(max_seq_len=64, scaling=None):
     return config, tensors, published
 
 
-@pytest.mark.parametrize("scaling", [None, LINEAR], ids=["llama3", "linear"])
+@pytest.mark.parametrize("scaling", [None, LINEAR, {**YARN, "original_max_position_embeddings": 32}],
+                         ids=["llama3", "linear", "yarn"])
 def test_the_file_and_the_engine_make_the_same_scaled_tables(scaling):
     """float32 files hold the tables (the converter makes them), int8 files do not (the engine does): the two must
     agree, and the engine needs rope_scaling from the options for that (T72's lesson: test the options' path)."""

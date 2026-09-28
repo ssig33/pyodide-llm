@@ -38,6 +38,18 @@ def q8_0_blocks(values):
         (ints.astype(np.float32) * scales.astype(np.float32)[:, None]).reshape(values.shape)
 
 
+def pq2_0_blocks(values):
+    """Prism's PQ2_0 (T235) of ternary weights: per 128 values a float16 d (their mean size here), the values over d
+    rounded to -1, 0 or +1, stored as q = value + 1 in two bits, four to a byte from the lowest bits up."""
+    groups = values.reshape(-1, 128).astype(np.float32)
+    d = np.abs(groups).mean(axis=1).astype(np.float16)
+    trits = np.clip(np.round(groups / np.maximum(d.astype(np.float32), 1e-30)[:, None]), -1, 1).astype(np.int32)
+    q = (trits + 1).reshape(-1, 32, 4)
+    packed = (q[:, :, 0] | q[:, :, 1] << 2 | q[:, :, 2] << 4 | q[:, :, 3] << 6).astype(np.uint8)
+    return np.concatenate([d.view(np.uint8).reshape(-1, 2), packed], axis=1).tobytes(), \
+        (trits.astype(np.float32) * d.astype(np.float32)[:, None]).reshape(values.shape)
+
+
 def turn(w, heads):
     """What llama.cpp's convert does to q and k of a Llama."""
     rows = w.shape[0] // heads
@@ -51,10 +63,12 @@ def gguf_name(name):
     return f"blk.{layer}.{LAYER['.'.join(rest[:-1])]}.{rest[-1]}"
 
 
-def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=10000.0, more=(), extra=None, bos=1, eos=2):
+def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=10000.0, more=(), extra=None, bos=1, eos=2,
+              ternary=False):
     """A GGUF v3 of these Hugging Face tensors, and the tensors as the GGUF holds them (Q8_0 rounds).
     more: further metadata (key, GGUF type, value); extra: {GGUF name: float32 values} written as they are
-    (rope_freqs.weight). bos, eos: None leaves the token out (unsloth's Qwen3 GGUFs name no BOS)."""
+    (rope_freqs.weight). bos, eos: None leaves the token out (unsloth's Qwen3 GGUFs name no BOS). ternary: the
+    matrices as Prism's PQ2_0 instead of Q8_0 (T235)."""
     string = lambda text: struct.pack("<Q", len(text.encode())) + text.encode()
     heads = {"q_proj": published["num_attention_heads"], "k_proj": published["num_key_value_heads"]}
     metadata = [("general.architecture", 8, arch), (f"{arch}.block_count", 4, published["num_hidden_layers"]),
@@ -82,9 +96,9 @@ def gguf_file(tensors, published, vocab_size, arch="llama", pre="gpt-2", theta=1
         if arch == "llama" and kind:
             stored = turn(tensor, heads[kind])
         if tensor.ndim == 2:
-            blob, rounded = q8_0_blocks(stored)
+            blob, rounded = (pq2_0_blocks if ternary else q8_0_blocks)(stored)
             held[name] = rounded  # as the GGUF holds it (turned, for q and k of a Llama)
-            type_ = 8
+            type_ = 142 if ternary else 8
         else:
             blob, type_ = stored.astype(np.float32).tobytes(), 0
             held[name] = stored.astype(np.float32)
@@ -352,6 +366,79 @@ def test_a_qwen3_gguf_that_is_not_the_originals_is_refused(change, what):
     llama2_convert.gguf_weights(file, json.dumps(published))  # its own config goes through
     with pytest.raises(ValueError, match=what):
         llama2_convert.gguf_weights(file, json.dumps({**published, **change}))
+
+
+# ---- T235: the ternary Bonsai, a Qwen3 of Prism's PQ2_0 matrices and YaRN's RoPE scaling
+YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16}
+
+
+def bonsai_gguf():
+    """A Qwen3 as prism-ml/Ternary-Bonsai-1.7B-gguf is one: every matrix PQ2_0 (rows of 128), YaRN said in the
+    metadata as llama.cpp says it, and heads of another size than dim / heads."""
+    from test_qwen3 import qwen3
+    config, weights = synthetic_weights(dim=128, hidden_dim=256, n_heads=4, n_kv_heads=2, head_size=64)
+    tensors, published = qwen3(config, weights, True)
+    published = {**published, "rms_norm_eps": 1e-6, "rope_scaling": YARN}
+    more = [("qwen3.attention.key_length", 4, 64), ("qwen3.attention.layer_norm_rms_epsilon", 6, 1e-6),
+            ("qwen3.rope.scaling.type", 8, "yarn"), ("qwen3.rope.scaling.factor", 6, 4.0),
+            ("qwen3.rope.scaling.original_context_length", 4, 16)]
+    file, same = gguf_file(tensors, published, config["vocab_size"], "qwen3", pre="qwen2", more=more, ternary=True)
+    return config, published, file, same
+
+
+def test_pq2_0_reads_each_code_as_prisms_fork_does():
+    """00 = -1, 01 = 0, 10 = +1, 11 = +2 (unused by a ternary model), times the block's float16 scale, four codes a
+    byte from the lowest bits up."""
+    codes = np.arange(128) % 4
+    packed = (codes.reshape(32, 4) << np.array([0, 2, 4, 6])).sum(axis=1).astype(np.uint8)
+    block = np.float16(0.75).tobytes() + packed.tobytes()
+    assert np.array_equal(llama2_convert.pq2_0(block + block), np.tile((codes - 1) * 0.75, 2).astype(np.float32))
+    values = (np.random.default_rng(5).standard_normal((3, 256)) * 0.2).astype(np.float32)
+    blob, rounded = pq2_0_blocks(values)
+    back = llama2_convert.pq2_0(blob).reshape(values.shape)
+    assert np.array_equal(back, rounded)
+    ints, scales = llama2_convert.quantize(back)
+    assert np.array_equal(ints.astype(np.float32) * scales[:, None], rounded.reshape(-1, 32)), "int8 holds it exactly"
+
+
+@pytest.mark.parametrize("dtype", ["int8", "float32"])
+def test_a_ternary_bonsai_gguf_with_the_originals_files_is_the_safetensors_conversion(dtype):
+    """The checkpoint, tokenizer.bin and options of the safetensors of the same values: PQ2_0 read as the values it
+    stands for, and YaRN's scaling in the options (the engine makes the int8 tables from it)."""
+    config, published, file, same = bonsai_gguf()
+    vocabulary = unigram(config["vocab_size"])
+    got = with_original(file, published, vocabulary, "tokenizer.json", dtype)
+    safetensors = safetensors_file(same)
+    size = struct.unpack("<Q", safetensors[:8])[0]
+    expected = Conversion(safetensors[8:8 + size].decode(), 8 + size, json.dumps(published), vocabulary,
+                          "tokenizer.json", dtype=dtype, max_seq_len=1 << 20)
+    expected.feed(safetensors)
+    expected.finish()
+    assert bytes(got.checkpoint) == bytes(expected.checkpoint)
+    assert got.options == expected.options and got.options["rope_scaling"] == YARN
+    alone = fed(file, dtype)
+    assert bytes(alone.checkpoint) == bytes(expected.checkpoint), "the GGUF's own YaRN makes the same float32 tables"
+    assert alone.options["rope_scaling"] == {"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16}
+
+
+@pytest.mark.parametrize("change, what", [
+    (dict(rope_scaling={**YARN, "factor": 2.0}), "RoPE scaling factor"),
+    (dict(rope_scaling={**YARN, "original_max_position_embeddings": 32}), "original context"),
+    (dict(rope_scaling=None), "RoPE scaling"),
+])
+def test_a_gguf_whose_yarn_is_not_the_originals_is_refused(change, what):
+    config, published, file, _ = bonsai_gguf()
+    llama2_convert.gguf_weights(file, json.dumps(published))  # its own config goes through
+    with pytest.raises(ValueError, match=what):
+        llama2_convert.gguf_weights(file, json.dumps({**published, **change}))
+
+
+def test_a_pq2_0_tensor_whose_rows_are_not_blocks_of_128_is_refused():
+    config, weights = synthetic_weights(dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2)
+    tensors, published = hugging_face(config, weights, True)
+    file, _ = gguf_file(tensors, published, config["vocab_size"], ternary=True)
+    with pytest.raises(ValueError, match="multiple of 128"):
+        Conversion.from_gguf(file)
 
 
 # ---- T136's third stage: GPT-2 and GPT-NeoX, as llama.cpp's convert_hf_to_gguf.py writes them

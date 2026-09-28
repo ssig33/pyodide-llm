@@ -455,11 +455,14 @@ def rope(x, cos, sin):
 def rope_frequencies(width, theta, scaling=None):
     """The angle per position of each pair of a head's first width values (float64), for the RoPE tables.
 
-    scaling: config.json's rope_scaling, of two kinds. "linear" (T126: deepseek-coder): every pair turns factor times
+    scaling: config.json's rope_scaling, of three kinds. "linear" (T126: deepseek-coder): every pair turns factor times
     slower, as if the positions were divided by factor. "llama3": the pairs that turn slowly (a wavelength past
     original_max_position_embeddings / low_freq_factor) turn factor times slower, the fast ones (shorter than
     original / high_freq_factor) as before, and the ones between are a blend of the two (transformers'
-    _compute_llama3_parameters).
+    _compute_llama3_parameters). "yarn" (T235: the ternary Bonsai): the pairs that turn fewer than beta_slow times
+    within original_max_position_embeddings turn factor times slower, the ones that turn more than beta_fast times as
+    before, and the ones between are a blend along a line over their index (transformers' _compute_yarn_parameters);
+    the tables are then scaled by rope_amplitude().
     """
     frequencies = 1.0 / theta ** (np.arange(0, width, 2, dtype=np.float64) / width)
     if not scaling:
@@ -467,6 +470,17 @@ def rope_frequencies(width, theta, scaling=None):
     kind = scaling.get("rope_type", scaling.get("type"))
     if kind == "linear":
         return frequencies / float(scaling["factor"])
+    if kind == "yarn":
+        factor, original = float(scaling["factor"]), float(scaling["original_max_position_embeddings"])
+        # the index of the pair that turns so many times within the original context, and the line between the two
+        where = lambda turns: width * math.log(original / (turns * 2 * math.pi)) / (2 * math.log(theta))
+        low, high = where(scaling.get("beta_fast") or 32), where(scaling.get("beta_slow") or 1)
+        if scaling.get("truncate", True):
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0), min(high, width - 1)
+        # both ends the same would divide by zero: transformers moves the far one a little
+        ramp = np.clip((np.arange(width // 2, dtype=np.float64) - low) / ((high - low) or 0.001), 0, 1)
+        return frequencies / factor * ramp + frequencies * (1 - ramp)
     if kind != "llama3":
         raise ValueError(f"RoPE scaling of the {kind} kind is not supported.")
     factor, low, high = float(scaling["factor"]), float(scaling["low_freq_factor"]), float(scaling["high_freq_factor"])
@@ -476,6 +490,27 @@ def rope_frequencies(width, theta, scaling=None):
     blended = (1 - smooth) * frequencies / factor + smooth * frequencies
     return np.where(wavelength < original / high, frequencies,
                     np.where(wavelength > original / low, frequencies / factor, blended))
+
+
+def rope_amplitude(scaling=None):
+    """What the cos and sin tables are multiplied by: 1 but for YaRN (T235), whose attention_factor (0.1 ln(factor) + 1
+    unless config.json says it) scales q and k, and so every score by its square."""
+    if not scaling or scaling.get("rope_type", scaling.get("type")) != "yarn":
+        return 1.0
+    if scaling.get("attention_factor") is not None:
+        return float(scaling["attention_factor"])
+    factor = float(scaling["factor"])
+    grown = lambda m=1.0: 0.1 * m * math.log(factor) + 1.0 if factor > 1 else 1.0
+    if scaling.get("mscale") and scaling.get("mscale_all_dim"):
+        return grown(float(scaling["mscale"])) / grown(float(scaling["mscale_all_dim"]))
+    return grown()
+
+
+def rope_tables(seq_len, width, theta, scaling=None):
+    """The cos and sin tables (float64, seq_len rows of width // 2) of the RoPE of a head's first width values."""
+    angles = np.arange(seq_len, dtype=np.float64)[:, None] * rope_frequencies(width, theta, scaling)
+    amplitude = rope_amplitude(scaling)
+    return np.cos(angles) * amplitude, np.sin(angles) * amplitude
 
 
 REPETITION_WINDOW = 64  # the repetition penalty looks at this many of the latest tokens
@@ -945,11 +980,11 @@ class Llama:
         self.bo = self.b1 = self.b2 = None
         # a dict from Python, or a JavaScript object from the worker
         rope_scaling = rope_scaling.to_py() if hasattr(rope_scaling, "to_py") else rope_scaling
-        frequencies = lambda width: rope_frequencies(width, rope_theta, rope_scaling)
+        rope = lambda width: rope_tables(self.seq_len, width, rope_theta, rope_scaling)
         if arch in ("gpt2", "neox"):
-            self.gpt2_tensors(take, shared_weights, keep_int8, kv_dim, dtype, frequencies)
+            self.gpt2_tensors(take, shared_weights, keep_int8, kv_dim, dtype, rope)
         else:
-            self.llama_tensors(take, shared_weights, keep_int8, kv_dim, bias, dtype, frequencies, qk_norm)
+            self.llama_tensors(take, shared_weights, keep_int8, kv_dim, bias, dtype, rope, qk_norm)
         self.backend = "NumPy"
         if external is not None:
             if offset != int(external.size):
@@ -977,7 +1012,7 @@ class Llama:
         self.stats = {}
         self._run = 0
 
-    def llama_tensors(self, take, shared_weights, keep_int8, kv_dim, bias, dtype, frequencies, qk_norm=False):
+    def llama_tensors(self, take, shared_weights, keep_int8, kv_dim, bias, dtype, rope, qk_norm=False):
         """The tensors of a Llama (and of a Qwen2, which adds the q, k and v biases at the end, and of a Qwen3, which
         adds the norms of q and k after them), in file order."""
         dim, hidden_dim, n_layers = self.dim, self.hidden_dim, self.n_layers
@@ -1007,10 +1042,9 @@ class Llama:
             self.k_norm = take(n_layers, self.head_size, matrix=False)
         if dtype != np.float32:
             # half precision is too coarse for the rotation angles, and int8 files leave the RoPE tables out
-            angles = np.arange(self.seq_len)[:, None] * frequencies(self.head_size)
-            self.freq_cis_real, self.freq_cis_imag = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+            self.freq_cis_real, self.freq_cis_imag = (table.astype(np.float32) for table in rope(self.head_size))
 
-    def gpt2_tensors(self, take, shared_weights, keep_int8, kv_dim, dtype, frequencies):
+    def gpt2_tensors(self, take, shared_weights, keep_int8, kv_dim, dtype, rope):
         """The tensors of a GPT-2 or a GPT-NeoX, in the order llama2_convert.layout() writes them. The two
         differ in one place: GPT-2 has a learned table of positions, GPT-NeoX the RoPE tables (left out of an
         int8 checkpoint, as everywhere)."""
@@ -1044,9 +1078,8 @@ class Llama:
             self.freq_cis_real = self.freq_cis_imag = np.zeros((self.seq_len, self.head_size // 2), dtype=np.float32)
         elif dtype != np.float32:
             # the angles of the rotated part only, in a table of the same shape (the rest is never read)
-            angles = np.arange(self.seq_len)[:, None] * frequencies(self.rotary)
             tables = [np.zeros((self.seq_len, self.head_size // 2), dtype=np.float32) for _ in range(2)]
-            for table, values in zip(tables, (np.cos(angles), np.sin(angles))):
+            for table, values in zip(tables, rope(self.rotary)):
                 table[:, :self.rotary // 2] = values
             self.freq_cis_real, self.freq_cis_imag = tables
 

@@ -46,10 +46,13 @@ STRING, ARRAY = 8, 9
 F32, F16, Q8_0, BF16 = 0, 1, 8, 30
 # T98: the 4- and 5-bit types of the GGUF files that are about int4, read only to measure them (widened to float32)
 Q4_0, Q4_1, Q5_0, Q4_K, Q6_K = 2, 3, 6, 12, 14
+# T235: Prism's ternary PQ2_0 of their llama.cpp fork (the ternary Bonsai)
+PQ2_0 = 142
 TYPE_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16", Q4_0: "Q4_0", Q4_1: "Q4_1", Q5_0: "Q5_0",
-              Q4_K: "Q4_K", Q6_K: "Q6_K"}
-# bytes per value: a block of 32 values (or a super-block of 256) and its scales
-BYTES = {F32: 4, F16: 2, BF16: 2, Q8_0: 34 / 32, Q4_0: 18 / 32, Q4_1: 20 / 32, Q5_0: 22 / 32, Q4_K: 144 / 256, Q6_K: 210 / 256}
+              Q4_K: "Q4_K", Q6_K: "Q6_K", PQ2_0: "PQ2_0"}
+# bytes per value: a block of 32 values (or a super-block of 256, or PQ2_0's 128) and its scales
+BYTES = {F32: 4, F16: 2, BF16: 2, Q8_0: 34 / 32, Q4_0: 18 / 32, Q4_1: 20 / 32, Q5_0: 22 / 32, Q4_K: 144 / 256, Q6_K: 210 / 256,
+         PQ2_0: 34 / 128}
 
 
 def half(raw):
@@ -107,8 +110,17 @@ def widen_q6_k(raw):
     return (values * scale * d[:, :, None, None]).reshape(-1, 256)
 
 
+def widen_pq2_0(raw):
+    """Blocks of 128: a float16 d, then 32 bytes; value j is bits 2 (j % 4) of byte j // 4, q, and worth (q - 1) * d
+    (the fork's dequantize_row_pq2_0)."""
+    blocks = raw.reshape(-1, 34)
+    j = np.arange(128)
+    codes = (blocks[:, 2 + j // 4] >> (2 * (j % 4)).astype(np.uint8)) & 3
+    return (codes.astype(np.float32) - 1) * half(blocks[:, :2])
+
+
 WIDEN = {Q4_0: (32, 18, widen_q4_0), Q4_1: (32, 20, widen_q4_1), Q5_0: (32, 22, widen_q5_0),
-         Q4_K: (256, 144, widen_q4_k), Q6_K: (256, 210, widen_q6_k)}
+         Q4_K: (256, 144, widen_q4_k), Q6_K: (256, 210, widen_q6_k), PQ2_0: (128, 34, widen_pq2_0)}
 
 
 class Reader:

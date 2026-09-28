@@ -193,6 +193,10 @@ export const LICENSES = {
   "Qwen/Qwen3-8B-GGUF": APACHE, "mmnga-o/Qwen3-Swallow-8B-RL-v0.2-gguf": APACHE,
   "unsloth/Qwen3-4B-Instruct-2507-GGUF": APACHE, "unsloth/Qwen3-4B-Thinking-2507-GGUF": APACHE,
   "mradermacher/DeepSeek-R1-Distill-Qwen-1.5B-GGUF": MIT,
+  // T235: Prism ML's ternary Bonsai, the PQ2_0 GGUF and the float16 safetensors its vocabulary and config.json come from
+  "prism-ml/Ternary-Bonsai-1.7B-gguf": APACHE, "prism-ml/Ternary-Bonsai-1.7B-unpacked": APACHE,
+  "prism-ml/Ternary-Bonsai-4B-gguf": APACHE, "prism-ml/Ternary-Bonsai-4B-unpacked": APACHE,
+  "prism-ml/Ternary-Bonsai-8B-gguf": APACHE, "prism-ml/Ternary-Bonsai-8B-unpacked": APACHE,
 };
 /** The Hugging Face repository a model comes from. */
 export const sourceOf = (entry) => entry.hf?.repo ?? entry.source;
@@ -533,6 +537,22 @@ const LISTED = [
     ...ggufOf("unsloth/Qwen3-4B-Thinking-2507-GGUF", "f40adb104d4d44aee52f398b60597c5866a973a3", "Qwen3-4B-Thinking-2507-Q8_0.gguf",
       "Qwen/Qwen3-4B-Thinking-2507", "768f209d9ea81521153ed38c47d515654e938aea"), download: 4280405632,
     conversion: {}, options: {}, generation: thinking, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
+  // T235: Prism ML's ternary Bonsai, Qwen3s whose every weight is -1, 0 or +1 times a scale per 128, in their PQ2_0
+  // GGUF (a quarter of Q8_0's size); the page widens them to int8, which holds them exactly. Their chat_template
+  // always begins the answer with an empty thought; the sampling is the GGUF's own. Their config.json names no BOS
+  // (the converter would take token 1, '"'): Qwen3's, <|endoftext|>, which it also stops at as Qwen3 does
+  ...[["1.7B", "983b5dec2ff16aab79990711ba0f828a499a7e6a", "3aca840085293d026ce6f6b80fafdae937fd2eeb", 463290464,
+    "fetches 463 MB (GGUF) → int8 1.9 GB · desktop only"],
+  ["4B", "a3eb42bafe873f9686bc97486c43b72ef7d75ec8", "4485fae7a00129467b9329b738110d88b2942a1a", 1074969344,
+    "fetches 1.1 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox"],
+  ["8B", "c2aefbeb4b24469cd11579c3384b990404c17a30", "ac20f03fc62e872399218b659c8e949dfca05769", 2182184672,
+    "fetches 2.2 GB (GGUF) → int8 9.2 GB · desktop only · Chrome and Firefox"]].map(([size, revision, original, download, sizes]) => ({
+    group: "hf", id: `hf-ternary-bonsai-${size.toLowerCase()}`, name: `Ternary Bonsai ${size}`,
+    note: `ternary weights · answers at once · 日本語 / English · ${sizes}`,
+    ...ggufOf(`prism-ml/Ternary-Bonsai-${size}-gguf`, revision, `Ternary-Bonsai-${size}-PQ2_0.gguf`,
+      `prism-ml/Ternary-Bonsai-${size}-unpacked`, original), download,
+    conversion: {}, options: { bos: 151643, stop_tokens: [151643, 151645] }, generation: { steps: 0, temperature: 0.5, topp: 0.85, repetition_penalty: 1.0 },
+    template: QWEN3_AT_ONCE, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE })),
 ];
 
 // T90: memory. A device that runs out of it kills the worker's WebAssembly memory, so the page warns before it
