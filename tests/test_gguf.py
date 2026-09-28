@@ -485,3 +485,19 @@ def test_a_gpt2_or_neox_gguf_that_is_not_the_originals_is_refused(model, change,
     llama2_convert.gguf_weights(file, json.dumps(config))  # its own config goes through
     with pytest.raises(ValueError, match=what):
         llama2_convert.gguf_weights(file, json.dumps({**config, **change}))
+
+
+def test_the_padding_of_a_gguf_vocabulary_is_empty_as_the_safetensors_path_pads():
+    """T143 (T136's review): llama.cpp pads a vocabulary up to its size with unused pieces ([PAD151665] ..., type 5),
+    which the safetensors path writes as empty text: the same tokenizer.bin now, which was spelling them out when
+    chosen. Its control tokens (type 3) are the special ones, its user-defined ones (type 4) the added ones."""
+    from llama2_numpy import Tokenizer
+    tokens = ["a", "b", "ab", "<|endoftext|>", "<think>", "[PAD5]", "[PAD6]"]
+    metadata = lambda count: {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.pre": "gpt-2",
+                              "tokenizer.ggml.tokens": tokens[:count],
+                              "tokenizer.ggml.token_type": [1, 1, 1, 3, 4, 5, 5][:count], "tokenizer.ggml.merges": ["a b"]}
+    data, _, _, controls, added = llama2_convert.gguf_tokenizer(metadata(7), 7)
+    assert controls == ["<|endoftext|>"] and added == ["<think>"]
+    assert data == llama2_convert.gguf_tokenizer(metadata(5), 7)[0]
+    vocabulary = Tokenizer(data, 7, kind="bytebpe")
+    assert vocabulary.vocab[5:] == [b"", b""] and vocabulary.vocab[4] == b"<think>"

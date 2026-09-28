@@ -1639,8 +1639,10 @@ def gguf_tokenizer(metadata, vocab_size):
     for rank, merge in enumerate(metadata.get("tokenizer.ggml.merges", [])):
         left, right = merge.split(" ")
         ranks.setdefault(left + right, -float(rank))
-    # what tokenizer.json calls special: llama.cpp's control tokens (type 3)
-    pieces = [(text, ranks.get(text, UNMATCHABLE), text in ranks and (kinds[id] if id < len(kinds) else 1) != 3)
+    # what tokenizer.json calls special: llama.cpp's control tokens (type 3). Its padding up to the vocabulary's size
+    # ([PAD151665] ..., type 5, unused) is text no piece of tokenizer.json has: empty, as the safetensors path pads (T143)
+    kind = lambda id: kinds[id] if id < len(kinds) else 1
+    pieces = [("" if kind(id) == 5 else text, ranks.get(text, UNMATCHABLE), text in ranks and kind(id) != 3)
               for id, text in enumerate(tokens)]
     # Qwen's tokenizer.json normalizes to NFC, which a GGUF does not say: the page's safetensors path does it
     options = {"tokenizer_kind": "bytebpe", "nfkc": False, "nfc": pre == "qwen2", "pretokenizer": GGUF_PRETOKENIZERS[pre],
