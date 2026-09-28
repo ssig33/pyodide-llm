@@ -1187,25 +1187,25 @@ T175（レビュー中）→ T184 → T185 → T186 → 負けた形を外すか
 - 出どころ: https://huggingface.co/collections/prism-ml/bonsai-2 。中身は `prism-ml/Ternary-Bonsai-2-27B-gguf`（apache-2.0、base は Qwen/Qwen3.8-27B、sha b072e1d3…）: `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.95 GB、1.75 ビット / 重み）・`-PQ2_0.gguf`（7.21 GB、2.13 ビット）・`-F16.gguf`・mmproj（視覚、BF16 と Q8_0）。ほかに `-gguf-dev`（Q2_0、prism の fork が要る）と `-mlx-2bit`。カードの要点: 27.36B（言語 24.35B・64 ブロック、埋め込みと LM head 2.54B、視覚 0.46B）、Qwen3.8 の hybrid attention（約 75% が linear attention）、262K の文脈、埋め込み・attention・MLP・LM head まで全部 3 値、カーネルは Prism ML の llama.cpp の fork（CUDA・Metal）。
 - 順（前にやるべきことは採番する、の決まり）: T228 → T229 → T230 → T231 → T232 → T233 → T234。T228 の調べで無理と分かれば、そこで持ち主に判断を仰ぐ。
 
-### T228 [調査] Bonsai 2 と Qwen3.8 の形を調べる — 状態: 未着手（週明け。規模 小〜中）
+### T228 [Bonsai][調査] Bonsai 2 と Qwen3.8 の形を調べる — 状態: 未着手（週明け。規模 小〜中）
 - Qwen3.8 の hybrid attention の中身（linear attention の種類: Gated DeltaNet などか、層の並び、状態の大きさ、RoPE の有無）、tokenizer と chat_template（思考の形）、config の項目。PTQ1_0・PQ2_0 のブロックの並び（Prism の llama.cpp の fork の `ggml` の型の定義と、CPU の参照の dequant）。ライセンス（apache-2.0、NOTICE）と KNOWN_ISSUES.md。prism-ml のほかの小さいモデル（前の版の Bonsai など）が一覧に入れやすいか。結果として、T229〜T234 の規模と、ブラウザの上限（64 ビットのメモリ 16 GB、iPhone）で動く見込みを数字で出す。元ネタの許諾（fork は MIT のはず、確かめる）。
 
-### T229 [追加] linear attention（Qwen3.8 の hybrid attention）をエンジンの CPU の道に — 状態: 未着手（T228 の後。規模 大）
+### T229 [Bonsai][追加] linear attention（Qwen3.8 の hybrid attention）をエンジンの CPU の道に — 状態: 未着手（T228 の後。規模 大）
 - NumPy の参照（`llama2_numpy.py`）と `forward.js` の両方。状態（再帰の状態）を KV キャッシュの代わりに持つ層と、普通の attention の層の混ぜ方。legacy 形式に層の種類をどう持たせるか（`FORM` に足す、T144 の決まり）。元ネタは transformers の Qwen3.8 の実装と llama.cpp（MIT）。
 
-### T230 [追加] 3 値の重み（PTQ1_0・PQ2_0）を読む — 状態: 未着手（T228 の後。規模 中〜大）
+### T230 [Bonsai][追加] 3 値の重み（PTQ1_0・PQ2_0）を読む — 状態: 未着手（T228 の後。規模 中〜大）
 - GGUF の読み手（`gguf_model()`）に 2 つの型。int8 に広げると 27B で 27 GB になり 16 GB に入らないので、**3 値のまま持つ**新しい dtype を legacy 形式と変換器に足す（`CONVERTER` を上げる回。T143 の決まりどおり、待っている変換器の直しを同じ回に）。`gguf_check.py` に参照の読み（F16 の GGUF と比べる）。
 
-### T231 [性能] 3 値の行列 × ベクトルと行列 × 行列の CPU のカーネル — 状態: 未着手（T230 の後。規模 大）
+### T231 [Bonsai][性能] 3 値の行列 × ベクトルと行列 × 行列の CPU のカーネル — 状態: 未着手（T230 の後。規模 大）
 - WASM SIMD で 3 値のまま掛ける（T98 の 6 ビットの広げと同じ考え方で、グループを int8 に広げて relaxed_dot か、3 値の加減算で）。元ネタは Prism の fork の CPU のカーネル（MIT なら行を写せる）、BitNet の TL1/TL2（MIT）。スレッド（jobs.js）、タイル（T159）、補正（T197）。
 
-### T232 [性能] 3 値の GPU の道 — 状態: 未着手（T231 の後。規模 大）
+### T232 [Bonsai][性能] 3 値の GPU の道 — 状態: 未着手（T231 の後。規模 大）
 - 行列 × ベクトル（答え）とタイル（プロンプト）のシェーダ、linear attention の層の GPU の段。WebGPU の元ネタは Hugging Face の space `webml-community/ternary-bonsai-2-webgpu-kernels`（コレクションに入っている。許諾を確かめる）。重みを GPU だけに（T156・T210）。
 
-### T233 [追加] 一覧に Bonsai 2 を足す — 状態: 未着手（T229〜T231 の後、GPU は T232 の後でもよい。規模 小〜中）
+### T233 [Bonsai][追加] 一覧に Bonsai 2 を足す — 状態: 未着手（T229〜T231 の後、GPU は T232 の後でもよい。規模 小〜中）
 - `src/models.js` の項目（PTQ1_0 か PQ2_0、語彙と config は原本 Qwen3.8 から T136 の段 ② の形で、書式、思考の形の 2 つ）、`LICENSES`、`gguf.yml` の突き合わせ、固定値、format_check。大きさの警告（64 ビットのメモリ、Chrome と Firefox のみ、iPhone は不可の見込み）。本番の `models.yml` で答えること。
 
-### T234 [文書] Bonsai 2 の結果を docs と gist に — 状態: 未着手（T233 の後。規模 小）
+### T234 [Bonsai][文書] Bonsai 2 の結果を docs と gist に — 状態: 未着手（T233 の後。規模 小）
 - 速さ・メモリ・品質（perplexity か固定値）を記録のあるものだけで。
 
 ### T199 [性能] スレッドの本数の検索を、1 塊の乱れに強くする — 状態: **完了（本線に入れた 48f8ee5、レビュー済み T217）**（2026-09-27、T190 のレビューの「あれば良い」。ブランチ `t199-search`、Opus medium。規模 小）
