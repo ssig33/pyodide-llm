@@ -353,9 +353,10 @@ export const placer = (holes) => (offset) => holes.reduce((at, [start, end]) => 
  * be (eligible: a Llama the GPU's steps take, T152) and it fits; else the CPU (and the prompts on the GPU where the
  * layers alone fit, gpuRoom, as before). deviceMemory: navigator.deviceMemory, 4 where the browser does not say
  * (Safari, Firefox); Chromium says 8 for 8 GB or more: both are then held to BOTH_ON_8 (6 GiB, the owner's choice,
- * 2026-09-27: up to llm-jp-3.1 1.8B both as before, 3B and larger (Qwen2.5 3B's 7.2 GB, T153's risk on an 8 GB phone)
- * not), and the GPU alone to nothing, as the CPU alone is (a 7B's 9.2 GB runs on the CPU there, T132: the GPU alone
- * takes about as much as the CPU alone, the matrices once either way).
+ * 2026-09-27: the models of the list up to 2B both as before but llm-jp-3.1 1.8B, whose 6.45 GB with the keys and values
+ * of 4096 positions on either side is 11 MB past it (the second review of T156); 3B and larger (Qwen2.5 3B's 7.2 GB,
+ * T153's risk on an 8 GB phone) not), and the GPU alone to nothing, as the CPU alone is (a 7B's 9.2 GB runs on the CPU
+ * there, T132: the GPU alone takes about as much as the CPU alone, the matrices once either way).
  * cpu: the checkpoint and what the forward pass puts after it (footprint); gpuOnly: the checkpoint without the
  * matrices and what the forward pass puts after that (footprint with direct); gpu: gpuBytes. Returns { mode: "both" |
  * "gpu" | "cpu", gpuRoom } */

@@ -139,10 +139,13 @@ const started = [{ count: 16, ms: 48 }, { count: 64, ms: 72 }];
 // both), else the GPU alone where the model can be and fits (8: no limit, as the CPU alone has none), else the CPU
 {
   const GB = 2 ** 30;
-  // (the owner, 2026-09-27: both up to 6 GiB on a device that says 8: llm-jp-3.1 1.8B, about 2.3 + 2.4 GB, as before)
+  // (the owner, 2026-09-27: both up to 6 GiB on a device that says 8. The second review of T156, the list's configs with
+  // footprint() and gpuBytes(), 4096 positions: sarashina2.2 1B 2.81 + 1.94 GB (4.42 GiB) both as before; llm-jp-3.1
+  // 1.8B 3.543 + 2.910 GB (6.010 GiB, no GQA: its keys and values are 0.8 GB on either side) 11 MB past: the GPU alone)
   assert.deepEqual(weightsPlace({ cpu: 1.5 * GB, gpu: 1.4 * GB, deviceMemory: 8 }), { mode: "both", gpuRoom: 4.5 * GB }, "Llama 3.2 1B on 8: both");
-  assert.equal(weightsPlace({ cpu: 2.3 * GB, gpuOnly: 0.6 * GB, gpu: 2.4 * GB, deviceMemory: 8, eligible: true }).mode, "both", "1.8B on 8: both");
-  assert.equal(weightsPlace({ cpu: 3.1 * GB, gpuOnly: 0.6 * GB, gpu: 3.0 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "6.1 GiB: past 6");
+  assert.equal(weightsPlace({ cpu: 2.812e9, gpuOnly: 0.98e9, gpu: 1.939e9, deviceMemory: 8, eligible: true }).mode, "both", "sarashina2.2 1B on 8: both");
+  assert.equal(weightsPlace({ cpu: 3.543e9, gpuOnly: 1.72e9, gpu: 2.910e9, deviceMemory: 8, eligible: true }).mode, "gpu", "llm-jp-3.1 1.8B: 6.01 GiB, past 6");
+  assert.equal(weightsPlace({ cpu: 3 * GB, gpuOnly: 0.6 * GB, gpu: 3 * GB, deviceMemory: 8, eligible: true }).mode, "both", "6 GiB: both");
   assert.equal(weightsPlace({ cpu: 4.4 * GB, gpuOnly: 1.2 * GB, gpu: 4.1 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "3B on 8: the GPU alone");
   assert.equal(weightsPlace({ cpu: 9.2 * GB, gpuOnly: 1.5 * GB, gpu: 8 * GB, deviceMemory: 8, eligible: true }).mode, "gpu", "7B on 8: no limit");
   const notEligible = weightsPlace({ cpu: 4.4 * GB, gpu: 4.1 * GB, deviceMemory: 8 });

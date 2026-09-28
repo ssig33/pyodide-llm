@@ -232,5 +232,36 @@ console.log("ok: FORM's keys and defaults reach footprint() from sink.open()");
     assert.deepEqual(worker.told, lost ? ["open", "stop"] : ["open"]);
     assert.equal(worker.terminated, Boolean(lost), "the load on the CPU began before the GPU's worker ended");
   }
+  // (4) the second review of T156: the verdict that the CPU is faster goes to the page with its load's id (the page
+  // reads no word of a load another choice cancelled: without it a late verdict was kept for the model chosen since),
+  // and a verdict the page kept for this device and /benchmark/'s reading keeps the model off the GPU alone, and says so
+  {
+    const { into } = opened();
+    engineGpu = Promise.resolve("prompts and answers on the CPU");
+    into.weights.llama({}, {});
+    into.release();
+    const said = [], told = [];
+    gpuContext.postMessage = (data) => said.push(JSON.parse(JSON.stringify(data)));
+    gpuContext.console = { ...console, info: (line) => told.push(line) };
+    gpuContext.verdict = { key: "arm|valhall||Mali-G615|a browser|0", cpu: { GBps: 28.7, threads: 4, promptGMACs: 40 } };
+    vm.runInContext("gpuOnlyNow.lost = 'the CPU as /benchmark/ measured it'; gpuOnlyNow.verdict = verdict", gpuContext);
+    assert.equal(await vm.runInContext("gpuOnlyReady({ id: 'kept' }, 7)", gpuContext), false);
+    assert.deepEqual(said.filter((data) => data.type === "gpu-alone"), [{ type: "gpu-alone", load: 7, alone: gpuContext.verdict }],
+      "the verdict went to the page without its load's id");
+    const placed = (cpu) => {
+      gpuContext.cpu = cpu;
+      vm.runInContext("gpuAdapter.key = verdict.key; gpuRequest = { remembered: { alone: verdict }, cpu }", gpuContext);
+      const sunk = vm.runInContext("checkpointSink()", gpuContext);
+      sunk.sink.open(size, proxy(LLAMA3B), "int8", proxy(FORM));
+      const direct = Boolean(sunk.weights.direct);
+      sunk.release();
+      return direct;
+    };
+    assert.equal(placed({ GBps: 28.7, threads: 4, promptGMACs: 40 }), false, "a verdict the page kept left the model on the GPU alone");
+    assert.ok(told.some((line) => /as the page kept it/.test(line)), "the console did not say the verdict it kept");
+    assert.equal(placed({ GBps: 30.1, threads: 4, promptGMACs: 40 }), true, "/benchmark/'s CPU measured again did not weigh the two again");
+    await vm.runInContext("gpuOnlyEnding", gpuContext);
+    gpuContext.console = console;
+  }
   console.log("ok: a model on the GPU alone lets go of its GPU's worker where its load ends without it (T156's review)");
 }

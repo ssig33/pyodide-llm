@@ -631,7 +631,7 @@ function weightsBuffer(size, header, options, keep) {
     // T148: the layers on the GPU are a second copy of them, in the same memory where the GPU is a phone's or an
     // Apple's: both, with the rest of this model, within half of what the device says it has (as src/models.js's
     // weightsFor asks for six bits past half). T156: a model that does not fit so goes on the GPU alone where it can
-    // (the owner's B, 2026-09-27: forward.js's weightsPlace; the device's 8 read as 8 GB, the double copy held to 4),
+    // (the owner's B, 2026-09-27: forward.js's weightsPlace; the double copy held to 6 GiB where the device says 8),
     // decided before any memory is made for it (a memory of the whole checkpoint would be one too many, T96)
     const deviceMemory = self.navigator?.deviceMemory ?? 4;
     // T205: a browser that does not say (Safari, Firefox) keeps a generation's steps (the classifier and the embedding
@@ -684,17 +684,26 @@ function weightsBuffer(size, header, options, keep) {
 // memory the device says (T205), the GPU's worker (not the benchmark's rounds), a shared memory and the 64-bit kernels,
 // the int8 kernels, an adapter that is no fallback (but for the tests), and no failure of the GPU under this model before
 // (cpuOnly). convert() asks it too before it opens a file to keep a conversion in as it comes (the review of T156)
-const gpuOnlyPossible = () => hasWebGpu && self.navigator?.deviceMemory !== undefined && !benchPage && !benching && sharedWanted() &&
+// (the owner, 2026-09-27: and no verdict the page kept that the CPU is faster here: then the CPU at once)
+const gpuOnlyPossible = () => gpuOnlyAllowed() && !aloneKept();
+const gpuOnlyAllowed = () => hasWebGpu && self.navigator?.deviceMemory !== undefined && !benchPage && !benching && sharedWanted() &&
   Boolean(wideKernels?.shared) && !disabled.includes("int8") && !cpuOnly.has(loadingKey) &&
-  Boolean(gpuAdapter) && (!gpuAdapter.fallback || Boolean(gpuForce.fallback)) &&
-  // (the owner, 2026-09-27: a CPU found faster here before, as the page kept it, loads on the CPU at once)
-  !forwardModule.aloneHolds(gpuRequest?.remembered?.alone, gpuAdapter.key, gpuRequest?.cpu);
+  Boolean(gpuAdapter) && (!gpuAdapter.fallback || Boolean(gpuForce.fallback));
+// T156: whether the page kept that the CPU was faster here than this model on the GPU alone (forward.js's aloneHolds)
+const aloneKept = () => Boolean(gpuAdapter) && forwardModule.aloneHolds(gpuRequest?.remembered?.alone, gpuAdapter.key, gpuRequest?.cpu);
 // T156: where a model goes ({ mode: "both" | "gpu" | "cpu", gpuRoom }, forward.js's weightsPlace): the GPU alone only
 // for a Llama of int8 the GPU's steps take (gpuOnlyUnfit), where the page and the device may (gpuOnlyPossible)
 function gpuOnlyWeightsFor(size, header, options, after, deviceMemory) {
   const { dtype = "float32" } = options, form = { arch: options.arch, bias: options.bias, qk_norm: options.qk_norm, head_dim: options.head_dim };
   const cpu = size + after, gpu = forwardModule.gpuBytes(header, form);
-  const eligible = gpuOnlyPossible() && !forwardModule.gpuOnlyUnfit(header, dtype, form, gpuAdapter, gpuForce);
+  const fit = gpuOnlyAllowed() && !forwardModule.gpuOnlyUnfit(header, dtype, form, gpuAdapter, gpuForce);
+  const eligible = fit && !aloneKept();
+  // (the second review of T156: the status line then says only the memory's reason where the layers do not fit beside
+  // the CPU's copy; the console says the kept verdict, and what asks again)
+  if (fit && !eligible) {
+    console.info("gpu: the CPU as /benchmark/ measured it was faster here than this model on the GPU alone, as the page kept it: " +
+      "on the CPU (a new run of /benchmark/'s CPU section, another browser version or new shaders weigh the two again)");
+  }
   if (!eligible) return forwardModule.weightsPlace({ cpu, gpu, deviceMemory });
   const tensors = placesOf(header, dtype, form), stored = size - forwardModule.layerHoles(tensors).reduce((sum, [a, b]) => sum + b - a, 0);
   const gpuOnly = stored + afterCheckpoint(header, stored, { ...options, direct: true }, true);
@@ -775,15 +784,17 @@ const weightsRoom = () => gpuOnlyNow?.room?.();
 const weightsDrained = () => gpuOnlyNow?.drained?.();
 // T156: after a model on the GPU alone is built: its GPU ready (true), or failed (false: the worker let go of it, and
 // the model goes on the CPU from now on this visit)
-async function gpuOnlyReady(model) {
+async function gpuOnlyReady(model, id) {
   const direct = gpuOnlyNow;
   if (!direct || outsideNow?.engine === undefined) return true;
   await outsideNow.engine.gpu;
   if (!direct.lost) return true;
   console.warn(`gpu: ${direct.lost}: the model was on the GPU alone, and is loaded again on the CPU`);
   cpuOnly.add(modelKey(model));
-  // (the CPU was faster: the page keeps it for this model and device, and the next visit loads on the CPU at once)
-  if (direct.verdict) postMessage({ type: "gpu-alone", model: model.id, alone: direct.verdict });
+  // (the CPU was faster: the page keeps it for this model and device once the load on the CPU is ready, and the next
+  // visit loads on the CPU at once. The load's id: the page reads no word of a load another choice cancelled, the
+  // second review of T156: a verdict that came late was kept for the model chosen since)
+  if (direct.verdict) postMessage({ type: "gpu-alone", load: id, alone: direct.verdict });
   // (the GPU's worker let go of its device: stopped by forward.js where it started it, and here where it did not, as a
   // model whose GPU forward.js gave up as the engine was built, before start(): its release() has no "ended" to wait
   // for then. The review of T156: the load on the CPU begins after it, T205)
@@ -1370,7 +1381,7 @@ async function load(model, signal, id) {
     await initialized;
     signal.throwIfAborted();
     const converted = await convert(model, signal, id);
-    if (!(await gpuOnlyReady(model))) return load(model, signal, id);  // T156: the GPU failed on it alone
+    if (!(await gpuOnlyReady(model, id))) return load(model, signal, id);  // T156: the GPU failed on it alone
     await startThreads(model);
     postMessage({
       type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
@@ -1437,7 +1448,7 @@ async function load(model, signal, id) {
     weights.destroy();
     tokenizer?.buffer.destroy();
   }
-  if (!(await gpuOnlyReady(model))) return load(model, signal, id);  // T156: the GPU failed on it alone
+  if (!(await gpuOnlyReady(model, id))) return load(model, signal, id);  // T156: the GPU failed on it alone
   await startThreads(model);
   postMessage({
     type: "ready", load: id, pyodide: pyodide.version, backend: llama.backend, seq_len: llama.seq_len,
