@@ -57,11 +57,10 @@ const SWALLOW_MS = "[INST] <<SYS>>\nあなたは誠実で優秀な日本人の�
 const ZEPHYR = "<|user|>\n{prompt}</s> \n<|assistant|>\n";
 // T124: Qwen3 thinks before it answers (<think>…</think>, then the answer), which is the form its chat_template writes
 // and the converter reads. The same weights answer at once when the answer begins with an empty thought: the form of
-// enable_thinking=false. <think> and </think> are tokens of the vocabulary that tokenizer.json does not call special,
-// and the converter passes only the special ones: they are named here for every Qwen3, or they would be spelled out
-// (in a template, or where a visitor types them: the real tokenizer reads them as the tokens they are)
+// enable_thinking=false. <think> and </think> are tokens of the vocabulary that tokenizer.json does not call special:
+// the converter names those as specials with the rest (T143: <tool_call>, <|fim_prefix|> ...), so the list names none
+// for Qwen3. A list of its own would go over the converter's and spell the others out where a visitor types them (T221)
 const QWEN3_AT_ONCE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-const qwen3 = { specials: ["<|im_start|>", "<|im_end|>", "</think>", "<think>"] };
 // the sampling of Qwen3's model card for either form (its top-k and presence penalty the page's sampler has not)
 const thinking = { steps: 0, temperature: 0.6, topp: 0.95, repetition_penalty: 1.0 };
 const atOnce = { steps: 0, temperature: 0.7, topp: 0.8, repetition_penalty: 1.0 };
@@ -69,7 +68,7 @@ const atOnce = { steps: 0, temperature: 0.7, topp: 0.8, repetition_penalty: 1.0 
  * share their weights, and so a conversion kept in the browser; only the format differs. shares: both ids, for
  * kept.js's replaced() (what either kept before its source changed goes, whichever form is opened first) */
 function thinkingAndNot(id, name, source, download, sizes, chat = {}) {
-  const common = { group: "hf", ...source, download, conversion: {}, options: qwen3, shares: [`${id}-thinking`, id],
+  const common = { group: "hf", ...source, download, conversion: {}, options: {}, shares: [`${id}-thinking`, id],
     prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE, ...chat };
   return [
     { ...common, id: `${id}-thinking`, name: `${name} (thinking)`, note: `thinks before it answers · 日本語 / English · ${sizes}`,
@@ -528,12 +527,12 @@ const LISTED = [
   { group: "hf", id: "hf-qwen3-4b-instruct-2507", name: "Qwen3 4B Instruct 2507", note: "answers instructions · 日本語 / English · fetches 4.3 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox",
     ...ggufOf("unsloth/Qwen3-4B-Instruct-2507-GGUF", "a06e946bb6b655725eafa393f4a9745d460374c9", "Qwen3-4B-Instruct-2507-Q8_0.gguf",
       "Qwen/Qwen3-4B-Instruct-2507", "cdbee75f17c01a7cc42f958dc650907174af0554"), download: 4280405600,
-    conversion: {}, options: qwen3, generation: atOnce, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
+    conversion: {}, options: {}, generation: atOnce, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
   // its chat_template begins the answer with <think> itself
   { group: "hf", id: "hf-qwen3-4b-thinking-2507", name: "Qwen3 4B Thinking 2507", note: "thinks before it answers · 日本語 / English · fetches 4.3 GB (GGUF) → int8 4.5 GB · desktop only · Chrome and Firefox",
     ...ggufOf("unsloth/Qwen3-4B-Thinking-2507-GGUF", "f40adb104d4d44aee52f398b60597c5866a973a3", "Qwen3-4B-Thinking-2507-Q8_0.gguf",
       "Qwen/Qwen3-4B-Thinking-2507", "768f209d9ea81521153ed38c47d515654e938aea"), download: 4280405632,
-    conversion: {}, options: qwen3, generation: thinking, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
+    conversion: {}, options: {}, generation: thinking, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
 ];
 
 // T90: memory. A device that runs out of it kills the worker's WebAssembly memory, so the page warns before it

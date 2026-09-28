@@ -4,8 +4,9 @@
 # filled()'s rules) against transformers' apply_chat_template on the files of the pinned revision. Only config.json,
 # the tokenizer files and the safetensors headers (by Range) are fetched; no weights.
 #
-#   python3 tests/format_check.py [--hf] <directory for the downloads> [model id ...]
+#   python3 tests/format_check.py [--hf] [--prompt <text> ...] <directory for the downloads> [model id ...]
 #
+# --prompt: one more prompt after PROMPTS (T221: what a visitor types, such as Qwen3's <tool_call>), as often as given.
 # --hf: as ?hf= opens the repository, with what the converter makes alone (T143): the list's options and format are
 # left out. A difference known for the list's format is then no error when it is gone.
 #
@@ -211,6 +212,11 @@ def main():
     arguments = sys.argv[1:]
     alone = "--hf" in arguments  # T143: the converter's options and format only, as ?hf= has them
     arguments = [argument for argument in arguments if argument != "--hf"]
+    prompts = list(PROMPTS)
+    while "--prompt" in arguments:
+        at = arguments.index("--prompt")
+        prompts.append(arguments[at + 1])
+        del arguments[at:at + 2]
     directory, only = Path(arguments[0]), arguments[1:]
     accepted = set(inspect.signature(llama2_numpy.Tokenizer.__init__).parameters) - {"self", "data", "vocab_size", "kind"}
     failed, stale = [], []
@@ -230,7 +236,7 @@ def main():
         thinking = {"enable_thinking": False} if "(no thinking)" in entry["name"] else {}
         known = KNOWN.get(entry["id"], {})
         same, explained, diffs = 0, 0, []
-        for prompt in PROMPTS:
+        for prompt in prompts:
             page = [options["bos"]] + tokenizer.encode(filled(template, prompt), tuple(options.get("specials", ())))
             messages = ([{"role": "system", "content": SYSTEM[entry["id"]]}] if entry["id"] in SYSTEM else []) \
                 + [{"role": "user", "content": prompt}]
@@ -257,7 +263,7 @@ def main():
         where = "the list" if entry.get("template") and not alone else "the converter"
         verdict = "DIFF" if diffs else "known" if explained else "ok  "
         note = f", {explained} as known: {known['why']}" if explained else ""
-        print(f"{verdict} {entry['id']}: {same}/{len(PROMPTS)}{note} (format of {where})", flush=True)
+        print(f"{verdict} {entry['id']}: {same}/{len(prompts)}{note} (format of {where})", flush=True)
         for diff in diffs[:3]:
             print("  ", diff)
         if diffs:
