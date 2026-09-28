@@ -293,6 +293,13 @@ for tensors_of, config_of, arch in ((tensors, gpt2_config, "gpt2"), (neox_tensor
     llama2_convert.convert_weights(llama2_convert.Arrays(tensors_of), config_of, "int8", positions, numpy_int8)
     llama2_convert.convert_weights(llama2_convert.Arrays(tensors_of), config_of, "int8", positions, kernel_int8, quantize_rows=quantize_rows)
     assert numpy_int8 == kernel_int8, f"the kernels' quantizer changed the int8 {arch} checkpoint"
+# T233: Bonsai 2's sizes, which Pyodide's NumPy (its int of 32 bits) counted short: np.prod of a layer stack of 5.7
+# billion weights wrapped, the page made a memory of 2.7 GB for 7.2 GB and a conversion went past 100%
+bonsai = (5120, 17408, 64, 24, 4, -248320, 4096)
+bonsai_form = {"arch": "qwen35", "qk_norm": True, "head_dim": 256, "interval": 4, "k_heads": 16, "v_heads": 48, "k_head": 128,
+               "v_head": 128, "conv": 4, "hadamard": 1024}
+assert llama2_convert.checkpoint_size(bonsai, "ternary", bonsai_form) == 7242373148, "a 27B's size is counted short"
+assert llama2_numpy.checkpoint_dtype(bonsai, 7242373148, bonsai_form) == "ternary"
 # T123: bfloat16 widened on the kernels is NumPy's widening to the bit, every 16-bit pattern (NaNs, infinities,
 # subnormals, both zeros), in a length that leaves a tail after the groups of 8
 widen = llama2_numpy.kernel_widener("simdkernel.so")

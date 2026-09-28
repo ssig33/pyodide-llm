@@ -5,6 +5,7 @@
 # lets the same code run when the site is built (convert_hf.py, quantize.py) and inside the browser, where the
 # WebAssembly memory has 32 bits and never shrinks.
 import json
+import math
 import re
 import struct
 import time
@@ -101,7 +102,7 @@ def check_dtype(dtype):
 
 def tensor_bytes(shape, is_matrix, dtype):
     """How many bytes a tensor of layout() takes in a checkpoint of that dtype."""
-    count, dtype = int(np.prod(shape)), dtype_name(dtype)
+    count, dtype = int(math.prod(shape)), dtype_name(dtype)
     if dtype not in PACKED:
         return count * np.dtype(dtype).itemsize
     if is_matrix is None:
@@ -183,12 +184,12 @@ class Writer:
                 quantized, scales = quantize6(rows)
                 packed = pack6(quantized)
             self.put(offset + first * 3 // 4, packed)
-            self.put(offset + int(np.prod(shape)) * 3 // 4 + 4 * (first // 32), scales)
+            self.put(offset + int(math.prod(shape)) * 3 // 4 + 4 * (first // 32), scales)
         elif is_matrix:
             fast = self.quantize_rows is not None and shape[-1] % 32 == 0
             quantized, scales = (self.quantize_rows if fast else quantize)(np.asarray(values, dtype=np.float32).reshape(-1, shape[-1]))
             self.put(offset + first, quantized)
-            self.put(offset + int(np.prod(shape)) + 4 * (first // group_size(shape[-1])), scales)
+            self.put(offset + int(math.prod(shape)) + 4 * (first // group_size(shape[-1])), scales)
         elif is_matrix is False:
             self.put(offset + 4 * first, np.asarray(values, dtype=np.float32))
 
@@ -883,7 +884,7 @@ class Safetensors:
             raise ValueError(f"{name} is stored as {info['dtype']}: only float32, float16 and bfloat16 are supported.")
         itemsize, reader = READERS[info["dtype"]]
         shape = self.shape(name)
-        row = int(np.prod(shape[1:]))
+        row = int(math.prod(shape[1:]))
         begin = self.base + info["data_offsets"][0] + int(start * row * itemsize)
         return reader(self.read(begin, int((stop - start) * row * itemsize))).reshape(stop - start, *shape[1:])
 
@@ -1399,18 +1400,18 @@ def convert_pieces(source, config, dtype, max_seq_len, out, quantize_rows=None):
     writer = Writer(out, header, dtype, form, quantize_rows=quantize_rows)
 
     plan, shapes = conversion_plan(header, form, source_prefix(source, form), rotary_of(config, form))
-    total, done = sum(int(np.prod(shape)) for shape in shapes), 0
+    total, done = sum(int(math.prod(shape)) for shape in shapes), 0
 
     for index, (parts, shape) in enumerate(zip(plan, shapes)):
         if parts is None:
             # the RoPE tables (left out of an int8 checkpoint): cos, then sin
             writer.write(index, 0, rope_table(config, header, plan[:index].count(None)))
-            done += int(np.prod(shape))
+            done += int(math.prod(shape))
             yield done, total
             continue
         if isinstance(parts, tuple):
             writer.write(index, 0, hadamard_signs(config, parts[1]))
-            done += int(np.prod(shape))
+            done += int(math.prod(shape))
             continue
         first = 0
         for name, transform in parts:
@@ -1419,7 +1420,7 @@ def convert_pieces(source, config, dtype, max_seq_len, out, quantize_rows=None):
             if found != expected:
                 raise ValueError(f"This model cannot be converted: {name} is {found or 'missing'}, not {expected}.")
             rows = found[0] if len(found) > 1 else 1
-            row = int(np.prod(found)) // rows
+            row = int(math.prod(found)) // rows
             # a transform needs the whole tensor (a small one); everything else goes piece by piece
             step = rows if transform or len(found) == 1 else max(1, PIECE // row)
             for start in range(0, rows, step):
@@ -1430,7 +1431,7 @@ def convert_pieces(source, config, dtype, max_seq_len, out, quantize_rows=None):
                 first += values.size
                 done += values.size
                 yield done, total
-        assert first == int(np.prod(shape)), name
+        assert first == int(math.prod(shape)), name
 
 
 class Stream:
@@ -1471,16 +1472,16 @@ class Stream:
         self.out = out  # None when the checkpoint goes to sink
         self.writer = Writer(self.out, self.header, dtype, self.form, sink=sink, quantize_rows=quantize_rows)
         plan, shapes = conversion_plan(self.header, self.form, source_prefix(self, self.form), rotary_of(config, self.form))
-        self.total, self.done = sum(int(np.prod(shape)) for shape in shapes), 0
+        self.total, self.done = sum(int(math.prod(shape)) for shape in shapes), 0
         wanted = {}
         for index, (parts, shape) in enumerate(zip(plan, shapes)):
             if parts is None:
                 self.writer.write(index, 0, rope_table(config, self.header, plan[:index].count(None)))
-                self.done += int(np.prod(shape))
+                self.done += int(math.prod(shape))
                 continue
             if isinstance(parts, tuple):
                 self.writer.write(index, 0, hadamard_signs(config, parts[1]))
-                self.done += int(np.prod(shape))
+                self.done += int(math.prod(shape))
                 continue
             first = 0
             for name, transform in parts:
@@ -1492,7 +1493,7 @@ class Stream:
                     raise ValueError(f"{name} is stored as {self.tensors[name]['dtype']}: only float32, float16 and bfloat16 are supported.")
                 # GPT-2's c_attn holds q, k and v in one matrix, so one tensor of the file can feed several
                 wanted.setdefault(name, []).append((index, first, transform))
-                first += int(np.prod(part_shape(shape, parts)))
+                first += int(math.prod(part_shape(shape, parts)))
         # what to do with each stretch of the file, in the order of the file
         self.steps = []
         for name, info in sorted(self.tensors.items(), key=lambda item: item[1]["data_offsets"][0]):
@@ -1544,7 +1545,7 @@ class Stream:
         shape = tuple(info["shape"])
         # T136's third stage: a GPT-2's Conv1D matrix, which the GGUF holds as (out, in), is read in that shape
         stored = tuple(reversed(shape)) if info.get("transposed") else shape
-        row = int((int(np.prod(stored[1:])) if len(stored) > 1 else int(stored[0])) * itemsize)
+        row = int((int(math.prod(stored[1:])) if len(stored) > 1 else int(stored[0])) * itemsize)
         # the head permutation needs its whole matrix (a small one); everything else goes row by row, as it comes.
         # A GGUF's tensor held in another order than Hugging Face's is put back whole too
         again = info.get("turned") or info.get("split") or info.get("transposed") or info.get("untile")
@@ -1566,7 +1567,7 @@ class Stream:
         raw = bytes(self.pending[:rows * row])
         values = ternary_blocks(raw, info["dtype"]) if blocks else reader(raw)
         del self.pending[:rows * row]
-        width = int(np.prod(stored[1:])) if len(stored) > 1 else int(stored[0])  # values a row
+        width = int(math.prod(stored[1:])) if len(stored) > 1 else int(stored[0])  # values a row
         if blocks:
             values = values.reshape(rows, width // TERNARY_BLOCK * TERNARY_BYTES)
         elif len(stored) > 1:
@@ -1783,7 +1784,7 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
         info = tensors["rope_freqs.weight"]
         if info["type"] != 0:
             raise ValueError(f"rope_freqs.weight is stored as ggml type {info['type']}, not F32.")
-        size = 4 * int(np.prod(info["shape"]))
+        size = 4 * int(math.prod(info["shape"]))
         header["rope_freqs.weight"] = {"dtype": "F32", "shape": info["shape"], "rope_freqs": True,
                                        "data_offsets": [info["offset"], info["offset"] + size]}
     names, layer, layers = GGUF_ARCHITECTURES[arch]
@@ -1806,7 +1807,7 @@ def gguf_model(metadata, tensors, base, rope_freqs=False):
             # ggml itself requires it; a file that breaks it would be read at the wrong offsets and write nonsense
             raise ValueError(f"{name} is {dtype} with rows of {info['shape'][-1]}, which is not a multiple of "
                              f"{BLOCKS[dtype]}.")
-        size = int(int(np.prod(info["shape"])) * READERS[dtype][0])
+        size = int(int(math.prod(info["shape"])) * READERS[dtype][0])
         entry = {"dtype": dtype, "shape": info["shape"], "data_offsets": [info["offset"], info["offset"] + size]}
         kind = parts[2] if len(parts) == 4 else None
         if arch == "llama" and kind in turns:
