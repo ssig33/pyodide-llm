@@ -12,11 +12,11 @@ flowchart TD
   python["Pyodide, Python in WebAssembly: loads and converts the model to int8, tokenizer, sampling"]
   engine["Forward engine: forward.js"]
   cpu["CPU: WebAssembly SIMD kernels, on software threads where the browser allows"]
-  gpu["GPU: WebGPU shaders, for the blocks of a prompt where this device measured them faster"]
+  gpu["GPU: WebGPU shaders, for the prompt and the answer where this device measured them faster"]
   page -- "prompt" --> worker
   worker -- "text, token by token" --> page
   worker --> python
-  python -- "one token, or a block of the prompt" --> engine
+  python -- "the prompt in blocks, the answer a few tokens at a time" --> engine
   engine --> cpu
   engine --> gpu
 ```
@@ -38,10 +38,11 @@ Open **https://takano32.github.io/pyodide-llm/** and write a prompt.
   keeps Pyodide and NumPy so that the page opens offline next time (`?offline=off` turns that off).
 - Every answer shows the temperature, the seed and the speed. The button left of the prompt changes them; the seed
   under an answer is a button that fixes it, so two models can be compared on the same seed. The status line says
-  what ran: the kernels, int8, relaxed SIMD, how many threads, and whether the prompt ran on WebGPU.
+  what ran: the kernels, int8, relaxed SIMD, how many threads, and whether the prompt and the answer ran on WebGPU.
 - While a text is being written, the send button stops it. Ctrl / Cmd + Enter sends; Enter alone breaks the line.
-- [/benchmark/](https://takano32.github.io/pyodide-llm/benchmark/) measures your device (CPU, GPU, storage, line)
-  and can open the result as a GitHub issue.
+- [/benchmark/](https://takano32.github.io/pyodide-llm/benchmark/) measures your device (the browser's features,
+  CPU, a model, GPU, storage, line, and on its own button how much memory a page can hold) and can open the result
+  as a GitHub issue.
 
 ## Browsers
 
@@ -55,12 +56,16 @@ Firefox and WebKit and in the installed Chrome and Edge: all 23 combinations run
 | software threads (through the Service Worker) | yes | yes | yes |
 | 64-bit memory: models over 4 GB | yes | yes | no |
 | WebGPU for the prompt | yes | not in the Firefox of the CI (no WebGPU in a worker) | on the owner's iPhone; not in the CI's WebKit |
+| WebGPU for the answer | yes, for models of Llama's shape | no | no (Safari does not say how much memory the device has) |
 
 - Where a model does not fit in 32-bit memory and the browser has no 64-bit memory (Safari), the page stores the
   weights in 6 bits instead of 8. The 7B and 8B models do not fit even then, so they need Chrome or Firefox.
 - The GPU is used by default where the browser has WebGPU. The page measures the GPU against the CPU on your device
   and keeps the CPU where it is faster. A model whose weights would not fit twice in memory (once for the CPU, once
   for the GPU) stays on the CPU.
+- A browser that does not say how much memory the device has (Safari, Firefox) keeps the answer on the CPU, and
+  `/benchmark/` skips its round without the kernels there (NumPy widens the weights to float32: for llm-jp-3-150m,
+  Pyodide grew to 958 MB in CI's Chromium).
 - For Safari, the only records are CI's WebKit (Playwright's build of Safari's engine) and the owner's iPhone.
   Safari on a Mac has not been tried.
 
@@ -76,7 +81,8 @@ The model list has three groups:
 - **Unquantized originals** of some of them (float16 or float32), to compare with int8.
 - **From Hugging Face, converted in this browser** (53 entries, from Pythia 70M to 8B models: Llama, Mistral,
   Qwen2.5, Qwen3, llm-jp, sarashina, Swallow, GPT-2, GPT-NeoX and others). The page fetches the weights from
-  huggingface.co (or a Q8_0 GGUF of them), converts them to int8 in your browser with the same Python code that
+  huggingface.co (for 47 of them a Q8_0 GGUF, read with the original repository's vocabulary and configuration),
+  converts them to int8 in your browser with the same Python code that
   builds the site's models, and keeps the result for the next visit. About lists what is kept and deletes it. A
   download of more than 500 MB asks first.
 
@@ -125,9 +131,10 @@ A checkpoint of more than 1 GB asks first.
    (`kernels/`, written in AssemblyScript) on the model's own WebAssembly memory. With threads, software threads
    (`public/helper.js`) share the rows of each matrix. The page measures how many threads are fastest on your
    device.
-4. Where WebGPU is available, the blocks of a prompt can run on the GPU (`public/gpu.js`, `public/shaders.js`). The
-   page checks each shader against JavaScript on your device, times them, and uses the GPU only where it measured
-   it faster than the CPU. The generated tokens run on the CPU for now.
+4. Where WebGPU is available, the blocks of a prompt and the tokens of the answer can run on the GPU
+   (`public/gpu.js`, `public/shaders.js`). The page checks each shader against JavaScript on your device, times them,
+   and uses the GPU only where it measured it faster than the CPU. The answer goes to the GPU 4 tokens at a time,
+   each sampled there with the random number the CPU drew for it.
 
 More:
 
@@ -176,9 +183,10 @@ and pitfalls, and [TODO.md](TODO.md) the tasks.
 - [llm-jp-3-150m](https://huggingface.co/llm-jp/llm-jp-3-150m) by LLM-jp (Apache License 2.0).
 - [TinyLlamas](https://huggingface.co/karpathy/tinyllamas) by Andrej Karpathy and
   [ellishg/tinyllamas](https://huggingface.co/ellishg/tinyllamas) for the TinyStories checkpoints.
-- [llama.cpp](https://github.com/ggml-org/llama.cpp), [ONNX Runtime](https://github.com/microsoft/onnxruntime)
-  and [TensorFlow.js](https://github.com/tensorflow/tfjs) for the shapes of the WebGPU shaders.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp), [ONNX Runtime](https://github.com/microsoft/onnxruntime),
+  [TensorFlow.js](https://github.com/tensorflow/tfjs) and [MLC LLM](https://github.com/mlc-ai/mlc-llm) for the
+  shapes of the WebGPU shaders.
 
 ## License
 
-[Mozilla Public License 2.0](LICENSE), the same as Pyodide's. Some files carry code from other projects under their own licenses, and keep those notices where the code is: `public/llama2_numpy.py` (tairov/llama2.py and karpathy/llama2.c, MIT) and `public/shaders.js` (llama.cpp and ONNX Runtime, MIT; TensorFlow.js, Apache-2.0). The models are not in this repository and each keeps its own license (see the model list).
+[Mozilla Public License 2.0](LICENSE), the same as Pyodide's. Some files carry code from other projects under their own licenses, and keep those notices where the code is: `public/llama2_numpy.py` (tairov/llama2.py and karpathy/llama2.c, MIT) and `public/shaders.js` (llama.cpp and ONNX Runtime, MIT; TensorFlow.js, MLC LLM and Apache TVM, Apache-2.0). The models are not in this repository and each keeps its own license (see the model list).

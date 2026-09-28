@@ -66,16 +66,29 @@ A 6-bit value is stored as an int8 whose lowest 2 bits are 0, with a scale a qua
 (32 values in 24 bytes) is new, and everything else is the int8 path. A 6-bit file is 7/9 of the int8 file.
 
 6 bits is slower: about 0.45 times int8 on one thread (stories15M, 243 against 490 tok/s), 0.37 to 0.53 times on 4
-threads in CI. So the page uses 6 bits only where int8 does not fit. Where the browser has 64-bit memory, a model
+threads in CI. Since 2026-09-27 the kernel widens the 6-bit values in 8 instructions instead of 15, 1.64 times as
+fast on CI's x86-64 runner and 1.26 to 1.30 times on its arm64 runner; the ratio to int8 after that has not been
+measured. So the page uses 6 bits only where int8 does not fit. Where the browser has 64-bit memory, a model
 too large for 32 bits stays int8: Llama 3.2 3B wrote 1.9 tok/s in 6 bits on 32-bit memory and 4.1 tok/s in int8
 on 64-bit memory (Chromium in CI). `?bits=6` or `?bits=8` chooses by hand.
 
 ## Models from GGUF
 
-Some models of the list are fetched as a Q8_0 GGUF (llama.cpp's int8 with a float16 scale per 32 values). Q8_0
-turns back into int8 without loss. Each GGUF was compared with its original tensor by tensor before it went into
-the list (`tests/gguf_check.py`). In 6 bits, a GGUF is quantized twice, which adds about 3% to the error of the
-weights (Qwen2.5 0.5B: 0.02375 against 0.02308); on 1,500 tokens the perplexity could not tell the two apart.
+47 of the 53 Hugging Face models of the list are fetched as a Q8_0 GGUF (llama.cpp's int8 with a float16 scale
+per 32 values), with the vocabulary and the configuration of the original repository. Q8_0 turns back into int8
+without loss. Each GGUF was compared with its original tensor by tensor before it went into the list
+(`tests/gguf_check.py`): every row had to be within a relative error of 0.05 of the original, of llama.cpp's Q8_0 of the original, or
+of the Q8_0 of the original rounded to float16 (some GGUFs were made through float16). This is checked for each
+file, not for each publisher: Qwen's own GGUFs of Qwen3 0.6B and 1.7B differ from their originals by 0.9 to 2.2%
+in every layer matrix, while Qwen's own 4B and 8B match, so the list takes those two from another publisher.
+
+The GGUF's int8 is, byte for byte, llama.cpp's Q8_0 of the original (checked on the GPT-2 and Pythia GGUFs), not
+the page's own int8 of it. The two differ like any two roundings of the same int8: on 1,000 tokens the most likely
+token agreed 95.7 to 98.2% of the time and the perplexity moved by −0.13 to +0.31%, as much as a small change to
+the rounding of the page's own int8 moves them.
+
+In 6 bits, a GGUF is quantized twice, which adds about 3% to the error of the weights (Qwen2.5 0.5B: 0.02375
+against 0.02308); on 1,500 tokens the perplexity could not tell the two apart.
 
 ## Other small effects
 
@@ -84,3 +97,9 @@ weights (Qwen2.5 0.5B: 0.02375 against 0.02308); on 1,500 tokens the perplexity 
   the right BOS (DeepSeek-R1 Distill Qwen 1.5B), and its entry now names it.
 - RMSNorm's epsilon: 1e-5 for all models until Qwen3 0.6B showed +0.12% with it; the converter now passes the
   model's own value.
+- The order of rounding inside the int8 kernels changed twice on 2026-09-27 (one scaling per group instead of
+  four, and the relaxed SIMD correction added as an integer). The first moved perplexity by less than 0.1%
+  (llm-jp-3-150m 29.992 → 29.997, tiny-lm 88.347 → 88.262); the second by −0.31 to +0.59% over eight comparisons,
+  in no fixed direction, as much as between a float16 and a float32 KV cache.
+- The KV cache: float16 (with threads) cannot be told from float32 (llm-jp-3-150m: 29.957 against 30.094). On the
+  GPU the keys and values are float16 too.

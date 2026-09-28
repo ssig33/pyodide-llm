@@ -71,10 +71,52 @@ Attention grows with the position: in llm-jp-3-150m it is 2% of a token at posit
 
 Around the forward pass, Python chooses each token (`node tests/overhead.mjs`, the CI's x86-64 and arm64 runners,
 one thread, 128 tokens): what a generated token costs outside `forward.js` is 0.31-0.35 ms for llm-jp-3-150m (4% of
-the token) and 0.24-0.35 ms for tiny-lm (16-20%), most of it the sampling kernel. A call from Python into
+the token) and 0.24-0.35 ms for tiny-lm (16-20%), most of it the sampling kernel (measured before that kernel's
+speed-up below). A call from Python into
 JavaScript costs 1.3-1.7 µs. The first code after a forward pass is slower than the same code warm, since the pass
 has read the weights through the caches. With the threads a page uses, the forward pass is 1.5-1.9 times shorter on
 those runners and the outside stays, so it is an estimated 5-8% and 26-27% there (not measured).
+
+## The kernels, 2026-09-27
+
+Changes to the CPU kernels, each timed against the kernel before it in the same process, taking turns. The CI's
+x86-64 runners draw a different CPU from run to run, so the CPU is named where it mattered. None of these has been
+timed on the owner's devices yet.
+
+| change | measured on | times as fast |
+|---|---|---:|
+| a prompt's int8 matrix product in tiles of 4 rows × 4 tokens | CI arm64 (Neoverse-N2), 1 and 4 threads | 1.17-1.33 |
+| the same, llm-jp-3-150m's prompt in blocks of 16 tokens | CI arm64, 1 thread / 4 threads | 1.25-1.27 / 1.09-1.15 |
+| the same, 4 to 6 tokens of narrow rows | CI x86-64 (AMD EPYC 9V45), 1 thread | 0.88-0.99 |
+| the sampling kernel, llm-jp-3-150m / tiny-lm | CI x86-64 (EPYC 7763) | 2.35 / 2.07 |
+| the same | CI arm64 | 1.54 / 1.28 |
+| 6-bit weights widened in 8 instructions instead of 15 | CI x86-64 / arm64 | 1.64 / 1.26-1.30 |
+| Safari's int8 kernel (no relaxed SIMD) | the second development machine, 1 thread | 1.17-1.21 |
+| SwiGLU and GELU four values at a time | the second development machine, 1 thread | 4.12 / 4.24 |
+| one token's int8 kernel scales a group once, not four times | CI arm64 (Neoverse-N2) / x86-64 (EPYC 9V45) | 1.04-1.12 / 0.88-0.95 |
+
+The last row is slower on AMD's Zen 5 with one thread, where the kernel before it already read 87 to 94% as fast as
+a loop that only reads; with 4 threads it is 0.99 to 1.01 there. The owner chose to keep it. The prompt's tiles
+reduce only the reads: the bookkeeping of each group stays, so they stay far from what a loop of dot products
+alone reaches.
+
+## The tokenizer
+
+Before the first token, Python encodes the prompt. `node tests/encode-bench.mjs` compares the engine's `encode()`
+with an earlier version in one Pyodide (CI's x86-64 runner, an AMD EPYC 7763, and its arm64 runner; ms for a text
+of about 64 tokens, x86-64 / arm64):
+
+| vocabulary | before 2026-09-27 | now |
+|---|---:|---:|
+| Llama 2 (llama2.c's BPE) | 6.06 / 6.58 | 1.09 / 1.12, then 0.55 on x86-64 with the heap below |
+| tiny-lm (Unigram) | 1.02 / 1.07 | 0.55 / 0.58 |
+| llm-jp-3-150m (Unigram) | 3.09 / 3.33 | 1.34 / 1.43 |
+
+rinna's sentencepiece model is 3.0 times as fast, Llama 3.2's byte-level BPE 2.2 times, GPT-2's and Qwen3's 1.08
+to 1.12 times. llama2.c's BPE used to grow with the square of the text; it now takes its pairs from a heap, and
+1040 tokens take 9.9 ms instead of 185.8 (EPYC 7763), 10.6 instead of 172.5 (arm64); before both changes, 1000
+tokens took 1.7 s. In exchange, loading a Unigram tokenizer takes 11 to 38 ms longer, once per model, and it keeps
+more in Pyodide's memory (llm-jp-3-150m: 9.1 → 15.2 MiB). These speed-ups did not change any ID.
 
 ## Long texts
 
@@ -148,4 +190,5 @@ conversion about 5 seconds.
 ## Not measured
 
 - Safari on a Mac, and iPhones other than the owner's.
-- The speed of the GPU path on real devices: see [webgpu.md](webgpu.md).
+- The kernels and the tokenizer of 2026-09-27 on the owner's devices.
+- Which side the page chooses on real devices, and how fast the GPU path is there: see [webgpu.md](webgpu.md).

@@ -19,10 +19,10 @@ flowchart TD
   worker -- "each piece of text" --> page
   worker --> engine
   worker --> convert
-  engine -- "tensor positions; one token or a block of the prompt" --> forward
+  engine -- "tensor positions; blocks of the prompt, a few tokens of the answer" --> forward
   forward --> kernels
   forward --> helper
-  forward -- "blocks of a prompt" --> gpu
+  forward -- "blocks of the prompt, 4 tokens of the answer" --> gpu
 ```
 
 | Part | What it does |
@@ -32,7 +32,7 @@ flowchart TD
 | `public/worker.js` | Loads Pyodide and NumPy, downloads the model in parts while Pyodide loads, and runs `generate()`. |
 | `public/llama2_numpy.py` | The engine. Reads llama2.c's legacy format (float32, float16, int8, 6 bits), the tokenizers (llama2.c's BPE, sentencepiece Unigram, byte-level BPE), the architectures (Llama, Qwen2, Qwen3, GPT-2, GPT-NeoX), and samples. Without the kernels, NumPy does the arithmetic. |
 | `public/llama2_convert.py` | Converts a Hugging Face model (or a Q8_0 GGUF) as its file arrives, and writes it into the model's memory. The same code builds the site's models (`convert_hf.py`, `quantize.py`) and converts in the browser. It also reads a model's chat template (a small part of Jinja). |
-| `public/forward.js` | One token's forward pass, and a block of prompt tokens, in JavaScript. It calls the same kernels in the same order as the Python engine would. |
+| `public/forward.js` | One token's forward pass, and a block of prompt tokens, in JavaScript. It calls the same kernels in the same order as the Python engine would, and chooses for each block and each few tokens whether the CPU or the GPU runs them. |
 | `kernels/` | The SIMD kernels: int8 and float32 matrix products, activation quantization, RMSNorm, LayerNorm, RoPE, attention, SwiGLU, GELU, and the sampling (repetition penalty, softmax, top-p). |
 | `public/helper.js`, `public/jobs.js` | Software threads, and the work they share. |
 | `public/gpu.js`, `public/shaders.js` | The GPU worker and all WGSL shaders. |
@@ -69,9 +69,13 @@ threads on each device and writes its decision to the console (lines starting wi
 - WebAssembly has 32-bit addresses (4 GB). Where the browser has 64-bit memory (Chrome and Firefox), a model that
   does not fit runs on it, about 10% slower. Where it does not (Safari), the page stores the weights in 6 bits.
 - What the forward pass needs besides the weights (the KV cache for the whole context, its growth, the
-  activations) is computed from the header before the model is loaded (`footprint()` in `forward.js`).
+  activations) is computed from the header before the model is loaded (`footprint()` in `forward.js`). The same
+  place decides the type of the KV cache: float32 on one thread; float16 with threads, except for a model with
+  grouped-query attention, which keeps float32 unless that would push it out of 32-bit memory or it needs 64-bit
+  memory anyway (see [performance.md](performance.md#threads)).
 - The model's WebAssembly memory is reused when another model is chosen: Chromium would not create a third
-  WebAssembly memory on one page.
+  WebAssembly memory on one page. Before the next model loads, the page also waits (up to 5 seconds) for the GPU
+  worker of the last one to let go of its buffers and its device.
 
 ## Downloading and converting
 
@@ -79,14 +83,27 @@ threads on each device and writes its decision to the console (lines starting wi
 - Hugging Face models are fetched in parts of 8 or 16 MiB over 6 connections, in the order of the file, and each
   tensor is converted when it arrives. The download is never held as a whole: the peak is about the converted
   model.
-- Several of the models in the list are fetched as a Q8_0 GGUF with the vocabulary and the configuration of the
-  original repository: half the download, the same weights to within the rounding of the scales.
+- 47 of the 53 Hugging Face models in the list are fetched as a Q8_0 GGUF, with the vocabulary and the
+  configuration of the original repository: about half the download, the same weights to within the rounding of
+  the scales. Each GGUF was compared with its original tensor by tensor before it replaced it, one file at a time:
+  two GGUFs from the same publisher can differ (Qwen's own GGUFs of Qwen3 0.6B and 1.7B did not match their
+  originals, so those two come from another publisher).
 - Converted models are kept in the browser (OPFS, or the Cache API), so the next visit fetches nothing.
 
 ## The GPU
 
 Where the browser has WebGPU in a worker, `forward.js` starts a GPU worker for each model. It copies the int8
-weights of the layers to the GPU, checks each shader against JavaScript on this device, times them, and then runs
-the blocks of a prompt (up to 64 tokens) on the GPU where that was measured faster than the CPU. The keys and
-values it computes are written back into the CPU's cache, and the tokens that follow run on the CPU. See
-[webgpu.md](webgpu.md).
+weights of the layers to the GPU (and the classifier and the embeddings, where the answer can run there too),
+checks each shader against JavaScript on this device, and times them. Then the blocks of a prompt (up to 64
+tokens) and the tokens of the answer (4 in one submission, each sampled on the GPU with the random number the CPU
+drew for it) run on the GPU where that was measured faster than the CPU. The keys and values one side computes are
+copied to the other, so either can go on from any position. See [webgpu.md](webgpu.md).
+
+## The tokenizers
+
+The engine reads three kinds of tokenizer: llama2.c's BPE, sentencepiece's Unigram, and byte-level BPE (GPT-2's
+kind, with the pre-tokenizers of GPT-2, SmolLM2, Qwen and Llama 3). They are compared with the real ones (Hugging
+Face's `tokenizers` and `sentencepiece`) on every character (for sentencepiece, those of the Basic Multilingual
+Plane) and on random texts. The few differences known today
+(a handful of rare characters in two sentencepiece normalizations, and Pythia's added tokens for runs of spaces)
+are recorded in [AGENTS.md](../AGENTS.md). Their speed is in [performance.md](performance.md#the-tokenizer).
