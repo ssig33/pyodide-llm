@@ -492,12 +492,14 @@ def test_the_padding_of_a_gguf_vocabulary_is_empty_as_the_safetensors_path_pads(
     which the safetensors path writes as empty text: the same tokenizer.bin now, which was spelling them out when
     chosen. Its control tokens (type 3) are the special ones, its user-defined ones (type 4) the added ones."""
     from llama2_numpy import Tokenizer
-    tokens = ["a", "b", "ab", "<|endoftext|>", "<think>", "[PAD5]", "[PAD6]"]
+    # nine tenths of the vocabulary or more, or the converter takes it for another model's
+    tokens = ["a", "b", "ab", *(f"w{i}" for i in range(15)), "<|endoftext|>", "<think>", "[PAD20]", "[PAD21]"]
+    kinds = [1] * 18 + [3, 4, 5, 5]
     metadata = lambda count: {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.pre": "gpt-2",
-                              "tokenizer.ggml.tokens": tokens[:count],
-                              "tokenizer.ggml.token_type": [1, 1, 1, 3, 4, 5, 5][:count], "tokenizer.ggml.merges": ["a b"]}
-    data, _, _, controls, added = llama2_convert.gguf_tokenizer(metadata(7), 7)
+                              "tokenizer.ggml.tokens": tokens[:count], "tokenizer.ggml.token_type": kinds[:count],
+                              "tokenizer.ggml.merges": ["a b"]}
+    data, _, _, controls, added = llama2_convert.gguf_tokenizer(metadata(22), 22)
     assert controls == ["<|endoftext|>"] and added == ["<think>"]
-    assert data == llama2_convert.gguf_tokenizer(metadata(5), 7)[0]
-    vocabulary = Tokenizer(data, 7, kind="bytebpe")
-    assert vocabulary.vocab[5:] == [b"", b""] and vocabulary.vocab[4] == b"<think>"
+    assert data == llama2_convert.gguf_tokenizer(metadata(20), 22)[0]
+    vocabulary = Tokenizer(data, 22, kind="bytebpe")
+    assert vocabulary.vocab[20:] == [b"", b""] and vocabulary.vocab[19] == b"<think>"
