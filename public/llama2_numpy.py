@@ -65,10 +65,10 @@ def number(char):
 class CharClasses(dict):
     r"""What the pre-tokenizer's patterns tell apart, one character for each character (T200): the ASCII letters,
     the apostrophe, the space, \r and \n as they are (the contractions and the line breaks name them) and ſ (U+017F,
-    which (?i:'s) takes for s), any other whitespace "\t", any other letter (\p{L}) "a", a number (\p{N}) "0",
-    anything else "!". A text goes through str.translate() with it, and the standard re module runs the patterns on
-    what comes out: \p{L} and \p{N}, which re has not, become [A-Za-zſ] and 0. A character is classed the first time
-    it is seen.
+    which (?i:'s) takes for s), any other whitespace "\t", any other letter (\p{L}) "a", a number (\p{N}) "0", a mark
+    (\p{M}, which Qwen3.5's pattern takes with the letters, T233) "~", anything else "!". A text goes through
+    str.translate() with it, and the standard re module runs the patterns on what comes out: \p{L}, \p{M} and \p{N},
+    which re has not, become [A-Za-zſ], ~ and 0. A character is classed the first time it is seen.
 
     Whitespace is what the real tokenizers' regex (Oniguruma) calls \s (T206): str.isspace less \x1c to \x1f, which
     Oniguruma takes for neither whitespace nor a letter nor a number."""
@@ -83,6 +83,8 @@ class CharClasses(dict):
             kind = "a"
         elif number(char):
             kind = "0"
+        elif unicodedata.category(char)[0] == "M":
+            kind = "~"
         else:
             kind = "!"
         self[code] = kind
@@ -90,14 +92,17 @@ class CharClasses(dict):
 
 
 CHAR_CLASSES = CharClasses()
-# pretokenize()'s patterns on the classes: \p{L} is [A-Za-zſ], \p{N} is 0, \s is [ \t\r\n], anything else ['!].
-# Under (?i) re takes ſ for s, as Oniguruma does; GPT-2's case-sensitive 's does not.
+# pretokenize()'s patterns on the classes: \p{L} is [A-Za-zſ], \p{M} ~, \p{N} 0, \s [ \t\r\n], anything else ['!]
+# (and ~ where a pattern does not name \p{M}). Under (?i) re takes ſ for s, as Oniguruma does; GPT-2's case-sensitive
+# 's does not.
 CONTRACTED = "'s|'t|'re|'ve|'m|'ll|'d"
 SPACES = r"[ \t\r\n]+(?![^ \t\r\n])|[ \t\r\n]+"
 PATTERNS = {
-    "gpt2": re.compile(CONTRACTED + r"| ?[A-Za-zſ]+| ?0+| ?['!]+|" + SPACES),
-    "qwen": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
-    "llama3": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0{1,3}| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    "gpt2": re.compile(CONTRACTED + r"| ?[A-Za-zſ]+| ?0+| ?['!~]+|" + SPACES),
+    "qwen": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0| ?['!~]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    "llama3": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ]+|0{1,3}| ?['!~]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
+    # T233: Qwen3.5's (Qwen3.8's, Bonsai 2's): Qwen's with the marks among the letters
+    "qwen35": re.compile(f"(?i:{CONTRACTED})" + r"|[^\r\nA-Za-zſ0]?[A-Za-zſ~]+|0| ?['!]+[\r\n]*|[ \t\r\n]*[\r\n]+|" + SPACES),
 }
 DIGITS = re.compile("0|[^0]+")  # Digits(individual_digits) on the classes: every number a piece of its own
 
@@ -116,7 +121,9 @@ def pretokenize(text, pattern):
     and a piece of anything-but-a-line-break may lead a word):
         (?i:'s|…)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
     "llama3" is Llama 3's, which is Qwen's with the digits taken up to three at a time (\p{N}{1,3}).
-    All four are checked against the real patterns in tests/test_bytebpe.py and tests/test_llama3.py.
+    "qwen35" is Qwen3.5's (T233), which is Qwen's with the marks (\p{M}) taken with the letters:
+        (?i:'s|…)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+    All five are checked against the real patterns in tests/test_bytebpe.py and tests/test_llama3.py.
     """
     classes = text.translate(CHAR_CLASSES)
     if pattern == "gpt2-digits":

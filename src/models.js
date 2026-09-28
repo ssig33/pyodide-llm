@@ -197,6 +197,8 @@ export const LICENSES = {
   "prism-ml/Ternary-Bonsai-1.7B-gguf": APACHE, "prism-ml/Ternary-Bonsai-1.7B-unpacked": APACHE,
   "prism-ml/Ternary-Bonsai-4B-gguf": APACHE, "prism-ml/Ternary-Bonsai-4B-unpacked": APACHE,
   "prism-ml/Ternary-Bonsai-8B-gguf": APACHE, "prism-ml/Ternary-Bonsai-8B-unpacked": APACHE,
+  // T233: Bonsai 2 and the original its vocabulary and config.json come from
+  "prism-ml/Ternary-Bonsai-2-27B-gguf": APACHE, "Qwen/Qwen3.8-27B": APACHE,
 };
 /** The Hugging Face repository a model comes from. */
 export const sourceOf = (entry) => entry.hf?.repo ?? entry.source;
@@ -553,6 +555,24 @@ const LISTED = [
       `prism-ml/Ternary-Bonsai-${size}-unpacked`, original), download,
     conversion: {}, options: { bos: 151643, stop_tokens: [151643, 151645] }, generation: { steps: 0, temperature: 0.5, topp: 0.85, repetition_penalty: 1.0 },
     template: QWEN3_AT_ONCE, prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE })),
+  // T233: Prism ML's Bonsai 2 (T228, T229, T230): Qwen3.8 27B, three layers of Gated DeltaNet to one of attention,
+  // every weight ternary in their PTQ1_0 GGUF, kept ternary here (7.2 GB: int8 would be 30 GB, past a browser's 16).
+  // The vocabulary and config.json are Qwen3.8's own; its chat_template calls macros (T73's reader cannot), so the
+  // answering-at-once form is written here, as enable_thinking=false writes it. Its config.json says 248044
+  // (<|endoftext|>) for both BOS and EOS: the answer ends at <|im_end|> (248046) too. With no template read, the
+  // converter names none of the special tokens this format writes: the list names them, with the converter's own
+  // (T143: the added tokens that are not special), for a list of its own goes over the converter's. The sampling of
+  // its card for the non-thinking mode (its top-k and presence penalty the page's sampler has not)
+  { group: "hf", id: "hf-bonsai-2-27b", name: "Bonsai 2 27B (no thinking)", note: "ternary weights · answers at once · 日本語 / English · fetches 6.0 GB (GGUF) → ternary 7.2 GB · desktop only · Chrome and Firefox",
+    ...ggufOf("prism-ml/Ternary-Bonsai-2-27B-gguf", "b072e1d3b35a0a630cece372c2127528e0994386", "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+      "Qwen/Qwen3.8-27B", "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"), download: 5946648928,
+    conversion: { dtype: "ternary" }, generation: atOnce,
+    options: { stop_tokens: [248044, 248046], specials: ["<|endoftext|>", "</tool_response>", "<tool_response>", "<|fim_middle|>",
+      "<|fim_prefix|>", "<|fim_suffix|>", "<|im_start|>", "<|repo_name|>", "</tool_call>", "<|file_sep|>", "<|fim_pad|>",
+      "<tool_call>", "<|im_end|>", "</think>", "<think>"] },
+    // (its template trims what was typed, T138)
+    template: "<|im_start|>user\n{prompt:trim}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    prompt: "これからの流行りを3つ挙げてください。", placeholder: ASK_JAPANESE },
 ];
 
 // T90: memory. A device that runs out of it kills the worker's WebAssembly memory, so the page warns before it
@@ -567,7 +587,7 @@ export function modelBytes(entry) {
   // a float16 original is widened to float32 when loaded, next to the file it came from: llm-jp-3 150M's 305 MB
   // file measures about 800 MB of heap (AGENTS.md), so three times the file is the honest estimate
   if (entry.bytes) return entry.options?.dtype === "float16" ? entry.bytes * 3 : entry.bytes;
-  const found = /int8 ([\d.]+) (MB|GB)/.exec(entry.note ?? "");
+  const found = /(?:int8|ternary) ([\d.]+) (MB|GB)/.exec(entry.note ?? "");  // (T233: Bonsai 2's is ternary)
   const int8 = found ? Number(found[1]) * (found[2] === "GB" ? 1e9 : 1e6) : undefined;
   return int8 && entry.conversion?.dtype === "int6" ? int8 * SIX_OF_EIGHT : int8;
 }

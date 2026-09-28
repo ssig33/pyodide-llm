@@ -1621,7 +1621,8 @@ GGUF_VALUES = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7:
 # their fork of llama.cpp only; BF16 (T230) is Bonsai 2's for the two gates of its DeltaNet
 GGUF_TENSORS = {0: "F32", 1: "F16", 8: "Q8_0", 30: "BF16", 142: "PQ2_0", 143: "PTQ1_0"}
 # llama.cpp's names of the pre-tokenizers, as the engine knows them (llama2_numpy.pretokenize)
-GGUF_PRETOKENIZERS = {"gpt-2": "gpt2", "gpt2": "gpt2", "smollm": "gpt2-digits", "qwen2": "qwen", "llama-bpe": "llama3"}
+GGUF_PRETOKENIZERS = {"gpt-2": "gpt2", "gpt2": "gpt2", "smollm": "gpt2-digits", "qwen2": "qwen", "llama-bpe": "llama3",
+                      "qwen35": "qwen35"}
 GGUF_LAYER = {"attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm", "attn_q": "self_attn.q_proj",
               "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj",
               "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj"}
@@ -2016,7 +2017,7 @@ def gguf_tokenizer(metadata, vocab_size):
     pieces = [("" if kind(id) == 5 else text, ranks.get(text, UNMATCHABLE), text in ranks and kind(id) != 3)
               for id, text in enumerate(tokens)]
     # Qwen's tokenizer.json normalizes to NFC, which a GGUF does not say: the page's safetensors path does it
-    options = {"tokenizer_kind": "bytebpe", "nfkc": False, "nfc": pre == "qwen2", "pretokenizer": GGUF_PRETOKENIZERS[pre],
+    options = {"tokenizer_kind": "bytebpe", "nfkc": False, "nfc": pre in ("qwen2", "qwen35"), "pretokenizer": GGUF_PRETOKENIZERS[pre],
                "ignore_merges": pre == "llama-bpe"}
     special = lambda key: tokens[metadata[key]] if isinstance(metadata.get(key), int) and metadata[key] < len(tokens) else ""
     config = {"chat_template": metadata.get("tokenizer.chat_template"), "bos_token": special("tokenizer.ggml.bos_token_id"),
@@ -2125,6 +2126,7 @@ def tokenizer_json_charsmap(tokenizer):
 PRETOKENIZERS = {
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+": "llama3",
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+": "qwen",
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+": "qwen35",
 }
 
 
