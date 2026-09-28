@@ -207,3 +207,27 @@ def test_refuses_what_the_engine_cannot_split():
     with pytest.raises(ValueError, match="adds a space"):
         tokenizer_json_options({"model": {"type": "BPE"},
                                 "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": True}})
+
+
+def test_added_tokens_that_are_not_special_are_one_token_wherever_they_are():
+    """T143: the real tokenizers read an added token that is not special as one token wherever it is written, before
+    it splits the text: Pythia's runs of 2 to 24 spaces (T215's finding: "    x " is [50274, 89, 209] there) and
+    Qwen3's <think>. The converter names them all as specials; a special token only where the template writes it."""
+    from tokenizers import AddedToken
+    from conftest import vocabulary_conversion
+    real, _ = trained(None, False)
+    real.add_tokens([AddedToken(" " * count, normalized=True) for count in range(24, 1, -1)]
+                    + [AddedToken("<think>", normalized=False), AddedToken("</think>", normalized=False)])
+    real.add_special_tokens(["<|im_end|>"])
+    vocab_size = real.get_vocab_size()
+    options = vocabulary_conversion(real.to_str().encode(), "tokenizer.json", vocab_size).options
+    specials = tuple(options["specials"])
+    assert "<think>" in specials and " " * 24 in specials and "  " in specials and "<|im_end|>" not in specials
+    assert list(specials) == sorted(specials, key=lambda token: (-len(token), token)), "the longest first"
+    mine = Tokenizer(vocabulary_conversion(real.to_str().encode(), "tokenizer.json", vocab_size).tokenizer, vocab_size,
+                     kind="bytebpe", pretokenizer=options["pretokenizer"])
+    texts = ["    x ", "def f():\n    return 1\n", " " * 30 + "a", "a  b   c    d", "<think> hi </think>", "x<think>y",
+             "\t    \n  ", "<thin k>", *TEXTS]
+    wrong = [text for text in texts if mine.encode(text, specials) != real.encode(text, add_special_tokens=False).ids]
+    assert not wrong, f"{len(wrong)} of {len(texts)} texts differ, as {wrong[0]!r}"
+    assert mine.encode("    x ", specials)[0] == real.token_to_id("    ")

@@ -60,6 +60,31 @@ TEXTS = [CORPUS, " ", "  ", "\n", "\r\n", " \n ", "0123", " 42 ", "a", " a", "  
 
 # ------------------------------------------------------------------------------------- synthetic checkpoints
 
+class NoWeights:
+    """A converter's sink that keeps nothing: for the options and the tokenizer.bin, which it has before the weights."""
+
+    def open(self, *args):
+        pass
+
+    def write(self, *args):
+        pass
+
+
+def vocabulary_conversion(tokenizer, name, vocab_size, tokenizer_config=None, **config):
+    """llama2_convert.Conversion of a small model with this tokenizer (bytes, as the file name says) and vocabulary,
+    and these keys of config.json besides (bos_token_id ...): its options and tokenizer, with no weights fed (T143)."""
+    import json
+    import llama2_convert
+    from test_convert import hugging_face, safetensors_file
+    settings, weights = synthetic_weights(vocab_size=vocab_size)
+    tensors, published = hugging_face(settings, weights, True)
+    file = safetensors_file(tensors)
+    size = struct.unpack("<Q", file[:8])[0]
+    return llama2_convert.Conversion(file[8:8 + size].decode(), 8 + size, json.dumps({**published, **config}), tokenizer,
+                                     name, dtype="float32", max_seq_len=settings["seq_len"], start=8 + size,
+                                     tokenizer_config=tokenizer_config, sink=NoWeights())
+
+
 def rope_tables(seq_len, head_size, rope_theta=10000.0):
     angles = np.arange(seq_len)[:, None] / rope_theta ** (np.arange(0, head_size, 2) / head_size)
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)

@@ -1642,17 +1642,21 @@ def gguf_tokenizer(metadata, vocab_size):
     special = lambda key: tokens[metadata[key]] if isinstance(metadata.get(key), int) and metadata[key] < len(tokens) else ""
     config = {"chat_template": metadata.get("tokenizer.chat_template"), "bos_token": special("tokenizer.ggml.bos_token_id"),
               "eos_token": special("tokenizer.ggml.eos_token_id")}
-    controls = [text for id, text in enumerate(tokens) if id < len(kinds) and kinds[id] == 3]
-    return tokenizer_bin(pieces, vocab_size), options, config, controls
+    # the added tokens tokenizer.json does not call special are llama.cpp's user-defined ones (type 4)
+    controls, added = ([text for id, text in enumerate(tokens) if id < len(kinds) and kinds[id] == type] for type in (3, 4))
+    return tokenizer_bin(pieces, vocab_size, spaces=False), options, config, controls, added
 
 
 # ---------------------------------------------------------------------------------------- the tokenizer
 UNMATCHABLE = -1e9  # control, unknown and byte pieces must never match user text: llama2_numpy.py skips such scores
 
 
-def tokenizer_bin(pieces, vocab_size):
-    """llama2.c's tokenizer.bin from (text, score, matchable) pieces."""
-    rows = [(score if matchable else UNMATCHABLE, text.replace("▁", " ").encode("utf-8")) for text, score, matchable in pieces]
+def tokenizer_bin(pieces, vocab_size, spaces=True):
+    """llama2.c's tokenizer.bin from (text, score, matchable) pieces. spaces: a sentencepiece vocabulary writes a space
+    as U+2581, which the engine's pieces spell " ". A byte-level one writes it as its byte's character (Ġ), and a
+    U+2581 there is an added token's own (DeepSeek's <｜begin▁of▁sentence｜>), kept as it is (T143)."""
+    rows = [(score if matchable else UNMATCHABLE, (text.replace("▁", " ") if spaces else text).encode("utf-8"))
+            for text, score, matchable in pieces]
     if len(rows) > vocab_size:
         raise ValueError(f"The tokenizer has {len(rows)} pieces, but the model has a vocabulary of {vocab_size}.")
     # A model can have a few more embedding rows than the tokenizer has pieces (padding to a round number). Many
@@ -1873,13 +1877,18 @@ class Conversion:
                 parsed = json.loads(tokenizer)
             except ValueError:
                 raise ValueError("tokenizer.json is not JSON.") from None
-            self.tokenizer, options = tokenizer_bin(tokenizer_json_pieces(parsed), vocab_size), tokenizer_json_options(parsed)
-            specials = [token["content"] for token in parsed.get("added_tokens", []) if token.get("special")]
+            options = tokenizer_json_options(parsed)
+            self.tokenizer = tokenizer_bin(tokenizer_json_pieces(parsed), vocab_size, spaces=options["tokenizer_kind"] != "bytebpe")
+            added = parsed.get("added_tokens", [])
+            specials = [token["content"] for token in added if token.get("special")]
+            # T143: the added tokens it does not call special are read as one token wherever they are too, by the real
+            # tokenizers before it splits the text: Qwen3's <think>, Pythia's runs of 2 to 24 spaces (T215's finding)
+            added = [token["content"] for token in added if not token.get("special")]
         else:
             self.tokenizer, options = tokenizer_bin(sentencepiece_pieces(tokenizer), vocab_size), sentencepiece_options(tokenizer)
-            specials = sentencepiece_specials(tokenizer)
+            specials, added = sentencepiece_specials(tokenizer), []
         self.start(header, base, options, tokenizer_config, dtype, max_seq_len, start, sink, quantize_rows, specials, bfloat16,
-                   chat_template, q8_0)
+                   chat_template, q8_0, added)
 
     @classmethod
     def from_gguf(cls, head, dtype="int8", max_seq_len=4096, sink=None, quantize_rows=None, bfloat16=None, q8_0=None):
@@ -1900,17 +1909,18 @@ class Conversion:
                                  f"original's vocabulary and config.json.")
         if not callable(dtype):
             check_dtype(dtype)
-        self.tokenizer, options, tokenizer_config, specials = gguf_tokenizer(metadata, config["vocab_size"])
+        self.tokenizer, options, tokenizer_config, specials, added = gguf_tokenizer(metadata, config["vocab_size"])
         self.base = base
         self.start(header, base, options, tokenizer_config, dtype, max_seq_len, base, sink, quantize_rows, specials, bfloat16,
-                   q8_0=q8_0)
+                   q8_0=q8_0, added=added)
         return self
 
     def start(self, header, base, options, tokenizer_config, dtype, max_seq_len, start, sink=None, quantize_rows=None,
-              specials=(), bfloat16=None, chat_template=None, q8_0=None):
+              specials=(), bfloat16=None, chat_template=None, q8_0=None, added=()):
         """sink and quantize_rows: see Writer, bfloat16 and q8_0: see Stream. checkpoint is None with a sink: the bytes went there. specials: the
         tokenizer's special tokens, the ones a chat template writes between the turns. chat_template: the text of
-        chat_template.jinja, where there is one (T127)."""
+        chat_template.jinja, where there is one (T127). added: the added tokens that are not special, one token
+        wherever they are written (T143)."""
         bos = self.config.get("bos_token_id", 1)
         eos = self.config.get("eos_token_id", 2)
         stop = [token for token in [bos, *(eos if isinstance(eos, list) else [eos])] if isinstance(token, int)]
@@ -1927,11 +1937,13 @@ class Conversion:
         template = one_turn_template(tokenizer_config, chat_template)
         if template:
             self.options["template"] = template
-            # the special tokens it writes stand for their token; spelled out they would be a dozen tokens each.
-            # The longest first, so that one that begins another never cuts it short
-            written = sorted({special for special in specials if special and special in template}, key=len, reverse=True)
-            if written:
-                self.options["specials"] = written
+        # the special tokens the template writes stand for their token; spelled out they would be a dozen tokens each.
+        # The added tokens that are not special, wherever they are written (T143). The longest first, so that one that
+        # begins another never cuts it short
+        written = {special for special in specials if special and template and special in template}
+        written = sorted(written | {token for token in added if token}, key=lambda token: (-len(token), token))
+        if written:
+            self.options["specials"] = written
         eps = self.config.get("rms_norm_eps")
         # a GGUF says it in float32 (1e-5 is 9.99999974e-06 there): six digits are what config.json writes
         eps = float(f"{eps:.6g}") if isinstance(eps, (int, float)) and eps > 0 else RMS_EPS
