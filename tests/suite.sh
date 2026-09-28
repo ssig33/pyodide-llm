@@ -46,6 +46,9 @@ part "unit tests of the page's modules" page_modules
 # the page resolves the latest Pyodide release when it is opened, so test against that one
 part "the latest Pyodide" npm install --no-save pyodide@latest
 part "smoke test" node tests/smoke.mjs
+# T217 (the review of T201): attention's softmax where its largest score decides something (two positions far above
+# the rest): a largest that leaves positions out, which forward-check's line cannot see (under a second)
+part "attention's largest score" node tests/attention-check.mjs
 
 if [ "$suite" = full ]; then
   # T93: the forward pass of public/forward.js against NumPy's, on the site's models (the line is for 128 positions)
