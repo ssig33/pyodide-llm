@@ -81,7 +81,7 @@ the GPU. If the GPU fails, the page also loads the model again on the CPU.
 
 A model converted from Hugging Face is kept as it arrives. 6-bit models are not put on the GPU alone: the GPU holds
 them widened to int8, which is larger. On the GPU alone, Llama 3.2 3B takes about 4.1 GB in all (4.09 GB on the GPU
-and 0.02 GB on the CPU's side) against 4.7 GB on the CPU alone, and Llama 3.1 Swallow 8B about 9.0 GB against 10.9 GB
+and 0.02 GB on the CPU's side) against 4.7 GB on the CPU alone, and Llama 3.1 Swallow 8B about 9.6 GB against 10.8 GB
 (estimates for 4096 positions, without the page and Pyodide themselves; not measured).
 
 ## Where the GPU is not used
